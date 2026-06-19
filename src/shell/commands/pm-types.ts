@@ -33,8 +33,8 @@ export interface PmDeps {
     ctx: ShellContext,
     opts?: { isFork?: boolean },
   ) => Promise<ShellResult>;
-  evalCode: (code: string, ctx: ShellContext) => ShellResult;
-  printCode: (code: string, ctx: ShellContext) => ShellResult;
+  evalCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;
+  printCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;
   removeNodeModules: (cwd: string) => void;
   formatErr: (msg: string, pm: PkgManager) => string;
   formatWarn: (msg: string, pm: PkgManager) => string;

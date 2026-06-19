@@ -404,8 +404,11 @@ export class Nodepod {
       }
     });
 
-    const isNodeCmd = cmd === "node" && args?.length;
-    if (isNodeCmd) {
+    const isNodeFileRun =
+      cmd === "node" &&
+      args?.length &&
+      !args[0].startsWith("-");
+    if (isNodeFileRun) {
       const filePath = this._resolveCommand(cmd, args);
       handle.exec({
         type: "exec",

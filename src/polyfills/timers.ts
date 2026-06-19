@@ -18,6 +18,38 @@ const _rawSetInterval = globalThis.setInterval.bind(globalThis);
 const _rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
 const _rawClearInterval = globalThis.clearInterval.bind(globalThis);
 
+// tracked timers so process teardown can cancel the underlying browser ids.
+// closeAll() only drops registry handles; without this, intervals keep firing
+// in persistent shell workers after Ctrl+C.
+const _activeTimers = new Set<TimeoutLike>();
+
+function trackTimer(timer: TimeoutLike): void {
+  _activeTimers.add(timer);
+}
+
+function untrackTimer(timer: TimeoutLike): void {
+  _activeTimers.delete(timer);
+}
+
+/** Cancel every tracked timer. Called from child_process cleanup on exit/abort. */
+export function disposeAllTimers(): void {
+  for (const timer of Array.from(_activeTimers)) {
+    if (timer._isInterval) {
+      _rawClearInterval(timer._id);
+    } else {
+      const id = timer._id as unknown;
+      if (id && typeof id === "object" && "cleared" in (id as object)) {
+        (id as ImmediateEntry).cleared = true;
+      } else {
+        _rawClearTimeout(timer._id);
+      }
+    }
+    timer._handle.close();
+    timer._fired = true;
+  }
+  _activeTimers.clear();
+}
+
 // node's TIMEOUT_MAX = 2^31 - 1. anything outside [1, TIMEOUT_MAX] (NaN,
 // negative, non-finite, non-numeric) is coerced to 1. matches
 // lib/internal/timers.js#getTimerDuration in node source.
@@ -60,6 +92,7 @@ function makeTimeout(
     if (!isInterval) {
       self._fired = true;
       handle.close();
+      untrackTimer(self);
     }
     try {
       // widen the declared void return so we can duck-type async callbacks.
@@ -88,6 +121,7 @@ function makeTimeout(
   self._id = isInterval
     ? _rawSetInterval(fire, ms)
     : _rawSetTimeout(fire, ms);
+  trackTimer(self);
 
   self.ref = () => {
     if (!self._fired) handle.ref();
@@ -195,6 +229,7 @@ function makeImmediate(
   self._handle = handle;
   // no raw timer id here, stash the entry pointer for clearImmediate
   self._id = entry as unknown as ReturnType<typeof _rawSetTimeout>;
+  trackTimer(self);
   self.ref = () => {
     if (!entry.cleared) handle.ref();
     return self;
@@ -240,6 +275,7 @@ export function setImmediate(
 export function clearTimeout(t: unknown): void {
   if (t && typeof t === "object" && "_id" in t && "_handle" in t) {
     const timer = t as TimeoutLike;
+    untrackTimer(timer);
     // setImmediate handles use the ImmediateEntry as _id; detect and mark
     const id = timer._id as unknown;
     if (id && typeof id === "object" && "cleared" in (id as object)) {
@@ -257,6 +293,7 @@ export function clearTimeout(t: unknown): void {
 export function clearInterval(t: unknown): void {
   if (t && typeof t === "object" && "_id" in t && "_handle" in t) {
     const timer = t as TimeoutLike;
+    untrackTimer(timer);
     _rawClearInterval(timer._id);
     timer._handle.close();
     return;

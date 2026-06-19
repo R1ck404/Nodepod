@@ -687,4 +687,43 @@ describe("exit semantics - libuv-parity", () => {
       expect(elapsed).toBeLessThan(500);
     });
   });
+
+  describe("node -e / -p", () => {
+    it("node -e waits for short timers before exiting", async () => {
+      const { shellExec } = await import("../polyfills/child_process");
+      setup({});
+      const t0 = performance.now();
+      const result = await new Promise<{ stdout: string; exitCode: number }>((resolve) => {
+        shellExec(
+          'node -e "setTimeout(() => console.log(\\\"done\\\"), 200)"',
+          {},
+          (err, stdout) => {
+            resolve({
+              stdout: String(stdout ?? ""),
+              exitCode: err ? ((err as { code?: number }).code ?? 1) : 0,
+            });
+          },
+        );
+      });
+      const elapsed = performance.now() - t0;
+      expect(result.stdout).toContain("done");
+      expect(result.exitCode).toBe(0);
+      expect(elapsed).toBeGreaterThanOrEqual(150);
+    }, 5_000);
+
+    it("node -p prints the evaluated expression", async () => {
+      const { shellExec } = await import("../polyfills/child_process");
+      setup({});
+      const result = await new Promise<{ stdout: string; exitCode: number }>((resolve) => {
+        shellExec('node -p "2 + 2"', {}, (err, stdout) => {
+          resolve({
+            stdout: String(stdout ?? ""),
+            exitCode: err ? ((err as { code?: number }).code ?? 1) : 0,
+          });
+        });
+      });
+      expect(result.stdout).toContain("4");
+      expect(result.exitCode).toBe(0);
+    });
+  });
 });

@@ -314,8 +314,17 @@ export class NodepodTerminal {
 
     if (this._running) {
       // Ctrl+C
-      if (data.includes("\x03")) {
-        const abort = this._wiring?.getActiveAbort();
+    if (data.includes("\x03")) {
+      const isRaw = this._wiring?.getIsStdinRaw() ?? false;
+      const sendStdin = this._wiring?.getSendStdin();
+
+      // raw TUI apps handle ctrl+c themselves (often need two presses to quit)
+      if (isRaw && sendStdin) {
+        sendStdin(data);
+        return;
+      }
+
+      const abort = this._wiring?.getActiveAbort();
         if (abort) {
           abort.abort();
           // Don't clear activeAbort -- nodepod.ts checks it to skip duplicate prompt

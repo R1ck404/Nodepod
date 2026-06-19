@@ -28,6 +28,7 @@ import { createGitCommand } from "../shell/commands/git";
 import { format as utilFormat } from "./util";
 import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config";
 import { closeAllServers, getAllServers } from "./http";
+import { disposeAllTimers } from "./timers";
 import type { SyncChannelWorker } from "../threading/sync-channel";
 
 let _shell: NodepodShell | null = null;
@@ -352,61 +353,22 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
 
 // node -e / -p helpers (used by PmDeps)
 
-function evalNodeCode(code: string, ctx: ShellContext): ShellResult {
-  let out = "";
-  let err = "";
-  const sandbox = new ScriptEngine(_vol!, {
-    cwd: ctx.cwd,
-    env: ctx.env,
-    enableSharedArrayBuffer: _sabEnabled,
-    onConsole: (m: string, args: unknown[]) => {
-      const line = utilFormat(args[0], ...args.slice(1)) + "\n";
-      m === "error" ? (err += line) : (out += line);
-    },
-    onStdout: (s: string) => {
-      out += s;
-    },
-    onStderr: (s: string) => {
-      err += s;
-    },
+function evalNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
+  if (!_vol) return Promise.resolve({ stdout: "", stderr: "Volume unavailable\n", exitCode: 1 });
+  const evalPath = `/<eval-${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
+  _vol.writeFileSync(evalPath, code);
+  return executeNodeBinary(evalPath, [], ctx).finally(() => {
+    try {
+      if (_vol!.existsSync(evalPath)) _vol!.unlinkSync(evalPath);
+    } catch {
+      /* ignore */
+    }
   });
-  try {
-    sandbox.execute(code, "/<eval>.js");
-  } catch (e) {
-    if (isExitSentinel(e))
-      return { stdout: out, stderr: err, exitCode: 0 };
-    err += `Error: ${e instanceof Error ? e.message : String(e)}\n`;
-    return { stdout: out, stderr: err, exitCode: 1 };
-  }
-  return { stdout: out, stderr: err, exitCode: 0 };
 }
 
-function printNodeCode(code: string, ctx: ShellContext): ShellResult {
-  let out = "";
-  let err = "";
-  const sandbox = new ScriptEngine(_vol!, {
-    cwd: ctx.cwd,
-    env: ctx.env,
-    enableSharedArrayBuffer: _sabEnabled,
-    onConsole: (m: string, args: unknown[]) => {
-      const line = utilFormat(args[0], ...args.slice(1)) + "\n";
-      m === "error" ? (err += line) : (out += line);
-    },
-    onStdout: (s: string) => {
-      out += s;
-    },
-    onStderr: (s: string) => {
-      err += s;
-    },
-  });
-  try {
-    const result = sandbox.execute(code, "/<print>.js");
-    out += String(result.exports) + "\n";
-  } catch (e) {
-    err += `Error: ${e instanceof Error ? e.message : String(e)}\n`;
-    return { stdout: out, stderr: err, exitCode: 1 };
-  }
-  return { stdout: out, stderr: err, exitCode: 0 };
+function printNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
+  const wrapped = `const __nodepodPrintResult = (${code});\nif (typeof __nodepodPrintResult !== 'undefined') { process.stdout.write(String(__nodepodPrintResult) + '\\n'); }\n`;
+  return evalNodeCode(wrapped, ctx);
 }
 
 // npm helpers
@@ -1541,6 +1503,7 @@ export async function executeNodeBinary(
     if (ctxRestore) ctxRestore.liveStdin = prevLiveStdin;
     _activeProcs.delete(proc as any);
     closeAllServers();
+    disposeAllTimers();
     getRegistry().closeAll();
     resetActiveInterfaceCount();
   }

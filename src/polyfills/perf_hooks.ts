@@ -1,19 +1,45 @@
 // perf_hooks polyfill wrapping browser Performance API
 
+export type MarkResourceTimingFn = (
+  timingInfo?: unknown,
+  requestedUrl?: unknown,
+  initiatorType?: unknown,
+  global?: unknown,
+  cacheMode?: unknown,
+  bodyInfo?: unknown,
+  responseStatus?: unknown,
+  deliveryType?: unknown,
+) => void;
 
+function noopMarkResourceTiming(..._args: unknown[]): void {
+  // undici calls this after fetch; browsers lack the node extension.
+}
 
-export const performance: Performance = globalThis.performance ?? ({
-  now: () => Date.now(),
-  timeOrigin: Date.now(),
-  mark: () => {},
-  measure: () => {},
-  getEntries: () => [],
-  getEntriesByName: () => [],
-  getEntriesByType: () => [],
-  clearMarks: () => {},
-  clearMeasures: () => {},
-  clearResourceTimings: () => {},
-} as unknown as Performance);
+type PerfHooksPerformance = Performance & { markResourceTiming: MarkResourceTimingFn };
+
+function createPerformance(): PerfHooksPerformance {
+  const base = globalThis.performance;
+  const perf = {
+    now: () => Date.now(),
+    timeOrigin: Date.now(),
+    mark: () => {},
+    measure: () => {},
+    getEntries: () => [] as PerformanceEntry[],
+    getEntriesByName: () => [] as PerformanceEntry[],
+    getEntriesByType: () => [] as PerformanceEntry[],
+    clearMarks: () => {},
+    clearMeasures: () => {},
+    clearResourceTimings: () => {},
+    markResourceTiming: noopMarkResourceTiming,
+  } as unknown as PerfHooksPerformance;
+  if (base) {
+    Object.assign(perf, base);
+    perf.markResourceTiming = noopMarkResourceTiming;
+  }
+  return perf;
+}
+
+export const performance: PerfHooksPerformance = createPerformance();
 
 
 export interface TimingEntryList {
