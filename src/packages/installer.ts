@@ -1,7 +1,7 @@
 // Dependency Installer
 // Handles the full install lifecycle: resolve, download, extract, transform, bin stubs, lock file.
 
-import { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { RegistryClient, RegistryConfig } from "./registry-client";
 import {
   resolveDependencyTree,
@@ -100,12 +100,12 @@ function splitSpecifier(spec: string): { name: string; version?: string } {
 let transformerReady = false;
 
 export class DependencyInstaller {
-  private vol: MemoryVolume;
+  private vol: IVolume;
   private registryClient: RegistryClient;
   private workingDir: string;
   private _snapshotCache: IDBSnapshotCache | null;
 
-  constructor(vol: MemoryVolume, opts: { cwd?: string; snapshotCache?: IDBSnapshotCache | null } & RegistryConfig = {}) {
+  constructor(vol: IVolume, opts: { cwd?: string; snapshotCache?: IDBSnapshotCache | null } & RegistryConfig = {}) {
     this.vol = vol;
     this.registryClient = new RegistryClient(opts);
     this.workingDir = opts.cwd || "/";
@@ -448,7 +448,7 @@ export class DependencyInstaller {
 // One-shot install: `install("express@4.18.2", vol)`
 export async function install(
   specifier: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   flags?: InstallFlags,
 ): Promise<InstallOutcome> {
   const installer = new DependencyInstaller(vol);

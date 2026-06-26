@@ -1,4 +1,5 @@
 import { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { DependencyInstaller } from "../packages/installer";
 import {
   RequestProxy,
@@ -80,7 +81,7 @@ export class Nodepod {
    *  multiple coexist on one page */
   readonly instanceId: string;
 
-  private _volume: MemoryVolume;
+  private _volume: IVolume;
   private _packages: DependencyInstaller;
   private _proxy: RequestProxy;
   private _cwd: string;
@@ -98,7 +99,7 @@ export class Nodepod {
   /* ---- Construction (use Nodepod.boot()) ---- */
 
   private constructor(
-    volume: MemoryVolume,
+    volume: IVolume,
     packages: DependencyInstaller,
     proxy: RequestProxy,
     cwd: string,
@@ -231,7 +232,10 @@ export class Nodepod {
 
     const handler = new MemoryHandler(opts.memory);
     handler.startMonitoring();
-    const volume = new MemoryVolume(handler);
+    // Use the user-provided VFS adapter if given, otherwise the default
+    // in-memory MemoryVolume. Custom adapters own their own storage; the
+    // MemoryHandler is still created for heap monitoring / pressure hooks.
+    const volume: IVolume = opts.volume ?? new MemoryVolume(handler);
 
     // fs bridge for napi-rs WASI workers (tailwind v4 oxide, rolldown, etc).
     // they call fs from inside a Web Worker which would normally route
@@ -738,9 +742,10 @@ export class Nodepod {
   async restore(snapshot: Snapshot, opts?: SnapshotOptions): Promise<void> {
     const autoInstall = opts?.autoInstall ?? true;
 
-    // Swap the internal tree
-    const fresh = MemoryVolume.fromSnapshot(snapshot);
-    (this._volume as any).tree = (fresh as any).tree;
+    // Swap the internal tree via the public IVolume contract.
+    // Adapters that don't keep an in-memory tree implement replaceFromSnapshot
+    // to re-init from the snapshot entries.
+    this._volume.replaceFromSnapshot(snapshot);
 
     // Auto-install deps from package.json if requested and manifest exists
     if (autoInstall && this._volume.existsSync("/package.json")) {
@@ -828,7 +833,7 @@ export class Nodepod {
 
   /* ---- Escape hatches ---- */
 
-  get volume(): MemoryVolume {
+  get volume(): IVolume {
     return this._volume;
   }
   /** @deprecated Main-thread engine removed for security. all code now runs in isolated Web Workers via spawn() <-- this removes fatal security flaws. */

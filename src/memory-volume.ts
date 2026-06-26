@@ -4,6 +4,7 @@ import type { VolumeSnapshot, VolumeEntry } from './engine-types';
 import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding';
 import { MOCK_IDS, MOCK_FS } from './constants/config';
 import type { MemoryHandler } from './memory-handler';
+import type { IVolume } from './types/volume';
 
 export interface VolumeNode {
   kind: 'file' | 'directory' | 'symlink';
@@ -173,7 +174,7 @@ export function makeSystemError(
   return err;
 }
 
-export class MemoryVolume {
+export class MemoryVolume implements IVolume {
   private tree: VolumeNode;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
@@ -321,6 +322,23 @@ export class MemoryVolume {
     this.activeWatchers.clear();
     this.subscribers.clear();
     this.globalChangeListeners.clear();
+    if (this._handler) {
+      this._handler.statCache.clear();
+      this._handler.pathNormCache.clear();
+    }
+  }
+
+  /**
+   * Replace the entire filesystem contents with the given snapshot.
+   * Implements IVolume.replaceFromSnapshot — used by Nodepod.restore()
+   * so callers don't have to reach into private tree state.
+   */
+  replaceFromSnapshot(snapshot: VolumeSnapshot): void {
+    const fresh = MemoryVolume.fromSnapshot(snapshot);
+    this.tree = fresh.tree;
+    // re-key ino map to the new tree so stat inos stay unique per path
+    this._inos.clear();
+    this._nextIno = 1;
     if (this._handler) {
       this._handler.statCache.clear();
       this._handler.pathNormCache.clear();

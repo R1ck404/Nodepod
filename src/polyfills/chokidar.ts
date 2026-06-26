@@ -1,11 +1,12 @@
-// Chokidar-compatible file watcher on top of MemoryVolume.watch()
+// Chokidar-compatible file watcher on top of IVolume.watch()
 
 
-import type { MemoryVolume, FileWatchHandle, FileStat } from "../memory-volume";
+import type { FileWatchHandle, FileStat } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { setSharedVolume, getSharedVolume } from "./volume-registry";
 
 
-export function setVolume(vol: MemoryVolume): void {
+export function setVolume(vol: IVolume): void {
   setSharedVolume(vol);
 }
 
@@ -79,7 +80,7 @@ export interface WatcherConfig {
 
 
 export interface PathWatcher extends MiniEmitter {
-  vol: MemoryVolume;
+  vol: IVolume;
   cfg: WatcherConfig;
   handles: Map<string, FileWatchHandle>;
   terminated: boolean;
@@ -107,7 +108,7 @@ export const PathWatcher = function PathWatcher(this: any, cfg: WatcherConfig = 
   const vol = getSharedVolume();
   if (!vol) {
     throw new Error(
-      "chokidar: MemoryVolume not set. Call setVolume() first.",
+      "chokidar: IVolume not set. Call setVolume() first.",
     );
   }
   this.vol = vol;

@@ -1,11 +1,11 @@
 // Async facade over MemoryVolume. Returns Promises even though the
 // underlying VFS is synchronous -- keeps the public API consistent.
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import type { StatResult } from "./types";
 
 export class NodepodFS {
-  constructor(private _vol: MemoryVolume) {}
+  constructor(private _vol: IVolume) {}
 
   // Auto-creates parent dirs on write
   async writeFile(path: string, data: string | Uint8Array): Promise<void> {
@@ -77,7 +77,7 @@ export class NodepodFS {
     return this._vol.watch(path, optionsOrCb ?? {}, cb!);
   }
 
-  get volume(): MemoryVolume {
+  get volume(): IVolume {
     return this._vol;
   }
 

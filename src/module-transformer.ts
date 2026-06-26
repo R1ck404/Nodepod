@@ -2,7 +2,7 @@
 // pre-convert packages so synchronous require() works at runtime.
 // Transforms are offloaded to Web Workers when available.
 
-import type { MemoryVolume } from "./memory-volume";
+import type { IVolume } from "./types/volume";
 import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY, cdnImport } from "./constants/cdn-urls";
 import { offload, taskId, TaskPriority } from "./threading/offload";
 import type { TransformResult } from "./threading/offload-types";
@@ -274,7 +274,7 @@ function patchBuiltinImports(source: string): string {
   return patched;
 }
 
-function listJsFiles(vol: MemoryVolume, dir: string): string[] {
+function listJsFiles(vol: IVolume, dir: string): string[] {
   const result: string[] = [];
   try {
     for (const name of vol.readdirSync(dir)) {
@@ -298,7 +298,7 @@ function listJsFiles(vol: MemoryVolume, dir: string): string[] {
   return result;
 }
 
-function isEsmPackage(vol: MemoryVolume, packageDir: string): boolean {
+function isEsmPackage(vol: IVolume, packageDir: string): boolean {
   try {
     const pkgPath = packageDir + "/package.json";
     if (vol.existsSync(pkgPath)) {
@@ -313,7 +313,7 @@ function isEsmPackage(vol: MemoryVolume, packageDir: string): boolean {
 
 // convert all ESM files in a package directory to CJS
 export async function convertPackage(
-  vol: MemoryVolume,
+  vol: IVolume,
   packageDir: string,
   onProgress?: (msg: string) => void,
 ): Promise<number> {

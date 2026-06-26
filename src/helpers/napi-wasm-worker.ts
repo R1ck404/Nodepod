@@ -12,7 +12,7 @@
  * no hardcoding per package
  */
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { EventEmitter } from "../polyfills/events";
 import { getRegistry, type Handle } from "./event-loop";
 
@@ -24,7 +24,7 @@ import { getRegistry, type Handle } from "./event-loop";
  */
 export function isNapiWasiWorkerScript(
   scriptPath: string,
-  vol: MemoryVolume,
+  vol: IVolume,
 ): boolean {
   const base = scriptPath.split("/").pop() ?? "";
   if (base !== "wasi-worker.mjs" && base !== "wasi-worker-browser.mjs") {
@@ -48,7 +48,7 @@ export function isNapiWasiWorkerScript(
  */
 export function buildNapiWorkerBundle(
   entryPath: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   resolveModule: (id: string, fromDir: string) => string,
   processEnv: Record<string, string>,
 ): string {
@@ -233,7 +233,7 @@ function pullFsPort(): MessagePort | null {
  * napi-rs WASI scripts, falling back to the standard fork-based worker otherwise
  */
 export function createNapiWorkerFactory(
-  vol: MemoryVolume,
+  vol: IVolume,
   resolveModule: (id: string, fromDir: string) => string,
   processEnv: Record<string, string>,
   fsBridge: any, // for handling __fs__ proxy messages
@@ -331,7 +331,7 @@ function createRealWebWorker(
   this: any,
   scriptPath: string,
   opts: any,
-  vol: MemoryVolume,
+  vol: IVolume,
   resolveModule: (id: string, fromDir: string) => string,
   processEnv: Record<string, string>,
   fsBridge: any,
@@ -929,7 +929,7 @@ const __pathStub = {
 __pathStub.posix = __pathStub;
 
 // fs proxy — synchronous FS operations forwarded to main thread via SharedArrayBuffer + Atomics.
-// The main thread handles __fs__ messages using the real nodepod VFS (MemoryVolume).
+// The main thread handles __fs__ messages using the real nodepod VFS (IVolume).
 // Protocol: worker creates a SAB, posts {__fs__: {sab, type, payload}}, then Atomics.wait().
 // Main thread performs the op, writes result to SAB, Atomics.notify().
 // Header layout (Int32Array view, first 16 bytes):
@@ -1514,7 +1514,7 @@ const __wasiStub = { WASI: class WASI {
             const isSym = item && typeof item.isSymbolicLink === 'function' ? item.isSymbolicLink() : false;
             const dType = isDir ? 3 : (isSym ? 7 : 4);
             // d_ino must be unique per (parent, name) for walkdir cycle
-            // detection to work correctly. statSync goes through MemoryVolume
+            // detection to work correctly. statSync goes through IVolume
             // which assigns stable per-path inos.
             var dino = BigInt(i + 1);
             try {

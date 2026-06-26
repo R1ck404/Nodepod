@@ -9,6 +9,13 @@ export type {
   WatchEventKind,
   SystemError,
 } from "./memory-volume";
+export type {
+  IVolume,
+  VolumeWriteData,
+  VolumeStats,
+  VolumeReadStream,
+  VolumeWriteStream,
+} from "./types/volume";
 export { ScriptEngine, executeCode } from "./script-engine";
 export type { ModuleRecord, EngineOptions, ResolverFn } from "./script-engine";
 export { spawnEngine, WorkerSandbox, IframeSandbox, spawnProcessWorkerEngine, ProcessWorkerAdapter } from "./engine-factory";
@@ -53,6 +60,7 @@ export * as rollup from "./polyfills/rollup";
 export * as assert from "./polyfills/assert";
 
 import { MemoryVolume } from "./memory-volume";
+import type { IVolume } from "./types/volume";
 import { ScriptEngine, EngineOptions } from "./script-engine";
 import { DependencyInstaller } from "./packages/installer";
 import { RequestProxy, getProxyInstance } from "./request-proxy";
@@ -79,11 +87,13 @@ export interface CommandOptions {
 export interface WorkspaceConfig extends EngineOptions {
   baseUrl?: string;
   onServerReady?: (port: number, url: string) => void;
+  /** Custom VFS adapter. Defaults to an in-memory MemoryVolume. */
+  volume?: IVolume;
 }
 
 // create a fully-wired workspace (volume + engine + packages + proxy)
 export function createWorkspace(config?: WorkspaceConfig): {
-  volume: MemoryVolume;
+  volume: IVolume;
   engine: ScriptEngine;
   packages: DependencyInstaller;
   proxy: RequestProxy;
@@ -94,7 +104,7 @@ export function createWorkspace(config?: WorkspaceConfig): {
   createREPL: () => { eval: (code: string) => unknown };
   on: (event: string, listener: (...args: unknown[]) => void) => void;
 } {
-  const volume = new MemoryVolume();
+  const volume = config?.volume ?? new MemoryVolume();
   const engine = new ScriptEngine(volume, config);
   const packages = new DependencyInstaller(volume);
   const proxy = getProxyInstance({

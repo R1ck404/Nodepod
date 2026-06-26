@@ -2,7 +2,7 @@
 // spawns Web Worker processes, routes I/O, syncs VFS, tracks process tree
 
 import { EventEmitter } from "../polyfills/events";
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
@@ -27,7 +27,7 @@ const MAX_PROCESSES = 50;
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
-  private _volume: MemoryVolume;
+  private _volume: IVolume;
   private _vfsBridge: VFSBridge | null = null;
   private _sharedBuffer: SharedArrayBuffer | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
@@ -42,7 +42,7 @@ export class ProcessManager extends EventEmitter {
   private _httpCallbacks = new Map<number, (resp: WorkerToMain_HttpResponse) => void>();
   private _nextHttpRequestId = 1;
 
-  constructor(volume: MemoryVolume) {
+  constructor(volume: IVolume) {
     super();
     this._volume = volume;
   }

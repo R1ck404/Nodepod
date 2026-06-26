@@ -1,4 +1,4 @@
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 
 /* ------------------------------------------------------------------ */
 /*  Result & context                                                   */
@@ -13,7 +13,7 @@ export interface ShellResult {
 export interface ShellContext {
   cwd: string;
   env: Record<string, string>;
-  volume: MemoryVolume;
+  volume: IVolume;
   // run a sub-command through the shell (used by npm run, etc.)
   exec: (cmd: string, opts?: { cwd?: string; env?: Record<string, string> }) => Promise<ShellResult>;
 }

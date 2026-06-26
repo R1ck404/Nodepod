@@ -3,7 +3,7 @@
 // (builtins + any extras + paths); anything after is paths only. dirs
 // get a trailing '/' and files get ' ', like bash.
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 
 export interface CompletionResult {
   token: string;
@@ -23,7 +23,7 @@ export function getCompletions(
   line: string,
   cursorPos: number,
   cwd: string,
-  volume: MemoryVolume,
+  volume: IVolume,
   builtinNames: Iterable<string>,
   opts?: CompletionOptions,
 ): CompletionResult {
@@ -89,7 +89,7 @@ export function longestCommonPrefix(strs: string[]): string {
 function completePath(
   token: string,
   cwd: string,
-  volume: MemoryVolume,
+  volume: IVolume,
 ): string[] {
   // split the token on the last '/' into a dir part and a prefix:
   //   "src/sh"   -> "src/",  "sh"

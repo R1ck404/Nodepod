@@ -1,12 +1,12 @@
-// fs polyfill -- buildFileSystemBridge(volume, getCwd) wraps MemoryVolume into a Node.js-compatible fs API
+// fs polyfill -- buildFileSystemBridge(volume, getCwd) wraps IVolume into a Node.js-compatible fs API
 
 import type {
-  MemoryVolume,
   FileStat,
   FileWatchHandle,
   WatchCallback,
   WatchEventKind,
 } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { makeSystemError } from "../memory-volume";
 import { bytesToBase64, bytesToHex } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
@@ -529,7 +529,7 @@ interface OpenFile {
 }
 
 export function buildFileSystemBridge(
-  volume: MemoryVolume,
+  volume: IVolume,
   getCwd?: () => string,
 ): FsBridge {
   // each bridge gets its own FD namespace (per-process isolation)

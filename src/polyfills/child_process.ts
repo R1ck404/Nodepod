@@ -1,12 +1,12 @@
 // child_process polyfill -- exec, execSync, spawn, fork backed by NodepodShell.
-// Integrates with MemoryVolume directly.
+// Integrates with IVolume directly.
 
 import { NodepodShell } from "../shell/shell-interpreter";
 import type { ShellResult, ShellContext } from "../shell/shell-types";
 import { EventEmitter } from "./events";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { ScriptEngine } from "../script-engine";
 import type { PackageManifest } from "../types/manifest";
 import { resetActiveInterfaceCount } from "./readline";
@@ -32,7 +32,7 @@ import { disposeAllTimers } from "./timers";
 import type { SyncChannelWorker } from "../threading/sync-channel";
 
 let _shell: NodepodShell | null = null;
-let _vol: MemoryVolume | null = null;
+let _vol: IVolume | null = null;
 
 // grab the native setTimeout before script-engine patches it. we use this
 // to yield to the host task queue without creating a tracked Handle that
@@ -298,7 +298,7 @@ export function sendStdin(text: string): void {
   stdin.emit("data", text);
 }
 
-export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string> }): void {
+export function initShellExec(volume: IVolume, opts?: { cwd?: string; env?: Record<string, string> }): void {
   _vol = volume;
 
   _shell = new NodepodShell(volume, {
@@ -373,7 +373,7 @@ function printNodeCode(code: string, ctx: ShellContext): Promise<ShellResult> {
 
 // npm helpers
 
-function removeDir(vol: MemoryVolume, dir: string): void {
+function removeDir(vol: IVolume, dir: string): void {
   for (const name of vol.readdirSync(dir)) {
     const full = `${dir}/${name}`;
     const st = vol.statSync(full);
@@ -1628,7 +1628,7 @@ async function npxExecute(
 
 function findBinary(
   name: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   cwd?: string,
 ): string | null {
   const cleanName = name.startsWith("@") ? name : name;
