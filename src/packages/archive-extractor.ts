@@ -2,7 +2,7 @@
 // Heavy work is offloaded to web workers when available.
 
 import pako from "pako";
-import { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import * as path from "../polyfills/path";
 import { offload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
@@ -132,12 +132,12 @@ export function inflateGzip(compressed: ArrayBuffer | Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// Extraction into MemoryVolume
+// Extraction into IVolume
 // ---------------------------------------------------------------------------
 
 export function extractArchive(
   archiveBytes: ArrayBuffer | Uint8Array,
-  vol: MemoryVolume,
+  vol: IVolume,
   destDir: string,
   opts: ExtractionOptions = {},
 ): string[] {
@@ -187,7 +187,7 @@ export function extractArchive(
 // Offloads fetch + decompress + parse to a worker, then writes results to VFS on main thread
 export async function downloadAndExtract(
   url: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   destDir: string,
   opts: ExtractionOptions = {},
 ): Promise<string[]> {
@@ -234,7 +234,7 @@ export async function downloadAndExtract(
 // Main-thread fallback when workers aren't available
 export async function downloadAndExtractDirect(
   url: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   destDir: string,
   opts: ExtractionOptions = {},
 ): Promise<string[]> {

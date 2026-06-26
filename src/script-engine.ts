@@ -1,7 +1,7 @@
 // ScriptEngine — JS execution engine with require(), module resolution,
 // ESM-to-CJS conversion, and Node.js polyfills. Runs in the browser.
 
-import { MemoryVolume } from "./memory-volume";
+import type { IVolume } from "./types/volume";
 import type {
   IScriptEngine,
   ExecutionOutcome,
@@ -1130,7 +1130,7 @@ function wrapConsole(
 
 // ── Module resolver & loader ──
 function buildResolver(
-  vol: MemoryVolume,
+  vol: IVolume,
   fsBridge: FsBridge,
   proc: ProcessObject,
   baseDir: string,
@@ -2071,14 +2071,14 @@ function buildResolver(
 
 // ── ScriptEngine class ──
 export class ScriptEngine {
-  private vol: MemoryVolume;
+  private vol: IVolume;
   private fsBridge: FsBridge;
   private proc: ProcessObject;
   private moduleRegistry: Record<string, ModuleRecord> = {};
   private opts: EngineOptions;
   private transformCache: Map<string, string>;
 
-  constructor(vol: MemoryVolume, opts: EngineOptions = {}) {
+  constructor(vol: IVolume, opts: EngineOptions = {}) {
     // Use handler's LRU transform cache if available, else a plain Map
     if (opts.handler) {
       this.transformCache = opts.handler.transformCache as unknown as Map<
@@ -2167,7 +2167,7 @@ export class ScriptEngine {
               vfsPath = decodeURIComponent(url.slice(7));
             }
             const v = (globalThis as any).__nodepodVolume as
-              | MemoryVolume
+              | IVolume
               | undefined;
             if (v) {
               try {
@@ -2863,7 +2863,7 @@ export class ScriptEngine {
     }
   }
 
-  getVolume(): MemoryVolume {
+  getVolume(): IVolume {
     return this.vol;
   }
   getProcess(): ProcessObject {
@@ -2932,7 +2932,7 @@ while (true) {
 
 export function executeCode(
   code: string,
-  vol: MemoryVolume,
+  vol: IVolume,
   opts?: EngineOptions,
 ): { exports: unknown; module: ModuleRecord } {
   const engine = new ScriptEngine(vol, opts);

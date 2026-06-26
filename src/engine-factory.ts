@@ -4,7 +4,7 @@
 import { ScriptEngine } from './script-engine';
 import { WorkerSandbox } from './worker-sandbox';
 import { IframeSandbox } from './iframe-sandbox';
-import type { MemoryVolume } from './memory-volume';
+import type { IVolume } from './types/volume';
 import type { IScriptEngine, ExecutionOutcome, SpawnEngineConfig, EngineConfig } from './engine-types';
 import { ProcessManager } from './threading/process-manager';
 import { VFSBridge } from './threading/vfs-bridge';
@@ -17,7 +17,7 @@ function canUseWorker(): boolean {
 class SyncEngineAdapter implements IScriptEngine {
   private engine: ScriptEngine;
 
-  constructor(vol: MemoryVolume, cfg: EngineConfig = {}) {
+  constructor(vol: IVolume, cfg: EngineConfig = {}) {
     this.engine = new ScriptEngine(vol, cfg);
   }
 
@@ -30,7 +30,7 @@ class SyncEngineAdapter implements IScriptEngine {
   }
 
   clearCache(): void { this.engine.clearCache(); }
-  getVolume(): MemoryVolume { return this.engine.getVolume(); }
+  getVolume(): IVolume { return this.engine.getVolume(); }
 
   unwrap(): ScriptEngine { return this.engine; }
 }
@@ -38,7 +38,7 @@ class SyncEngineAdapter implements IScriptEngine {
 // create a script engine in the appropriate execution mode
 // throws if neither sandboxUrl nor allowUnsafeEval is specified
 export async function spawnEngine(
-  vol: MemoryVolume,
+  vol: IVolume,
   config: SpawnEngineConfig = {},
 ): Promise<IScriptEngine> {
   const { sandboxUrl, allowUnsafeEval, useWorker = false, ...engineCfg } = config;
@@ -80,12 +80,12 @@ export async function spawnEngine(
 // wraps ProcessManager-based workers behind IScriptEngine.
 // each execute()/runFile() spawns a new worker process.
 class ProcessWorkerAdapter implements IScriptEngine {
-  private _vol: MemoryVolume;
+  private _vol: IVolume;
   private _processManager: ProcessManager;
   private _vfsBridge: VFSBridge;
   private _cfg: EngineConfig;
 
-  constructor(vol: MemoryVolume, cfg: EngineConfig = {}) {
+  constructor(vol: IVolume, cfg: EngineConfig = {}) {
     this._vol = vol;
     this._cfg = cfg;
     this._processManager = new ProcessManager(vol);
@@ -152,7 +152,7 @@ class ProcessWorkerAdapter implements IScriptEngine {
   }
 
   clearCache(): void { }
-  getVolume(): MemoryVolume { return this._vol; }
+  getVolume(): IVolume { return this._vol; }
 
   getProcessManager(): ProcessManager { return this._processManager; }
 
@@ -163,7 +163,7 @@ class ProcessWorkerAdapter implements IScriptEngine {
 
 // create a process-worker engine where each execution runs in a dedicated Web Worker
 export async function spawnProcessWorkerEngine(
-  vol: MemoryVolume,
+  vol: IVolume,
   config: EngineConfig = {},
 ): Promise<ProcessWorkerAdapter> {
   return new ProcessWorkerAdapter(vol, config);

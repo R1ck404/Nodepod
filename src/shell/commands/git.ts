@@ -2,7 +2,7 @@
 // GitHub API support when GITHUB_TOKEN is set.
 
 import type { ShellCommand, ShellContext, ShellResult } from "../shell-types";
-import type { MemoryVolume } from "../../memory-volume";
+import type { IVolume } from "../../types/volume";
 import { ok, fail, RESET, DIM, GREEN, BOLD_RED, CYAN } from "../shell-helpers";
 import { VERSIONS } from "../../constants/config";
 import { proxiedFetch } from "../../cross-origin";
@@ -243,11 +243,11 @@ interface StashEntry {
 /* ------------------------------------------------------------------ */
 
 class GitRepo {
-  private vol: MemoryVolume;
+  private vol: IVolume;
   readonly gitDir: string;
   readonly workDir: string;
 
-  constructor(vol: MemoryVolume, workDir: string, gitDir: string) {
+  constructor(vol: IVolume, workDir: string, gitDir: string) {
     this.vol = vol;
     this.workDir = workDir;
     this.gitDir = gitDir;
@@ -748,7 +748,7 @@ async function githubApi(
 /*  Find .git directory                                                */
 /* ------------------------------------------------------------------ */
 
-function findGitDir(vol: MemoryVolume, cwd: string): { gitDir: string; workDir: string } | null {
+function findGitDir(vol: IVolume, cwd: string): { gitDir: string; workDir: string } | null {
   let dir = cwd;
   while (true) {
     const gitPath = dir + "/.git";
@@ -763,7 +763,7 @@ function findGitDir(vol: MemoryVolume, cwd: string): { gitDir: string; workDir: 
   return null;
 }
 
-function requireRepo(vol: MemoryVolume, cwd: string): { repo: GitRepo } | { error: ShellResult } {
+function requireRepo(vol: IVolume, cwd: string): { repo: GitRepo } | { error: ShellResult } {
   const found = findGitDir(vol, cwd);
   if (!found) {
     return { error: fail("fatal: not a git repository (or any of the parent directories): .git\n", 128) };

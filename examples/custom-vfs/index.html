@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>nodepod — custom VFS adapter (IndexedDB)</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+            h1 { font-size: 18px; margin-bottom: 8px; color: #fff; }
+            p { font-size: 13px; color: #888; margin-bottom: 20px; }
+            #output {
+                background: #0d0d1a; border: 1px solid #333; border-radius: 6px;
+                padding: 16px; min-height: 300px; white-space: pre-wrap;
+                font-size: 14px; line-height: 1.6; overflow-y: auto;
+            }
+            .stdout { color: #a8e6a3; }
+            .stderr { color: #e68a8a; }
+            .info { color: #8ac4e6; }
+            .dim { color: #555; }
+        </style>
+    </head>
+    <body>
+        <h1>nodepod — custom VFS adapter (IndexedDB write-through)</h1>
+        <p>
+            Demonstrates passing a custom <code>IVolume</code> to
+            <code>Nodepod.boot({ volume })</code>. Files persist across reloads
+            via IndexedDB while reads stay synchronous from memory. Reload the
+            page after the first run — the file written last time is still there.
+        </p>
+        <div id="output"></div>
+
+        <script type="module">
+            import { Nodepod } from "/dist/index.mjs";
+            import { IndexedDBVolume } from "./indexeddb-volume.ts";
+
+            const out = document.getElementById("output");
+            function log(text, cls = "stdout") {
+                const span = document.createElement("span");
+                span.className = cls;
+                span.textContent = text + "\n";
+                out.appendChild(span);
+                out.scrollTop = out.scrollHeight;
+            }
+
+            log("Creating IndexedDB-backed volume...", "info");
+            const volume = await IndexedDBVolume.create("nodepod-custom-vfs-demo");
+
+            // Show what was already persisted from a previous session
+            const existing = volume.readdirSync("/");
+            log(`Restored from IDB, root entries: ${JSON.stringify(existing)}`, "dim");
+
+            log("Booting nodepod with the custom volume...", "info");
+            const nodepod = await Nodepod.boot({
+                volume,
+                files: {
+                    // only written if not already present (writeFileSync overwrites;
+                    // for a "don't clobber restored files" policy, check existsSync first)
+                    "/hello.js": `
+console.log('Hello from nodepod with a custom IndexedDB VFS!');
+console.log('Reload the page — this file and /persisted.txt survive.');
+                `.trim(),
+                },
+            });
+
+            log("Booted!\n", "info");
+
+            log("--- Running hello.js ---", "dim");
+            const proc = await nodepod.spawn("node", ["hello.js"]);
+            proc.on("output", (text) => log(text.trimEnd()));
+            proc.on("error", (text) => log(text.trimEnd(), "stderr"));
+            await proc.completion;
+
+            // Write a file that will survive reload
+            log("\n--- Writing /persisted.txt (survives reload) ---", "dim");
+            const stamp = new Date().toISOString();
+            const writeProc = await nodepod.spawn(
+                `echo "written at ${stamp}" > /persisted.txt && cat /persisted.txt`,
+            );
+            writeProc.on("output", (text) => log(text.trimEnd()));
+            writeProc.on("error", (text) => log(text.trimEnd(), "stderr"));
+            await writeProc.completion;
+
+            // Make sure IDB writes have landed before the user closes the tab
+            await volume.flush();
+            log("\nFlushed to IndexedDB. Reload the page to see /persisted.txt restored.", "info");
+        </script>
+    </body>
+</html>

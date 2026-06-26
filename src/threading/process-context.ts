@@ -2,7 +2,7 @@
 // Replaces module-level mutable state (the old `let _xxx` in child_process, fs, etc.).
 // One active context on main thread; each worker gets its own.
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { createHandleRegistry, type HandleRegistry } from "../helpers/event-loop";
 
 // --- I/O interfaces ---
@@ -28,7 +28,7 @@ export interface ProcessContext {
   liveStdin: { emit: (e: string, ...a: unknown[]) => void } | null;
   abortController: AbortController;
 
-  volume: MemoryVolume;
+  volume: IVolume;
 
   /** typed Handle registry, tracks live async primitives for loop liveness */
   handles: HandleRegistry;
@@ -52,7 +52,7 @@ export interface OpenFileEntry {
 let _nextPid = 100;
 
 export function createProcessContext(opts: {
-  volume: MemoryVolume;
+  volume: IVolume;
   cwd?: string;
   env?: Record<string, string>;
   pid?: number;

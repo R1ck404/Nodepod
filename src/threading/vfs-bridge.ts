@@ -1,20 +1,20 @@
-// syncs the canonical MemoryVolume with worker VFS clones
+// syncs the canonical IVolume with worker VFS clones
 // creates snapshots for init, applies worker writes, broadcasts changes
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
 import type { SharedVFSController } from "./shared-vfs";
 
 const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
 
 export class VFSBridge {
-  private _volume: MemoryVolume;
+  private _volume: IVolume;
   private _broadcaster: ((path: string, content: ArrayBuffer | null, excludePid: number) => void) | null = null;
   private _sharedVFS: SharedVFSController | null = null;
   // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
 
-  constructor(volume: MemoryVolume) {
+  constructor(volume: IVolume) {
     this._volume = volume;
   }
 

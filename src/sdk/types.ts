@@ -1,5 +1,6 @@
 import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
+import type { IVolume } from "../types/volume";
 
 /* ---- Boot options ---- */
 
@@ -7,6 +8,18 @@ export interface NodepodOptions {
   files?: Record<string, string | Uint8Array>;
   env?: Record<string, string>;
   workdir?: string;
+  /**
+   * Custom virtual filesystem adapter. By default nodepod uses an in-memory
+   * `MemoryVolume`. Pass any object implementing `IVolume` to back the
+   * filesystem with IndexedDB, localStorage, a remote store, or anything
+   * else — avoiding memory bloat when dealing with many files.
+   *
+   * The adapter must be synchronous (nodepod emulates Node's sync fs/require
+   * via eval + SyncPromise). Async backends should pre-load into an
+   * in-memory cache and write-through on mutations. `opts.files` are still
+   * written into the provided volume on boot.
+   */
+  volume?: IVolume;
   /** URL of the nodepod service worker. Defaults to `/__sw__.js`. */
   swUrl?: string;
   /**

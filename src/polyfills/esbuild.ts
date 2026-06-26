@@ -1,6 +1,6 @@
-// esbuild polyfill -- loads esbuild-wasm from CDN, routes file I/O through MemoryVolume
+// esbuild polyfill -- loads esbuild-wasm from CDN, routes file I/O through IVolume
 
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { CDN_ESBUILD_BINARY, CDN_ESBUILD_BROWSER, cdnImport } from "../constants/cdn-urls";
 import { stripTopLevelAwait } from "../syntax-transforms";
 import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config";
@@ -117,9 +117,9 @@ export interface BundleOutput {
 let engine: typeof import("esbuild-wasm") | null = null;
 let bootPromise: Promise<void> | null = null;
 let wasmBinaryUrl: string = CDN_ESBUILD_BINARY;
-let volumeRef: MemoryVolume | null = null;
+let volumeRef: IVolume | null = null;
 
-export function setVolume(vol: MemoryVolume): void {
+export function setVolume(vol: IVolume): void {
   volumeRef = vol;
 }
 
@@ -386,7 +386,7 @@ function pickCondition(entry: ExportValue, platform?: string, conditions?: strin
 }
 
 function locateModule(
-  vol: MemoryVolume,
+  vol: IVolume,
   specifier: string,
   exts: string[],
   fromDir?: string,
@@ -455,7 +455,7 @@ function locateModule(
 }
 
 function resolveSubpath(
-  vol: MemoryVolume,
+  vol: IVolume,
   pkg: PackageJson,
   base: string,
   sub: string,
@@ -479,7 +479,7 @@ function resolveSubpath(
 }
 
 function resolveRoot(
-  vol: MemoryVolume,
+  vol: IVolume,
   pkg: PackageJson,
   base: string,
   exts: string[],
@@ -504,7 +504,7 @@ function resolveRoot(
 
 // resolve #-prefixed subpath imports via package.json "imports" field
 function resolvePackageImport(
-  vol: MemoryVolume,
+  vol: IVolume,
   specifier: string,
   exts: string[],
   fromDir: string,
@@ -563,7 +563,7 @@ function resolvePackageImport(
 }
 
 function probeFile(
-  vol: MemoryVolume,
+  vol: IVolume,
   candidate: string,
   exts: string[],
 ): string | null {

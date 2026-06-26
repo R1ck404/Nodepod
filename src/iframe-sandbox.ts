@@ -1,6 +1,6 @@
 // executes code in a cross-origin iframe for maximum browser isolation
 
-import type { MemoryVolume } from './memory-volume';
+import type { IVolume } from './types/volume';
 import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types';
 
 interface CrossOriginMessage {
@@ -21,7 +21,7 @@ interface CrossOriginMessage {
 export class IframeSandbox implements IScriptEngine {
   private frame: HTMLIFrameElement;
   private targetOrigin: string;
-  private vol: MemoryVolume;
+  private vol: IVolume;
   private cfg: EngineConfig;
   private ready: Promise<void>;
   private pendingCalls = new Map<string, { resolve: (r: ExecutionOutcome) => void; reject: (e: Error) => void }>();
@@ -30,7 +30,7 @@ export class IframeSandbox implements IScriptEngine {
   private onFileDelete: ((p: string) => void) | null = null;
   private onMessage: ((e: MessageEvent) => void) | null = null;
 
-  constructor(sandboxUrl: string, vol: MemoryVolume, cfg: EngineConfig = {}) {
+  constructor(sandboxUrl: string, vol: IVolume, cfg: EngineConfig = {}) {
     this.targetOrigin = new URL(sandboxUrl).origin;
     this.vol = vol;
     this.cfg = cfg;
@@ -132,7 +132,7 @@ export class IframeSandbox implements IScriptEngine {
     this.frame.contentWindow?.postMessage({ type: 'clearCache' } as CrossOriginMessage, '*');
   }
 
-  getVolume(): MemoryVolume { return this.vol; }
+  getVolume(): IVolume { return this.vol; }
 
   terminate(): void {
     if (this.onFileChange) this.vol.off('change', this.onFileChange);

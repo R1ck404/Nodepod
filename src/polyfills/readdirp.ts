@@ -1,11 +1,12 @@
-// Recursive directory listing polyfill (readdirp-compatible) on MemoryVolume
+// Recursive directory listing polyfill (readdirp-compatible) on IVolume
 
 
-import type { MemoryVolume, FileStat } from "../memory-volume";
+import type { FileStat } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { setSharedVolume, getSharedVolume } from "./volume-registry";
 
 
-export function setVolume(vol: MemoryVolume): void {
+export function setVolume(vol: IVolume): void {
   setSharedVolume(vol);
 }
 

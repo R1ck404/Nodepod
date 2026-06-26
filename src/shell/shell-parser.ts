@@ -11,7 +11,7 @@ import type {
   CommandNode,
   RedirectNode,
 } from "./shell-types";
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 
 /* ------------------------------------------------------------------ */
 /*  Variable & substitution expansion                                  */
@@ -119,7 +119,7 @@ export function expandVariables(
 export function expandGlob(
   pattern: string,
   cwd: string,
-  volume: MemoryVolume,
+  volume: IVolume,
 ): string[] {
   if (!pattern.includes("*") && !pattern.includes("?")) return [pattern];
 

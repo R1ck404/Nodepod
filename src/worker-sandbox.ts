@@ -1,7 +1,7 @@
 // executes code in a dedicated Web Worker behind the IScriptEngine interface
 
 import { wrap, proxy, Remote } from 'comlink';
-import type { MemoryVolume } from './memory-volume';
+import type { IVolume } from './types/volume';
 import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types';
 
 interface WorkerEndpoint {
@@ -25,13 +25,13 @@ function createWorker(): Worker {
 export class WorkerSandbox implements IScriptEngine {
   private thread: Worker;
   private endpoint: Remote<WorkerEndpoint>;
-  private vol: MemoryVolume;
+  private vol: IVolume;
   private cfg: EngineConfig;
   private ready: Promise<void>;
   private onFileChange: ((path: string, content: string) => void) | null = null;
   private onFileDelete: ((path: string) => void) | null = null;
 
-  constructor(vol: MemoryVolume, cfg: EngineConfig = {}) {
+  constructor(vol: IVolume, cfg: EngineConfig = {}) {
     this.vol = vol;
     this.cfg = cfg;
 
@@ -78,7 +78,7 @@ export class WorkerSandbox implements IScriptEngine {
     this.endpoint.clearCache();
   }
 
-  getVolume(): MemoryVolume {
+  getVolume(): IVolume {
     return this.vol;
   }
 

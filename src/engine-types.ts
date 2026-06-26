@@ -1,6 +1,6 @@
 // shared types for the script engine and its execution modes
 
-import type { MemoryVolume } from './memory-volume';
+import type { IVolume } from './types/volume';
 
 export interface EngineConfig {
   cwd?: string;
@@ -29,7 +29,7 @@ export interface IScriptEngine {
   execute(code: string, filename?: string): Promise<ExecutionOutcome>;
   runFile(filename: string): Promise<ExecutionOutcome>;
   clearCache(): void;
-  getVolume?(): MemoryVolume;
+  getVolume?(): IVolume;
   terminate?(): void;
 }
 

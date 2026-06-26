@@ -10,7 +10,7 @@ import type {
   CommandNode,
   BuiltinFn,
 } from "./shell-types";
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 import { parse, expandGlob } from "./shell-parser";
 import { builtins } from "./shell-builtins";
 
@@ -27,7 +27,7 @@ export type SpawnChildCallback = (
 ) => Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>;
 
 export class NodepodShell {
-  private volume: MemoryVolume;
+  private volume: IVolume;
   private cwd: string;
   private env: Record<string, string>;
   private commands = new Map<string, ShellCommand>();
@@ -39,7 +39,7 @@ export class NodepodShell {
   private _spawnChild: SpawnChildCallback | null = null;
 
   constructor(
-    volume: MemoryVolume,
+    volume: IVolume,
     opts?: { cwd?: string; env?: Record<string, string> },
   ) {
     this.volume = volume;

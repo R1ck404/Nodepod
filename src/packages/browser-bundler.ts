@@ -6,14 +6,14 @@ import {
   setVolume as setVFS,
   type BundleOutput as BuildResult,
 } from "../polyfills/esbuild";
-import type { MemoryVolume } from "../memory-volume";
+import type { IVolume } from "../types/volume";
 
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
 
 const bundledModules = new Map<string, string>();
-let activeVolume: MemoryVolume | null = null;
+let activeVolume: IVolume | null = null;
 let externalPackages: string[] = [];
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ export function invalidateBundleCache(): void {
 }
 
 // Must be called before bundleForBrowser
-export function attachVolume(vol: MemoryVolume): void {
+export function attachVolume(vol: IVolume): void {
   setVFS(vol);
   activeVolume = vol;
 }
@@ -264,9 +264,9 @@ function injectNamedExports(code: string, names: string[]): string {
 // ---------------------------------------------------------------------------
 
 export class BrowserBundler {
-  private vol: MemoryVolume;
+  private vol: IVolume;
 
-  constructor(vol: MemoryVolume, options?: { external?: string[] }) {
+  constructor(vol: IVolume, options?: { external?: string[] }) {
     this.vol = vol;
     attachVolume(vol);
     if (options?.external) setExternalPackages(options.external);
