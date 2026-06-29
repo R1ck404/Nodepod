@@ -1177,6 +1177,7 @@ function buildResolver(
     id: string,
     fromDir: string,
     preferEsm: boolean = false,
+    preferFilesystem: boolean = false,
   ): string => {
     if (typeof id !== "string") {
       throw new TypeError(
@@ -1206,12 +1207,13 @@ function buildResolver(
     if (id.includes("\\")) id = id.replace(/\\/g, "/");
 
     if (
-      CORE_MODULES[id] ||
-      id === "fs" ||
-      id === "process" ||
-      id === "url" ||
-      id === "querystring" ||
-      id === "util"
+      !preferFilesystem &&
+      (CORE_MODULES[id] ||
+        id === "fs" ||
+        id === "process" ||
+        id === "url" ||
+        id === "querystring" ||
+        id === "util")
     ) {
       return id;
     }
@@ -1850,10 +1852,24 @@ function buildResolver(
           err.code = "MODULE_NOT_FOUND";
           throw err;
         }
+        const resolveFilename = (fromDir: string): string => {
+          try {
+            return resolveId(request, fromDir, false, true);
+          } catch {
+            if (
+              request === "fs" ||
+              request === "process" ||
+              CORE_MODULES[request]
+            ) {
+              return request;
+            }
+            throw new Error(`Cannot find module '${request}'`);
+          }
+        };
         if (options?.paths && Array.isArray(options.paths)) {
           for (const p of options.paths) {
             try {
-              return resolveId(request, p);
+              return resolveFilename(p);
             } catch {
               /* try next */
             }
@@ -1865,7 +1881,7 @@ function buildResolver(
               const dir = p.endsWith("/node_modules")
                 ? pathPolyfill.dirname(p)
                 : p;
-              return resolveId(request, dir);
+              return resolveFilename(dir);
             } catch {
               /* try next */
             }
@@ -1875,7 +1891,7 @@ function buildResolver(
           ? pathPolyfill.dirname(parent.filename)
           : baseDir;
         try {
-          return resolveId(request, fromDir);
+          return resolveFilename(fromDir);
         } catch {
           const err: any = new Error(`Cannot find module '${request}'`);
           err.code = "MODULE_NOT_FOUND";
@@ -2042,17 +2058,24 @@ function buildResolver(
   };
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
-    if (id === "fs" || id === "process" || CORE_MODULES[id]) return id;
     if (options?.paths && Array.isArray(options.paths)) {
       for (const p of options.paths) {
         try {
-          return resolveId(id, p);
+          return resolveId(id, p, false, true);
         } catch {
           /* try next */
         }
       }
     }
-    return resolveId(id, baseDir);
+    try {
+      return resolveId(id, baseDir, false, true);
+    } catch {
+      /* fall through to built-in bare names */
+    }
+    if (id === "fs" || id === "process" || CORE_MODULES[id]) return id;
+    const err: any = new Error(`Cannot find module '${id}'`);
+    err.code = "MODULE_NOT_FOUND";
+    throw err;
   };
 
   resolver.cache = cache;
