@@ -14,12 +14,24 @@ export const StringDecoder = function StringDecoder(this: any, encoding?: string
 
 StringDecoder.prototype.write = function write(buf: Uint8Array | Buffer): string {
   if (!buf || buf.length === 0) return "";
+  if (!this._decoder) {
+    this._decoder = new TextDecoder(this.encoding, { fatal: false });
+  }
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  return new TextDecoder(this.encoding).decode(bytes);
+  return this._decoder.decode(bytes, { stream: true });
 };
 
 StringDecoder.prototype.end = function end(buf?: Uint8Array | Buffer): string {
-  return buf ? this.write(buf) : "";
+  if (!this._decoder) {
+    this._decoder = new TextDecoder(this.encoding, { fatal: false });
+  }
+  let out = "";
+  if (buf && buf.length) {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    out = this._decoder.decode(bytes, { stream: true });
+  }
+  out += this._decoder.decode();
+  return out;
 };
 
 export default { StringDecoder };

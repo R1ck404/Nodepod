@@ -142,6 +142,23 @@ export const wrapper = [
 export function syncBuiltinESMExports(): void {
 }
 
+// Node's module.findSourceMap — we don't track source maps, returning
+// undefined is a valid "no source map found" answer (Next.js probes this
+// when rendering dev error overlays).
+export function findSourceMap(_path: string): undefined {
+  return undefined;
+}
+
+export class SourceMap {
+  payload: unknown;
+  constructor(payload: unknown) {
+    this.payload = payload;
+  }
+  findEntry(_line: number, _column: number): undefined {
+    return undefined;
+  }
+}
+
 export function Module(this: any, id?: string, parent?: any) {
   this.id = id || "";
   this.filename = id || "";
@@ -180,6 +197,8 @@ Module._nodeModulePaths = _nodeModulePaths;
 Module._load = _load;
 Module._findPath = _findPath;
 Module.syncBuiltinESMExports = syncBuiltinESMExports;
+Module.findSourceMap = findSourceMap;
+Module.SourceMap = SourceMap;
 Module.wrap = wrap;
 Module.wrapper = wrapper;
 Module.Module = Module; 

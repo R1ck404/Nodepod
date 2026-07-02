@@ -814,13 +814,31 @@ const WATERMARK_SCRIPT = `<script>
 
 // ── Error page generator ──
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function sanitizeProxyHeaders(h) {
+  const forbidden = ["set-cookie", "set-cookie2", "clear-site-data"];
+  for (const key of Object.keys(h)) {
+    if (forbidden.includes(key.toLowerCase())) delete h[key];
+  }
+  h["Cache-Control"] = "no-store";
+  return h;
+}
+
 function errorPage(status, title, message) {
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${status} - ${title}</title>
+<title>${escapeHtml(status)} - ${escapeHtml(title)}</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -838,9 +856,9 @@ function errorPage(status, title, message) {
 </head>
 <body>
 <div class="container">
-  <div class="status">${status}</div>
-  <div class="title">${title}</div>
-  <div class="message">${message}</div>
+  <div class="status">${escapeHtml(status)}</div>
+  <div class="title">${escapeHtml(title)}</div>
+  <div class="message">${escapeHtml(message)}</div>
   <div class="hint">Powered by Nodepod</div>
 </div>
 </body>
@@ -969,7 +987,8 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       let injection = LOCATION_PATCH_SCRIPT + getWsShimScript(instanceId, serverPort);
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
-        injection += `<script>${previewScript}<` + `/script>`;
+        const safe = String(previewScript).replace(/<\/script/gi, "<\\/script");
+        injection += `<script>${safe}<` + `/script>`;
       }
       if (watermarkEnabled) {
         injection += WATERMARK_SCRIPT;
@@ -1011,16 +1030,24 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
 
     // If the virtual server returned 404 and we have the original request,
-    // fall back to a real network fetch. This handles cases where the preview
-    // app generates relative URLs for external resources (e.g. fonts, CDN assets)
-    // that the virtual server doesn't serve.
+    // fall back to a real network fetch for cross-origin assets only.
     if ((data.statusCode === 404) && fallbackRequest) {
       try {
-        return await fetch(fallbackRequest);
+        const fbUrl = new URL(fallbackRequest.url);
+        if (fbUrl.origin !== self.location.origin) {
+          return await fetch(fbUrl.href, {
+            method: fallbackRequest.method,
+            headers: fallbackRequest.headers,
+            credentials: "omit",
+            redirect: "follow",
+          });
+        }
       } catch (fetchErr) {
         // Fall through to return the original 404
       }
     }
+
+    sanitizeProxyHeaders(respHeaders);
 
     return new Response(finalBody, {
       status: data.statusCode || 200,

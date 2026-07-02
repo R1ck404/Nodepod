@@ -1902,6 +1902,8 @@ function buildResolver(
       PerEngineModule._findPath = moduleSysPolyfill._findPath;
       PerEngineModule.syncBuiltinESMExports =
         moduleSysPolyfill.syncBuiltinESMExports;
+      PerEngineModule.findSourceMap = moduleSysPolyfill.findSourceMap;
+      PerEngineModule.SourceMap = moduleSysPolyfill.SourceMap;
       PerEngineModule.wrap = moduleSysPolyfill.wrap;
       PerEngineModule.wrapper = moduleSysPolyfill.wrapper;
       PerEngineModule.Module = PerEngineModule;
@@ -2138,6 +2140,15 @@ export class ScriptEngine {
       // prewarm now while the parent thread is free. chrome wont schedule
       // child workers spawned from a parent thats about to Atomics.wait
       try { prewarmWasiPool(); } catch (err) { _nativeConsole.warn("[Nodepod] WASI pool prewarm failed:", err); }
+    }
+
+    // Next.js createAsyncLocalStorage() prefers globalThis.AsyncLocalStorage over
+    // require('async_hooks'). Install our propagation-aware polyfill so
+    // workUnitAsyncStorage / workAsyncStorage survive await boundaries.
+    asyncCtxPolyfill.installAsyncContext();
+    if (!(globalThis as any).AsyncLocalStorage?.__nodepodAsyncCtx) {
+      (globalThis as any).AsyncLocalStorage = asyncCtxPolyfill.AsyncLocalStorage;
+      ((globalThis as any).AsyncLocalStorage as any).__nodepodAsyncCtx = true;
     }
 
     // Intercept fetch() for file:// URLs — serve from VFS instead of network.

@@ -10,6 +10,8 @@ import type {
   MainToWorker_Exec,
 } from "./worker-protocol";
 
+const MAX_HANDLE_OUTPUT_BYTES = 5_000_000;
+
 /* ------------------------------------------------------------------ */
 /*  ProcessHandle                                                      */
 /* ------------------------------------------------------------------ */
@@ -47,6 +49,12 @@ export class ProcessHandle extends EventEmitter {
 
   get stdout(): string { return this._stdout; }
   get stderr(): string { return this._stderr; }
+
+  private _trim(s: string): string {
+    return s.length > MAX_HANDLE_OUTPUT_BYTES
+      ? s.slice(-Math.floor(MAX_HANDLE_OUTPUT_BYTES * 0.75))
+      : s;
+  }
 
   get state(): ProcessState { return this._state; }
   get exitCode(): number | undefined { return this._exitCode; }
@@ -159,20 +167,20 @@ export class ProcessHandle extends EventEmitter {
           break;
 
         case "stdout":
-          this._stdout += msg.data;
+          this._stdout = this._trim(this._stdout + msg.data);
           this.emit("stdout", msg.data);
           break;
 
         case "stderr":
-          this._stderr += msg.data;
+          this._stderr = this._trim(this._stderr + msg.data);
           this.emit("stderr", msg.data);
           break;
 
         case "exit": {
           const stdout = msg.stdout || this._stdout;
           const stderr = msg.stderr || this._stderr;
-          this._stdout = stdout;
-          this._stderr = stderr;
+          this._stdout = this._trim(stdout);
+          this._stderr = this._trim(stderr);
           if (this._exitHoldCount > 0) {
             // Children still running — defer exit, keep output flowing
             this._deferredExit = { exitCode: msg.exitCode, stdout, stderr };

@@ -130,43 +130,60 @@ class BufferPolyfill extends Uint8Array {
 
   // ---- Instance methods ----
 
-  toString(enc: BufferEncoding = 'utf8'): string {
+  toString(enc: BufferEncoding = 'utf8', start?: number, end?: number): string {
     const lower = (enc || 'utf8').toLowerCase();
 
-    if (lower === 'base64') return bytesToBase64(this);
+    // Node supports toString(encoding, start, end) — webpack's wasm-hash
+    // relies on it to read a small hex digest out of a whole-memory Buffer view
+    let view: BufferPolyfill = this;
+    if (start !== undefined || end !== undefined) {
+      const from = Math.max(0, Math.min(this.length, start ?? 0));
+      const to = Math.max(from, Math.min(this.length, end ?? this.length));
+      view = this.subarray(from, to);
+    }
+
+    if (lower === 'base64') return bytesToBase64(view);
 
     if (lower === 'base64url') {
-      return bytesToBase64(this).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+      return bytesToBase64(view).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     }
 
-    if (lower === 'hex') return bytesToHex(this);
+    if (lower === 'hex') return bytesToHex(view);
 
-    if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(this);
+    if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(view);
 
     // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
-    if (typeof SharedArrayBuffer !== "undefined" && this.buffer instanceof SharedArrayBuffer) {
-      const copy = new Uint8Array(this.byteLength);
-      copy.set(this);
+    if (typeof SharedArrayBuffer !== "undefined" && view.buffer instanceof SharedArrayBuffer) {
+      const copy = new Uint8Array(view.byteLength);
+      copy.set(view);
       return textDec.decode(copy);
     }
-    return textDec.decode(this);
+    return textDec.decode(view);
   }
 
   slice(begin?: number, end?: number): BufferPolyfill {
-    return new BufferPolyfill(super.slice(begin, end));
+    return this.subarray(begin, end);
   }
 
   subarray(begin?: number, end?: number): BufferPolyfill {
-    return new BufferPolyfill(super.subarray(begin, end));
+    const view = super.subarray(begin, end);
+    return Object.setPrototypeOf(view, BufferPolyfill.prototype) as BufferPolyfill;
   }
 
   write(string: string, encoding?: BufferEncoding): number;
   write(string: string, offset: number, encoding?: BufferEncoding): number;
   write(string: string, offset: number, length: number, encoding?: BufferEncoding): number;
-  write(string: string, offsetOrEncoding?: number | BufferEncoding, lengthOrEncoding?: number | BufferEncoding, _encoding?: BufferEncoding): number {
+  write(string: string, offsetOrEncoding?: number | BufferEncoding, lengthOrEncoding?: number | BufferEncoding, encoding?: BufferEncoding): number {
     const offset = typeof offsetOrEncoding === "number" ? offsetOrEncoding : 0;
-    const encoded = textEnc.encode(string);
-    const len = typeof lengthOrEncoding === "number" ? Math.min(lengthOrEncoding, encoded.length) : encoded.length;
+    let enc: BufferEncoding | undefined;
+    if (typeof offsetOrEncoding === "string") enc = offsetOrEncoding;
+    else if (typeof lengthOrEncoding === "string") enc = lengthOrEncoding;
+    else enc = encoding;
+    // webpack's wasm-hash writes binary strings with "latin1"; utf8-encoding
+    // those would expand chars >= 0x80 to two bytes and corrupt the hash state
+    const encoded = BufferPolyfill.from(string, enc || "utf8");
+    let len = typeof lengthOrEncoding === "number" ? Math.min(lengthOrEncoding, encoded.length) : encoded.length;
+    len = Math.min(len, this.length - offset);
     this.set(encoded.subarray(0, len), offset);
     return len;
   }

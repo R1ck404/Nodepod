@@ -93,6 +93,23 @@ describe("Buffer", () => {
       const buf = Buffer.from([0xe9]);
       expect(buf.toString("latin1")).toBe("\xe9");
     });
+
+    // webpack's wasm-hash reads a small digest out of a whole-memory Buffer
+    // view via toString("latin1", 0, len); ignoring the range corrupted every
+    // [hash] placeholder (e.g. next/font emitted garbage into CSS urls)
+    it("honors start/end range arguments", () => {
+      const buf = Buffer.from("0123456789abcdef-GARBAGE-AFTER");
+      expect(buf.toString("utf8", 0, 16)).toBe("0123456789abcdef");
+      expect(buf.toString("latin1", 0, 16)).toBe("0123456789abcdef");
+      expect(buf.toString("utf8", 17, 24)).toBe("GARBAGE");
+      expect(buf.toString("hex", 0, 2)).toBe("3031");
+    });
+
+    it("clamps out-of-range start/end", () => {
+      const buf = Buffer.from("abc");
+      expect(buf.toString("utf8", 0, 100)).toBe("abc");
+      expect(buf.toString("utf8", 2, 1)).toBe("");
+    });
   });
 
   describe("slice / subarray", () => {
@@ -101,10 +118,11 @@ describe("Buffer", () => {
       expect(buf.slice(1, 3).toString()).toBe("el");
     });
 
-    it("slice result is a Buffer-like", () => {
-      const buf = Buffer.from("test");
-      const sliced = buf.slice(0, 2);
-      expect(sliced).toBeInstanceOf(Uint8Array);
+    it("slice aliases parent memory", () => {
+      const buf = Buffer.from([1, 2, 3, 4]);
+      const s = buf.slice(1, 3);
+      s[0] = 99;
+      expect(buf[1]).toBe(99);
     });
   });
 

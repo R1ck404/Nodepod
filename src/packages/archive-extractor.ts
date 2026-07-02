@@ -9,6 +9,15 @@ import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
 
+/** Returns safe absolute path if relative stays inside destDir, else null (zip-slip guard). */
+export function safeJoin(destDir: string, relative: string): string | null {
+  const base = path.normalize(destDir).replace(/\/+$/, "");
+  const abs = path.normalize(path.join(base, relative));
+  if (abs === base) return abs;
+  if (abs.startsWith(base + "/")) return abs;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -160,7 +169,8 @@ export function extractArchive(
 
     if (filter && !filter(relative)) continue;
 
-    const absolute = path.join(destDir, relative);
+    const absolute = safeJoin(destDir, relative);
+    if (!absolute) continue;
 
     if (entry.kind === "directory") {
       vol.mkdirSync(absolute, { recursive: true });
@@ -206,7 +216,8 @@ export async function downloadAndExtract(
   for (const file of result.files) {
     if (opts.filter && !opts.filter(file.path)) continue;
 
-    const absolute = path.join(destDir, file.path);
+    const absolute = safeJoin(destDir, file.path);
+    if (!absolute) continue;
     const parentDir = path.dirname(absolute);
     vol.mkdirSync(parentDir, { recursive: true });
 

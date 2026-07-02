@@ -22,10 +22,18 @@ Script.prototype.runInThisContext = function runInThisContext(_opts?: object): u
 };
 
 Script.prototype.runInNewContext = function runInNewContext(ctx?: object, _opts?: object): unknown {
-  const names = ctx ? Object.keys(ctx) : [];
-  const vals = ctx ? Object.values(ctx) : [];
-  const wrapper = new Function(...names, `return eval(${JSON.stringify(this._src)})`);
-  return wrapper(...vals);
+  const sandbox = (ctx ?? {}) as Record<string, unknown>;
+  // In Node's vm, the sandbox IS the context's global object: writes to
+  // `globalThis.foo` / `this.foo` inside the script must land on the sandbox.
+  // Next.js relies on this (evalManifest reads ctx.__RSC_MANIFEST back out).
+  // We emulate it by shadowing `globalThis` with the sandbox and binding
+  // `this` to it; sandbox keys are also exposed as local bindings.
+  const names = Object.keys(sandbox).filter(
+    (n) => n !== "globalThis" && n !== "self" && n !== "this",
+  );
+  const vals = names.map((n) => sandbox[n]);
+  const wrapper = new Function("globalThis", "self", ...names, `return eval(${JSON.stringify(this._src)})`);
+  return wrapper.call(sandbox, sandbox, sandbox, ...vals);
 };
 
 Script.prototype.runInContext = function runInContext(ctx: object, _opts?: object): unknown {

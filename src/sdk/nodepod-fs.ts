@@ -60,6 +60,21 @@ export class NodepodFS {
     }
   }
 
+  async rm(path: string, opts?: { recursive?: boolean; force?: boolean }): Promise<void> {
+    const exists = this._vol.existsSync(path);
+    if (!exists) {
+      if (opts?.force) return;
+      throw new Error(`ENOENT: no such file or directory, rm '${path}'`);
+    }
+    const st = this._vol.statSync(path);
+    if (st.isDirectory()) {
+      if (opts?.recursive) this._removeRecursive(path);
+      else this._vol.rmdirSync(path);
+    } else {
+      this._vol.unlinkSync(path);
+    }
+  }
+
   async rename(from: string, to: string): Promise<void> {
     this._vol.renameSync(from, to);
   }

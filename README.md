@@ -106,7 +106,7 @@ terminal.attach('#terminal-container');
 ### npm packages
 
 ```typescript
-await nodepod.install(['express']);
+await nodepod.packages.install('express');
 const proc = await nodepod.spawn('node', ['server.js']);
 ```
 
@@ -126,11 +126,11 @@ const nodepod = await Nodepod.boot({
   },
 });
 
-await nodepod.install(['express']);
+await nodepod.packages.install('express');
 await nodepod.spawn('node', ['server.js']);
 
-const response = await nodepod.request(3000, 'GET', '/');
-console.log(response.body); // { ok: true }
+const response = await nodepod.proxy.handleRequest(3000, 'GET', '/', {});
+console.log(response.body.toString()); // {"ok":true}
 ```
 
 ### Snapshots
@@ -162,7 +162,7 @@ await nodepod.restore(snapshot);
 | Method | Description |
 |--------|-------------|
 | `spawn(cmd, args?, opts?)` | Run a command |
-| `install(packages)` | Install npm packages |
+| `packages.install(name, version?, flags?)` | Install an npm package |
 | `createTerminal(opts)` | Create an xterm.js terminal |
 | `fs.readFile(path, enc?)` | Read a file |
 | `fs.writeFile(path, data)` | Write a file |
@@ -172,7 +172,7 @@ await nodepod.restore(snapshot);
 | `fs.rm(path, opts?)` | Remove file/directory |
 | `snapshot()` | Capture filesystem state |
 | `restore(snapshot)` | Restore from snapshot |
-| `request(port, method, path)` | Send request to virtual server |
+| `proxy.handleRequest(port, method, url, headers, body?)` | Send a request to a virtual server |
 | `port(num)` | Get preview URL for a port |
 | `setPreviewScript(js)` | Inject JS into preview iframes |
 | `clearPreviewScript()` | Remove injected script |
@@ -190,9 +190,9 @@ await proc.completion;             // wait for exit
 
 ## Polyfills
 
-**Full:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode
+**Full:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode, worker_threads
 
-**Stubs:** dns, worker_threads, vm, v8, tls, dgram, cluster, http2, inspector, domain, diagnostics_channel, async_hooks
+**Stubs:** dns, vm, v8, tls, dgram, cluster, http2, inspector, domain, diagnostics_channel, async_hooks
 
 **In development:** Native WASI/WASM loading for napi-rs based packages (rolldown, lightningcss, etc.)
 
@@ -207,9 +207,10 @@ We open-sourced it because we think running Node in the browser shouldn't be a p
 ```bash
 git clone https://github.com/ScelarOrg/Nodepod.git
 cd Nodepod
-npm install
-npm run build:publish   # build library + types
-npm test                # run tests
+corepack enable
+pnpm install
+pnpm run build:publish   # build library + types
+pnpm test                # run tests
 ```
 
 ### Publishing a new version
@@ -229,9 +230,9 @@ Note that nodepod is not my main focus, [Scelar](https://scelar.com) is. I work 
 Before opening a PR, make sure these pass:
 
 ```bash
-npm run type-check      # 0 TypeScript errors
-npm run build:publish   # builds cleanly
-npm test                # tests pass
+pnpm run type-check      # 0 TypeScript errors
+pnpm run build:publish   # builds cleanly
+pnpm test                # tests pass
 ```
 
 **Code style:**

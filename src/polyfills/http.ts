@@ -7,6 +7,7 @@ import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import { TcpSocket, TcpServer, type NetAddress } from "./net";
 import { createHash } from "./crypto";
+import { resolveProxyUrl } from "../cross-origin";
 // no event-loop import, the net.Server under us already registers TCPServerWrap
 import { TIMEOUTS } from "../constants/config";
 
@@ -182,6 +183,7 @@ export interface ServerResponse extends Writable {
   appendHeader(key: string, val: string | string[]): this;
   removeHeader(key: string): void;
   flushHeaders(): void;
+  _implicitHeader(): void;
   writeContinue(): void;
   writeProcessing(): void;
   writeEarlyHints(hints: Record<string, string | string[]>, cb?: () => void): void;
@@ -283,6 +285,14 @@ ServerResponse.prototype.removeHeader = function removeHeader(key: string): void
 
 ServerResponse.prototype.flushHeaders = function flushHeaders(): void {
   this.headersSent = true;
+};
+
+// Node internal API: flush implicit headers if none were sent explicitly.
+// Next.js's response proxy calls res._implicitHeader() from end().
+ServerResponse.prototype._implicitHeader = function _implicitHeader(): void {
+  if (!this.headersSent) {
+    this.writeHead(this.statusCode);
+  }
 };
 
 ServerResponse.prototype.writeContinue = function writeContinue(): void {
@@ -733,17 +743,7 @@ export const METHODS = [
   "TRACE",
 ];
 
-// CORS proxy helper
-
-function fetchProxy(): string | null {
-  try {
-    return typeof localStorage !== "undefined"
-      ? (localStorage.getItem("__corsProxyUrl") ?? null)
-      : null;
-  } catch {
-    return null;
-  }
-}
+// CORS proxy helper — unified with cross-origin.ts allowlist
 
 // ClientRequest  (fetch-backed)
 
@@ -964,8 +964,14 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
       return;
     }
 
-    const proxy = fetchProxy();
-    const targetUrl = proxy ? proxy + encodeURIComponent(endpoint) : endpoint;
+    let targetUrl: string;
+    try {
+      targetUrl = resolveProxyUrl(endpoint);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      this.emit("error", err);
+      return;
+    }
 
     const init: RequestInit = { method: this.method, headers: this.headers };
     if (

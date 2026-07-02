@@ -39,8 +39,12 @@ export class ProcessManager extends EventEmitter {
   // pids of children that inherit their parent's stdin. stdin-forward only
   // routes to pids in this set. stdio:'pipe' kids get their own isolated stdin.
   private _inheritStdinChildren = new Set<number>();
-  private _httpCallbacks = new Map<number, (resp: WorkerToMain_HttpResponse) => void>();
+  private _httpCallbacks = new Map<
+    number,
+    { pid: number; fn: (resp: WorkerToMain_HttpResponse) => void }
+  >();
   private _nextHttpRequestId = 1;
+  private static readonly HTTP_REQUEST_TIMEOUT_MS = 300_000;
 
   constructor(volume: MemoryVolume) {
     super();
@@ -259,17 +263,29 @@ export class ProcessManager extends EventEmitter {
     }
 
     const requestId = this._nextHttpRequestId++;
-    // console.log(`[PM] dispatchHttpRequest #${requestId} ${method} ${path} → pid ${pid}`);
     return new Promise((resolve) => {
-      this._httpCallbacks.set(requestId, (resp) => {
+      const timer = setTimeout(() => {
         this._httpCallbacks.delete(requestId);
-        // console.log(`[PM] http-response #${requestId} status=${resp.statusCode}`);
         resolve({
-          statusCode: resp.statusCode,
-          statusMessage: resp.statusMessage,
-          headers: resp.headers,
-          body: resp.body,
+          statusCode: 504,
+          statusMessage: "Gateway Timeout",
+          headers: { "Content-Type": "text/plain" },
+          body: `No response from server on port ${port}`,
         });
+      }, ProcessManager.HTTP_REQUEST_TIMEOUT_MS);
+
+      this._httpCallbacks.set(requestId, {
+        pid,
+        fn: (resp) => {
+          clearTimeout(timer);
+          this._httpCallbacks.delete(requestId);
+          resolve({
+            statusCode: resp.statusCode,
+            statusMessage: resp.statusMessage,
+            headers: resp.headers,
+            body: resp.body,
+          });
+        },
       });
 
       handle.postMessage({
@@ -358,8 +374,9 @@ export class ProcessManager extends EventEmitter {
         }
       }
       // drain pending HTTP callbacks for this worker so they don't leak
-      for (const [reqId, cb] of this._httpCallbacks) {
-        cb({
+      for (const [reqId, entry] of this._httpCallbacks) {
+        if (entry.pid !== handle.pid) continue;
+        entry.fn({
           type: "http-response",
           requestId: reqId,
           statusCode: 503,
@@ -955,8 +972,8 @@ export class ProcessManager extends EventEmitter {
     });
 
     handle.on("http-response", (msg: WorkerToMain_HttpResponse) => {
-      const cb = this._httpCallbacks.get(msg.requestId);
-      if (cb) cb(msg);
+      const entry = this._httpCallbacks.get(msg.requestId);
+      if (entry) entry.fn(msg);
     });
 
     handle.on("ws-frame", (msg: any) => {

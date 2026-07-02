@@ -59,4 +59,6 @@ createServer((req, res) => {
   console.log(`  Tailwind v3 + vite 8: http://localhost:${port}/examples/tailwind-v3-test/`);
   console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
   console.log(`  Vite HMR test:        http://localhost:${port}/examples/vite-hmr-test/`);
+  console.log(`  Dev playground:       http://localhost:${port}/examples/dev-playground/`);
+  console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
 });

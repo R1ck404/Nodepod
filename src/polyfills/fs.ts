@@ -535,6 +535,21 @@ export function buildFileSystemBridge(
   // each bridge gets its own FD namespace (per-process isolation)
   const openFiles = new Map<number, OpenFile>();
   let fdCounter = 3;
+
+  function numericFlagsToString(f: number): string {
+    const O_WRONLY = 1;
+    const O_RDWR = 2;
+    const O_CREAT = 64;
+    const O_TRUNC = 512;
+    const O_APPEND = 1024;
+    const readWrite = (f & O_RDWR) === O_RDWR;
+    const writeOnly = (f & O_WRONLY) === O_WRONLY;
+    const append = (f & O_APPEND) === O_APPEND;
+    if (append) return readWrite ? "a+" : "a";
+    if (writeOnly) return "w";
+    if (readWrite) return (f & O_CREAT) || (f & O_TRUNC) ? "w+" : "r+";
+    return "r";
+  }
   const abs = (target: unknown) => resolvePath(target, getCwd);
 
   const fsConst: FsConstantsShape = {
@@ -1565,7 +1580,7 @@ export function buildFileSystemBridge(
     },
     openSync(target: unknown, flags: string | number, _mode?: number): number {
       const p = abs(target);
-      const flagStr = typeof flags === "number" ? "r" : flags;
+      const flagStr = typeof flags === "number" ? numericFlagsToString(flags) : flags;
       const exists = volume.existsSync(p);
       const isWrite = flagStr.includes("w") || flagStr.includes("a");
       const isReadOnly = flagStr.includes("r") && !flagStr.includes("+");

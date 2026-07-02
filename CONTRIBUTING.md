@@ -7,18 +7,19 @@ Thanks for your interest in contributing!
 ```bash
 git clone https://github.com/ScelarOrg/Nodepod.git
 cd Nodepod
-npm install
+corepack enable
+pnpm install
 ```
 
 ## Development
 
 ```bash
-npm run type-check    # TypeScript validation (must pass with 0 errors)
-npm run build:lib     # Build ESM + CJS library bundles
-npm run build:types   # Generate type declarations
-npm run build:publish # Full publish build (lib + types)
-npm test              # Run test suite
-npm run test:watch    # Run tests in watch mode
+pnpm run type-check    # TypeScript validation (must pass with 0 errors)
+pnpm run build:lib     # Build ESM + CJS library bundles
+pnpm run build:types   # Generate type declarations
+pnpm run build:publish # Full publish build (lib + types)
+pnpm test              # Run test suite
+pnpm run test:watch    # Run tests in watch mode
 ```
 
 ## Project Structure
@@ -36,8 +37,8 @@ npm run test:watch    # Run tests in watch mode
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes
-3. Ensure `npm run type-check` passes with 0 errors
-4. Ensure `npm run build:lib` succeeds
+3. Ensure `pnpm run type-check` passes with 0 errors
+4. Ensure `pnpm run build:lib` succeeds
 5. Open a PR with a clear description of the change
 
 ## Key Conventions

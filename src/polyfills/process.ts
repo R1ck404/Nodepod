@@ -612,7 +612,13 @@ export function buildProcessEnv(config?: {
     const secs = Math.floor(now / 1000);
     const nanos = Math.floor((now % 1000) * 1e6);
     if (prev) {
-      return [secs - prev[0], nanos - prev[1]];
+      let ds = secs - prev[0];
+      let dn = nanos - prev[1];
+      if (dn < 0) {
+        dn += 1e9;
+        ds -= 1;
+      }
+      return [ds, dn];
     }
     return [secs, nanos];
   };

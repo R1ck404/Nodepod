@@ -2,6 +2,7 @@
 
 import { Buffer } from "./buffer";
 import { EventEmitter } from "./events";
+import { digestSync, hmacSync } from "./sync-digest";
 
 function normalizeAlg(name: string): string {
   const upper = name.toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -26,41 +27,6 @@ function hashOutputSize(alg: string): number {
   if (alg.includes("384")) return 48;
   if (alg.includes("1") || alg === "SHA-1") return 20;
   return 32;
-}
-
-function mixHash(input: Uint8Array, alg: string): Uint8Array {
-  const size = hashOutputSize(alg);
-  const out = new Uint8Array(size);
-
-  let a = 0xdeadbeef | 0;
-  let b = 0x41c6ce57 | 0;
-
-  for (let i = 0; i < input.length; i++) {
-    a = Math.imul(a ^ input[i], 2654435761);
-    b = Math.imul(b ^ input[i], 1597334677);
-  }
-
-  a =
-    Math.imul(a ^ (a >>> 16), 2246822507) ^
-    Math.imul(b ^ (b >>> 13), 3266489909);
-  b =
-    Math.imul(b ^ (b >>> 16), 2246822507) ^
-    Math.imul(a ^ (a >>> 13), 3266489909);
-
-  for (let i = 0; i < size; i++) {
-    const source = i < size >>> 1 ? a : b;
-    out[i] = (source >>> ((i & 3) * 8)) & 0xff;
-    a = (Math.imul(a, 1103515245) + 12345) | 0;
-    b = (Math.imul(b, 1103515245) + 12345) | 0;
-  }
-  return out;
-}
-
-function mixHmac(data: Uint8Array, key: Uint8Array, alg: string): Uint8Array {
-  const merged = new Uint8Array(key.length + data.length);
-  merged.set(key, 0);
-  merged.set(data, key.length);
-  return mixHash(merged, alg);
 }
 
 function joinChunks(parts: Uint8Array[]): Uint8Array {
@@ -163,7 +129,7 @@ Hash.prototype.digestAsync = async function digestAsync(enc?: string): Promise<s
 
 Hash.prototype.digest = function digest(enc?: string): string | Buffer {
   const merged = joinChunks(this._parts);
-  const hashed = mixHash(merged, this._alg);
+  const hashed = digestSync(this._alg, new Uint8Array(merged));
   return formatOutput(hashed, enc);
 };
 
@@ -225,7 +191,8 @@ Hmac.prototype.digestAsync = async function digestAsync(enc?: string): Promise<s
 
 Hmac.prototype.digest = function digest(enc?: string): string | Buffer {
   const merged = joinChunks(this._parts);
-  const result = mixHmac(merged, this._key, this._alg);
+  const keyBytes = new Uint8Array(this._key);
+  const result = hmacSync(this._alg, keyBytes, merged);
   return formatOutput(result, enc);
 };
 
@@ -301,11 +268,12 @@ export function pbkdf2Sync(
     saltPlusIdx.set(saltBuf);
     saltPlusIdx.set(bNumBytes, saltBuf.length);
 
-    let u = mixHmac(saltPlusIdx, pwBuf, alg);
+    const pwBytes = new Uint8Array(pwBuf);
+    let u = hmacSync(alg, pwBytes, saltPlusIdx);
     const accum = new Uint8Array(u);
 
     for (let r = 1; r < rounds; r++) {
-      u = mixHmac(u, pwBuf, alg);
+      u = hmacSync(alg, pwBytes, u);
       for (let j = 0; j < accum.length; j++) accum[j] ^= u[j];
     }
     derived.set(accum, (bIdx - 1) * blockSize);
@@ -389,23 +357,21 @@ function extractKey(source: KeyMaterial): KeyDetails {
   return { raw: keyBytes, kind: "secret", fmt: "raw" };
 }
 
-function syncSign(alg: string, data: Uint8Array, keyInfo: KeyDetails): Buffer {
-  const keyBytes =
-    keyInfo.raw instanceof Uint8Array ? keyInfo.raw : new Uint8Array(0);
-  const merged = new Uint8Array(keyBytes.length + data.length);
-  merged.set(keyBytes, 0);
-  merged.set(data, keyBytes.length);
-  return Buffer.from(mixHash(merged, alg));
+function syncSign(_alg: string, _data: Uint8Array, _keyInfo: KeyDetails): Buffer {
+  throw new Error(
+    "crypto: synchronous sign/verify is not supported in the browser polyfill; use the async Web Crypto path",
+  );
 }
 
 function syncVerify(
-  alg: string,
-  data: Uint8Array,
-  keyInfo: KeyDetails,
-  sig: Uint8Array,
+  _alg: string,
+  _data: Uint8Array,
+  _keyInfo: KeyDetails,
+  _sig: Uint8Array,
 ): boolean {
-  const expected = syncSign(alg, data, keyInfo);
-  return timingSafeEqual(Buffer.from(sig), expected);
+  throw new Error(
+    "crypto: synchronous sign/verify is not supported in the browser polyfill; use the async Web Crypto path",
+  );
 }
 
 export function sign(
