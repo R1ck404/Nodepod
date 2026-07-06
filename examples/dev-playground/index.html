@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod dev playground</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --live: #3fb950;
+    }
+    html, body { height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    header {
+      flex-shrink: 0;
+      padding: 10px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 14px; font-weight: 600; }
+    header p { font-size: 12px; color: var(--muted); flex: 1; }
+    header a { font-size: 12px; color: var(--accent); text-decoration: none; }
+    header a:hover { text-decoration: underline; }
+    .workspace {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+    #terminal-pane {
+      flex: 1 1 50%;
+      border-right: 1px solid var(--border);
+    }
+    #preview-pane {
+      flex: 1 1 50%;
+      background: var(--bg);
+    }
+    .pane-label {
+      flex-shrink: 0;
+      padding: 6px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    #terminal-box { flex: 1; padding: 4px; min-height: 0; }
+    .preview-bar {
+      flex-shrink: 0;
+      padding: 8px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #484f58;
+      flex-shrink: 0;
+    }
+    .status-dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
+    .url-field {
+      flex: 1;
+      min-width: 0;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      color: var(--text);
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 12px;
+      outline: none;
+    }
+    .url-field:focus { border-color: var(--accent); }
+    .bar-btn {
+      flex-shrink: 0;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 12px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    .bar-btn:hover:not(:disabled) { border-color: var(--muted); background: #21262d; }
+    .bar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    #preview-frame {
+      flex: 1;
+      border: none;
+      background: #fff;
+      min-height: 0;
+    }
+    .preview-empty {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+      padding: 24px;
+    }
+    .preview-empty code {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    @media (max-width: 800px) {
+      .workspace { flex-direction: column; }
+      #terminal-pane { border-right: none; border-bottom: 1px solid var(--border); }
+      #terminal-pane, #preview-pane { flex: 1 1 50%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>nodepod dev playground</h1>
+    <p>Shell on the left — start a dev server and the preview loads on the right.</p>
+    <a id="open-tab" href="#" target="_blank" rel="noopener" hidden>open in tab ↗</a>
+  </header>
+
+  <div class="workspace">
+    <div id="terminal-pane" class="pane">
+      <div class="pane-label">terminal</div>
+      <div id="terminal-box"></div>
+    </div>
+
+    <div id="preview-pane" class="pane">
+      <div class="pane-label">web preview</div>
+      <div class="preview-bar">
+        <div class="status-dot" id="status-dot" title="server status"></div>
+        <input class="url-field" id="preview-url" type="text" readonly value="waiting for server…" />
+        <button class="bar-btn" id="reload-btn" type="button" disabled title="Reload preview">↻</button>
+        <button class="bar-btn" id="go-btn" type="button" disabled title="Load URL in preview">go</button>
+      </div>
+      <div class="preview-empty" id="preview-empty">
+        <span>No server yet</span>
+        <span>Try <code>node index.js</code> or <code>npm run dev</code></span>
+      </div>
+      <iframe id="preview-frame" hidden sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+    import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm";
+    import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm";
+
+    const previewFrame = document.getElementById("preview-frame");
+    const previewEmpty = document.getElementById("preview-empty");
+    const previewUrl = document.getElementById("preview-url");
+    const statusDot = document.getElementById("status-dot");
+    const reloadBtn = document.getElementById("reload-btn");
+    const goBtn = document.getElementById("go-btn");
+    const openTab = document.getElementById("open-tab");
+
+    let currentUrl = "";
+
+    function showPreview(url) {
+      currentUrl = url;
+      previewUrl.value = url;
+      previewUrl.removeAttribute("readonly");
+      statusDot.classList.add("live");
+      statusDot.title = "server live";
+      reloadBtn.disabled = false;
+      goBtn.disabled = false;
+      openTab.hidden = false;
+      openTab.href = url;
+      previewEmpty.hidden = true;
+      previewFrame.hidden = false;
+      previewFrame.src = url;
+    }
+
+    reloadBtn.addEventListener("click", () => {
+      if (!currentUrl) return;
+      previewFrame.src = currentUrl;
+    });
+
+    goBtn.addEventListener("click", () => {
+      const url = previewUrl.value.trim();
+      if (!url) return;
+      previewEmpty.hidden = true;
+      previewFrame.hidden = false;
+      previewFrame.src = url;
+    });
+
+    previewUrl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") goBtn.click();
+    });
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/home",
+      allowedFetchDomains: null,
+      files: {
+        "/home/index.js": [
+          'const http = require("http");',
+          'const port = Number(process.env.PORT) || 3000;',
+          'const server = http.createServer((req, res) => {',
+          '  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });',
+          '  res.end(`',
+          '    <!DOCTYPE html>',
+          '    <html><head><meta charset="utf-8"><title>nodepod</title>',
+          '    <style>body{font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}',
+          '    h1{color:#0969da}code{background:#f6f8fa;padding:.15em .35em;border-radius:4px}</style></head>',
+          '    <body>',
+          '    <h1>Hello from nodepod</h1>',
+          '    <p>Quick start: run <code>node index.js</code> in the terminal, or scaffold something bigger:</p>',
+          '    <ul>',
+          '    <li><code>npx create-vite@latest my-app --template react-ts</code></li>',
+          '    <li><code>npx create-next-app@latest</code></li>',
+          '    </ul>',
+          '    <p>When a server binds a port, the preview panel loads it automatically.</p>',
+          '    </body></html>',
+          '  `);',
+          '});',
+          'server.listen(port, () => {',
+          '  console.log(`listening on http://localhost:${port}`);',
+          '});',
+        ].join("\n"),
+      },
+      onServerReady(_port, url) {
+        showPreview(url);
+      },
+    });
+
+    const terminal = nodepod.createTerminal({
+      Terminal,
+      FitAddon,
+      fontSize: 13,
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+    });
+
+    terminal.attach(document.getElementById("terminal-box"));
+
+    window.addEventListener("resize", () => terminal.fit());
+  </script>
+</body>
+</html>

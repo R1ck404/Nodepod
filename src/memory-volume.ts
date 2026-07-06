@@ -11,6 +11,20 @@ export interface VolumeNode {
   children?: Map<string, VolumeNode>;
   target?: string;
   modified: number;
+  // lean spawn mode: file known to exist (from a lazy readdir listing) but
+  // content not yet fetched from the main thread
+  lazy?: boolean;
+  // size reported by the main thread for a lazy stub (stat without content)
+  lazySize?: number;
+}
+
+// lean spawn mode: synchronous fallback consulted on read misses for paths
+// under lazy directory names (e.g. node_modules excluded from the spawn
+// snapshot). Implementations block on a SAB round-trip to the main thread.
+export interface VolumeMissHandler {
+  readFile(path: string): Uint8Array | null;
+  readdir(path: string): Array<{ name: string; isDirectory: boolean }> | null;
+  stat(path: string): { isFile: boolean; isDirectory: boolean; size: number } | null;
 }
 
 type FileChangeHandler = (filePath: string, content: string) => void;
@@ -177,6 +191,14 @@ export class MemoryVolume {
   private tree: VolumeNode;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
+  // lean spawn mode (see VolumeMissHandler)
+  private _missHandler: VolumeMissHandler | null = null;
+  private _lazyDirNames: string[] = [];
+  private _lazyListed = new Set<string>();
+  private _lazyNegative = new Set<string>();
+  // paths invalidated by main (large-file broadcast) — re-fetchable via the
+  // miss handler even when outside the lazy dir names
+  private _lazyInvalidated = new Set<string>();
   // unique ino per path. rust walkdir with follow_links(true) tracks visited
   // (dev,ino) pairs to break cycles, so ino=0 for everything makes it drop
   // every file as "already visited".
@@ -587,10 +609,149 @@ export class MemoryVolume {
     }
   }
 
+  // ---- Lean spawn mode: lazy hydration ----
+
+  // Install a synchronous fallback for read misses under the given directory
+  // names (lean spawn snapshots exclude e.g. node_modules). Pass null to
+  // remove. Only read paths consult the handler; writes behave as always.
+  setMissHandler(handler: VolumeMissHandler | null, lazyDirNames: string[] = []): void {
+    this._missHandler = handler;
+    this._lazyDirNames = handler ? lazyDirNames.slice() : [];
+    this._lazyListed.clear();
+    this._lazyNegative.clear();
+  }
+
+  // Main broadcast said this file changed but was too large to ship bytes.
+  // Drop the local copy silently; the next read pulls fresh content through
+  // the miss handler (works for any path, not just lazy dir names). No-op
+  // without a miss handler — better a stale copy than a lost file.
+  markLazyInvalidated(p: string): void {
+    if (!this._missHandler) return;
+    const norm = this.normalize(p);
+    this._lazyNegative.delete(norm);
+    this._lazyInvalidated.add(norm);
+    const parent = this.locate(this.parentOf(norm));
+    if (parent?.kind === 'directory') {
+      parent.children?.delete(this.nameOf(norm));
+    }
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  private _isUnderLazy(norm: string): boolean {
+    if (!this._missHandler) return false;
+    if (this._lazyInvalidated.has(norm)) return true;
+    if (this._lazyDirNames.length === 0) return false;
+    let start = 1;
+    const len = norm.length;
+    while (start < len) {
+      let end = norm.indexOf('/', start);
+      if (end === -1) end = len;
+      const seg = norm.substring(start, end);
+      if (this._lazyDirNames.includes(seg)) return true;
+      start = end + 1;
+    }
+    return false;
+  }
+
+  // Try to materialize a missing path from the miss handler. Returns true if
+  // the path exists locally afterwards. Never notifies watchers (hydration is
+  // not a "change" — the file logically existed all along).
+  private _hydrateMiss(norm: string): boolean {
+    if (!this._missHandler || this._lazyNegative.has(norm) || !this._isUnderLazy(norm)) {
+      return false;
+    }
+    let st: { isFile: boolean; isDirectory: boolean; size: number } | null = null;
+    try { st = this._missHandler.stat(norm); } catch { st = null; }
+    if (!st) {
+      this._lazyNegative.add(norm);
+      return false;
+    }
+    if (st.isDirectory) {
+      this.ensureDir(norm);
+      return true;
+    }
+    let bytes: Uint8Array | null = null;
+    try { bytes = this._missHandler.readFile(norm); } catch { bytes = null; }
+    if (bytes === null) {
+      this._lazyNegative.add(norm);
+      return false;
+    }
+    this.writeInternal(norm, bytes, false);
+    return true;
+  }
+
+  // Fetch content for a lazy stub created by _lazyList.
+  private _hydrateStub(norm: string, node: VolumeNode): void {
+    node.lazy = false;
+    if (!this._missHandler) return;
+    let bytes: Uint8Array | null = null;
+    try { bytes = this._missHandler.readFile(norm); } catch { bytes = null; }
+    node.content = bytes ?? new Uint8Array(0);
+    node.lazySize = undefined;
+    node.modified = Date.now();
+    if (this._handler) this._handler.invalidateStat(norm);
+  }
+
+  // Fetch only the size for a lazy stub — stat must not pull full content
+  // (readdir { withFileTypes } stats every entry; fetching content there
+  // would turn one listing into N content round-trips).
+  private _hydrateStubStat(norm: string, node: VolumeNode): void {
+    if (!this._missHandler || node.lazySize !== undefined) return;
+    let st: { isFile: boolean; isDirectory: boolean; size: number } | null = null;
+    try { st = this._missHandler.stat(norm); } catch { st = null; }
+    node.lazySize = st?.size ?? 0;
+  }
+
+  // Fully hydrate a subtree before structural changes (rename/link). A moved
+  // lazy stub would otherwise try to fetch content under its NEW path, which
+  // the main thread doesn't know about.
+  private _hydrateTree(norm: string, node: VolumeNode): void {
+    if (!this._missHandler) return;
+    if (node.kind === 'file') {
+      if (node.lazy) this._hydrateStub(norm, node);
+      return;
+    }
+    if (node.kind !== 'directory') return;
+    this._lazyList(norm, node);
+    if (!node.children) return;
+    for (const [name, child] of node.children) {
+      const childPath = norm === '/' ? `/${name}` : `${norm}/${name}`;
+      this._hydrateTree(childPath, child);
+    }
+  }
+
+  // Populate a lazy directory's listing once: union of proxy entries and any
+  // local children (local wins). Subdirs become unlisted lazy dirs; files
+  // become content-less stubs hydrated on first read/stat.
+  private _lazyList(norm: string, node: VolumeNode): void {
+    if (!this._missHandler || this._lazyListed.has(norm) || !this._isUnderLazy(norm)) {
+      return;
+    }
+    this._lazyListed.add(norm);
+    let entries: Array<{ name: string; isDirectory: boolean }> | null = null;
+    try { entries = this._missHandler.readdir(norm); } catch { entries = null; }
+    if (!entries) return;
+    if (!node.children) node.children = new Map();
+    for (const entry of entries) {
+      if (node.children.has(entry.name)) continue;
+      node.children.set(
+        entry.name,
+        entry.isDirectory
+          ? { kind: 'directory', children: new Map(), modified: Date.now() }
+          : { kind: 'file', lazy: true, modified: Date.now() },
+      );
+    }
+  }
+
   // ---- Public synchronous API ----
 
   existsSync(p: string): boolean {
-    return this.locate(this.normalize(p)) !== undefined;
+    const norm = this.normalize(p);
+    let node = this.locate(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locate(norm);
+    }
+    return node !== undefined;
   }
 
   statSync(p: string): FileStat {
@@ -601,10 +762,15 @@ export class MemoryVolume {
       if (cached !== undefined) return cached;
     }
 
-    const node = this.locate(norm);
+    let node = this.locate(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locate(norm);
+    }
     if (!node) throw makeSystemError('ENOENT', 'stat', p);
+    if (node.lazy) this._hydrateStubStat(norm, node);
 
-    const fileSize = node.kind === 'file' ? (node.content?.length || 0) : 0;
+    const fileSize =
+      node.kind === 'file' ? (node.content?.length ?? node.lazySize ?? 0) : 0;
     const ts = node.modified;
 
     const result: FileStat = {
@@ -645,7 +811,10 @@ export class MemoryVolume {
 
   lstatSync(p: string): FileStat {
     const norm = this.normalize(p);
-    const node = this.locateRaw(norm);
+    let node = this.locateRaw(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locateRaw(norm);
+    }
     if (!node) throw makeSystemError('ENOENT', 'lstat', p);
 
     if (node.kind === 'symlink') {
@@ -689,9 +858,13 @@ export class MemoryVolume {
   readFileSync(p: string, encoding: 'utf8' | 'utf-8'): string;
   readFileSync(p: string, encoding?: 'utf8' | 'utf-8'): Uint8Array | string {
     const norm = this.normalize(p);
-    const node = this.locate(norm);
+    let node = this.locate(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locate(norm);
+    }
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'read', p);
+    if (node.lazy) this._hydrateStub(norm, node);
 
     const bytes = node.content || new Uint8Array(0);
     if (encoding === 'utf8' || encoding === 'utf-8') {
@@ -740,9 +913,13 @@ export class MemoryVolume {
 
   readdirSync(p: string): string[] {
     const norm = this.normalize(p);
-    const node = this.locate(norm);
+    let node = this.locate(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locate(norm);
+    }
     if (!node) throw makeSystemError('ENOENT', 'scandir', p);
     if (node.kind !== 'directory') throw makeSystemError('ENOTDIR', 'scandir', p);
+    if (this._missHandler) this._lazyList(norm, node);
     return Array.from(node.children!.keys());
   }
 
@@ -800,8 +977,15 @@ export class MemoryVolume {
     if (!fromParent || fromParent.kind !== 'directory') throw makeSystemError('ENOENT', 'rename', from);
 
     const fromName = this.nameOf(normFrom);
-    const node = fromParent.children!.get(fromName);
+    let node = fromParent.children!.get(fromName);
+    if (!node && this._missHandler && this._hydrateMiss(normFrom)) {
+      node = fromParent.children!.get(fromName);
+    }
     if (!node) throw makeSystemError('ENOENT', 'rename', from);
+
+    // a moved lazy subtree would hydrate under the wrong (new) path — pull
+    // everything local before the move
+    if (this._missHandler) this._hydrateTree(normFrom, node);
 
     const toParent = this.ensureDir(this.parentOf(normTo));
     const toName = this.nameOf(normTo);
@@ -874,7 +1058,10 @@ export class MemoryVolume {
 
   realpathSync(p: string): string {
     const norm = this.normalize(p);
-    const node = this.locateRaw(norm);
+    let node = this.locateRaw(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locateRaw(norm);
+    }
     if (!node) throw makeSystemError('ENOENT', 'realpath', p);
     if (node.kind === 'symlink') {
       return this.realpathSync(node.target!);
@@ -917,9 +1104,12 @@ export class MemoryVolume {
   }
 
   linkSync(existingPath: string, newPath: string): void {
-    const existing = this.locate(this.normalize(existingPath));
+    const normExisting = this.normalize(existingPath);
+    const existing = this.locate(normExisting);
     if (!existing) throw makeSystemError('ENOENT', 'link', existingPath);
     if (existing.kind !== 'file') throw makeSystemError('EISDIR', 'link', existingPath);
+    // sharing a content-less stub would alias undefined content
+    if (existing.lazy) this._hydrateStub(normExisting, existing);
 
     const normNew = this.normalize(newPath);
     const parentPath = this.parentOf(normNew);
@@ -953,6 +1143,7 @@ export class MemoryVolume {
     let existing: Uint8Array = new Uint8Array(0);
     const node = this.locate(norm);
     if (node && node.kind === 'file') {
+      if (node.lazy) this._hydrateStub(norm, node);
       existing = node.content || new Uint8Array(0);
     }
     const bytes = this.toBytes(data);
@@ -967,6 +1158,7 @@ export class MemoryVolume {
     const node = this.locate(norm);
     if (!node) throw makeSystemError('ENOENT', 'truncate', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'truncate', p);
+    if (node.lazy) this._hydrateStub(norm, node);
     const content = node.content || new Uint8Array(0);
     if (len < content.length) {
       node.content = content.slice(0, len);

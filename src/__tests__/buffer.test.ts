@@ -253,8 +253,10 @@ describe("Buffer", () => {
       expect(Buffer.isBuffer(Buffer.from("x"))).toBe(true);
     });
 
-    it("isBuffer returns true for Uint8Array", () => {
-      expect(Buffer.isBuffer(new Uint8Array(1))).toBe(true);
+    // Node semantics: a plain Uint8Array is NOT a Buffer. Callers use this to
+    // decide whether Buffer-only methods (subsequence indexOf etc.) exist.
+    it("isBuffer returns false for plain Uint8Array", () => {
+      expect(Buffer.isBuffer(new Uint8Array(1))).toBe(false);
     });
 
     it("isEncoding returns true for valid encodings", () => {

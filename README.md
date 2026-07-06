@@ -110,6 +110,10 @@ await nodepod.packages.install('express');
 const proc = await nodepod.spawn('node', ['server.js']);
 ```
 
+Installs are lazy by default: packages are downloaded and extracted, and
+modules are converted on first `require()`. Pass
+`{ transformModules: 'eager' }` to run all transforms at install time instead.
+
 ### HTTP servers
 
 Works with Express, Hono, Vite, and anything that calls `listen()`:

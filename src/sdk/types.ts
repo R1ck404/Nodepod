@@ -39,6 +39,27 @@ export interface NodepodOptions {
   /** domains allowed through the cors proxy. merged with built-in defaults
    *  (npm, github, esm.sh etc). pass null to allow everything */
   allowedFetchDomains?: string[] | null;
+  /**
+   * "lean" excludes node_modules/.npm/.cache from per-spawn VFS snapshots;
+   * workers fetch those files on demand over a synchronous fs proxy. Cuts
+   * per-process memory roughly by the size of node_modules. Requires
+   * SharedArrayBuffer (COOP/COEP) — silently falls back to "full" without it.
+   * Default: "full".
+   */
+  spawnSnapshot?: "full" | "lean";
+  /**
+   * Start downloading + compiling esbuild-wasm (~10MB) during boot so it's
+   * ready by the time installs or builds need it. The download overlaps
+   * Service Worker registration and package installs. Default: true.
+   */
+  preloadEsbuild?: boolean;
+  /**
+   * URL of the process-worker bundle asset (dist/__worker__.js). When the
+   * asset is reachable, workers boot from it instead of the copy embedded in
+   * the library string, saving parse time and heap. Auto-detected next to
+   * the built library when omitted; the embedded copy remains the fallback.
+   */
+  workerUrl?: string;
 }
 
 /* ---- Terminal ---- */

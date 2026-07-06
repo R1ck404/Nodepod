@@ -1,7 +1,8 @@
 // esbuild polyfill -- loads esbuild-wasm from CDN, routes file I/O through MemoryVolume
 
 import type { MemoryVolume } from "../memory-volume";
-import { CDN_ESBUILD_BINARY, CDN_ESBUILD_BROWSER, cdnImport } from "../constants/cdn-urls";
+import { CDN_ESBUILD_BINARY, PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
+import { getEsbuild, getEsbuildIfReady } from "../helpers/esbuild-engine";
 import { stripTopLevelAwait } from "../syntax-transforms";
 import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config";
 import { getRegistry } from "../helpers/event-loop";
@@ -115,7 +116,6 @@ export interface BundleOutput {
 }
 
 let engine: typeof import("esbuild-wasm") | null = null;
-let bootPromise: Promise<void> | null = null;
 let wasmBinaryUrl: string = CDN_ESBUILD_BINARY;
 let volumeRef: MemoryVolume | null = null;
 
@@ -127,44 +127,10 @@ export function setWasmUrl(url: string): void {
   wasmBinaryUrl = url;
 }
 
+// delegates to the realm-wide singleton (shared with module-transformer)
 export async function initialize(opts?: { wasmURL?: string }): Promise<void> {
   if (engine) return;
-
-  if (
-    typeof window !== "undefined" &&
-    (window as unknown as Record<string, unknown>).__esbuild
-  ) {
-    engine = (window as unknown as Record<string, unknown>)
-      .__esbuild as typeof import("esbuild-wasm");
-    return;
-  }
-
-  if (
-    typeof window !== "undefined" &&
-    (window as unknown as Record<string, unknown>).__esbuildInitPromise
-  ) {
-    await (window as unknown as Record<string, unknown>).__esbuildInitPromise;
-    if ((window as unknown as Record<string, unknown>).__esbuild) {
-      engine = (window as unknown as Record<string, unknown>)
-        .__esbuild as typeof import("esbuild-wasm");
-      return;
-    }
-  }
-
-  if (bootPromise) return bootPromise;
-
-  bootPromise = (async () => {
-    try {
-      const mod = await cdnImport(CDN_ESBUILD_BROWSER);
-      await mod.initialize({ wasmURL: opts?.wasmURL || wasmBinaryUrl });
-      engine = mod;
-    } catch (err) {
-      bootPromise = null;
-      throw new Error(`esbuild: initialization failed -- ${err}`);
-    }
-  })();
-
-  return bootPromise;
+  engine = await getEsbuild({ wasmURL: opts?.wasmURL || wasmBinaryUrl });
 }
 
 export async function transform(
@@ -173,6 +139,7 @@ export async function transform(
 ): Promise<TransformOutput> {
   const h = getRegistry().register("EsbuildOp");
   try {
+    if (!engine) engine = getEsbuildIfReady();
     if (!engine) await initialize();
     if (!engine) throw new Error("esbuild: engine not ready");
     return await engine.transform(source, cfg);
@@ -186,6 +153,7 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
   // so the loop can drain mid-await if we do it the other way round
   const h = getRegistry().register("EsbuildOp");
   try {
+    if (!engine) engine = getEsbuildIfReady();
     if (!engine) await initialize();
     if (!engine) throw new Error("esbuild: engine not ready");
 
@@ -236,6 +204,7 @@ export function formatMessages(
   messages: unknown[],
   opts?: { kind?: "error" | "warning"; color?: boolean },
 ): Promise<string[]> {
+  if (!engine) engine = getEsbuildIfReady();
   if (!engine) throw new Error("esbuild: engine not ready");
   return (
     engine as unknown as {
@@ -244,7 +213,8 @@ export function formatMessages(
   ).formatMessages(messages, opts);
 }
 
-export const version = "0.21.5";
+// single source of truth: the pinned CDN version we actually load
+export const version = PINNED_ESBUILD_WASM;
 
 // build context for incremental builds (used by Vite)
 export async function context(cfg: BundleConfig): Promise<{

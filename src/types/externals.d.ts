@@ -28,11 +28,6 @@ declare module 'esbuild-wasm' {
   export const version: string;
 }
 
-interface Window {
-  __esbuildEngine?: typeof import('esbuild-wasm');
-  __esbuildReady?: Promise<void>;
-}
-
 declare module 'virtual:process-worker-bundle' {
   export const PROCESS_WORKER_BUNDLE: string;
 }

@@ -1,16 +1,21 @@
 // IndexedDB-backed cache for node_modules snapshots.
 // Keyed by a hash of the package.json contents so stale caches auto-invalidate.
+//
+// v2 (plan 015): snapshots are stored in the flat binary format (offset
+// manifest + one ArrayBuffer) instead of base64-encoded VolumeSnapshots.
+// The schema bump means v1 entries are simply ignored and age out.
 
-import type { VolumeSnapshot } from '../engine-types';
+import type { VFSBinarySnapshot } from '../threading/worker-protocol';
 
 const DB_NAME = 'nodepod-snapshots';
 const STORE_NAME = 'snapshots';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SCHEMA = 2; // stored per entry; entries with a different schema are misses
 
 export interface IDBSnapshotCache {
-  get(packageJsonHash: string): Promise<VolumeSnapshot | null>;
-  set(packageJsonHash: string, snapshot: VolumeSnapshot): Promise<void>;
+  get(packageJsonHash: string): Promise<VFSBinarySnapshot | null>;
+  set(packageJsonHash: string, snapshot: VFSBinarySnapshot): Promise<void>;
   close(): void;
 }
 
@@ -63,7 +68,11 @@ function idbCleanExpired(db: IDBDatabase): void {
       const cursor = req.result;
       if (!cursor) return;
       const entry = cursor.value;
-      if (entry?.createdAt && (now - entry.createdAt) > MAX_AGE_MS) {
+      // expired entries AND pre-v2 (base64) entries get dropped
+      if (
+        (entry?.createdAt && (now - entry.createdAt) > MAX_AGE_MS) ||
+        entry?.schema !== SCHEMA
+      ) {
         cursor.delete();
       }
       cursor.continue();
@@ -79,22 +88,24 @@ export async function openSnapshotCache(): Promise<IDBSnapshotCache | null> {
   idbCleanExpired(db);
 
   return {
-    async get(packageJsonHash: string): Promise<VolumeSnapshot | null> {
+    async get(packageJsonHash: string): Promise<VFSBinarySnapshot | null> {
       try {
         const entry = await idbGet(db, packageJsonHash);
-        if (!entry?.snapshot) return null;
+        if (!entry || entry.schema !== SCHEMA || !entry.manifest || !entry.data) return null;
         // Check expiry
         if (entry.createdAt && (Date.now() - entry.createdAt) > MAX_AGE_MS) return null;
-        return entry.snapshot as VolumeSnapshot;
+        return { manifest: entry.manifest, data: entry.data } as VFSBinarySnapshot;
       } catch {
         return null;
       }
     },
 
-    async set(packageJsonHash: string, snapshot: VolumeSnapshot): Promise<void> {
+    async set(packageJsonHash: string, snapshot: VFSBinarySnapshot): Promise<void> {
       try {
         await idbPut(db, packageJsonHash, {
-          snapshot,
+          schema: SCHEMA,
+          manifest: snapshot.manifest,
+          data: snapshot.data,
           createdAt: Date.now(),
         });
       } catch { /* silently fail — cache is optional */ }

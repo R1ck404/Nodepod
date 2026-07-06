@@ -24,6 +24,10 @@ import { SLOT_SIZE } from "./sync-channel";
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
 
+// lean spawn mode: dirs excluded from spawn snapshots at any depth, hydrated
+// lazily by the worker. Mirrors the SDK's shallow-snapshot exclude set.
+const LEAN_EXCLUDE_DIR_NAMES = ["node_modules", ".npm", ".cache"];
+
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
@@ -63,6 +67,16 @@ export class ProcessManager extends EventEmitter {
     this._syncBuffer = buf;
   }
 
+  // "lean" spawns exclude node_modules etc. from snapshots; workers hydrate
+  // lazily over a sync fs proxy (needs SAB). Default "full" — flip via the
+  // NodepodOptions.spawnSnapshot option.
+  private _spawnSnapshotMode: "full" | "lean" = "full";
+  private _warnedLeanUnavailable = false;
+
+  setSpawnSnapshotMode(mode: "full" | "lean"): void {
+    this._spawnSnapshotMode = mode;
+  }
+
   spawn(config: {
     command: string;
     args?: string[];
@@ -89,8 +103,22 @@ export class ProcessManager extends EventEmitter {
 
     const pid = this._nextPid++;
 
+    // lean mode needs SAB in the worker (Atomics.wait for the lazy fs proxy)
+    let lean = this._spawnSnapshotMode === "lean";
+    if (lean && (typeof SharedArrayBuffer === "undefined" || !this._syncBuffer)) {
+      if (!this._warnedLeanUnavailable) {
+        this._warnedLeanUnavailable = true;
+        console.warn(
+          "[nodepod] spawnSnapshot 'lean' requires SharedArrayBuffer (COOP/COEP); falling back to full snapshots",
+        );
+      }
+      lean = false;
+    }
+
     const snapshot = this._vfsBridge
-      ? this._vfsBridge.createSnapshot()
+      ? this._vfsBridge.createSnapshot(
+          lean ? { excludeDirNames: LEAN_EXCLUDE_DIR_NAMES } : undefined,
+        )
       : this._createEmptySnapshot();
 
     const spawnConfig: SpawnConfig = {
@@ -99,7 +127,6 @@ export class ProcessManager extends EventEmitter {
       cwd: config.cwd ?? "/",
       env: config.env ?? {},
       snapshot,
-      sharedBuffer: this._sharedBuffer ?? undefined,
       syncBuffer: this._syncBuffer ?? undefined,
       parentPid: config.parentPid,
     };
@@ -133,15 +160,30 @@ export class ProcessManager extends EventEmitter {
       }
     }
 
+    // lean mode: dedicated fs proxy channel for the worker's own lazy reads
+    let lazyFsPort: MessagePort | undefined;
+    if (lean && snapshot.lazyDirNames) {
+      const lazyBridge = buildFileSystemBridge(this._volume, () => "/");
+      const lazyCh = new MessageChannel();
+      lazyCh.port1.onmessage = (e: MessageEvent) => {
+        const data = e.data;
+        if (!data || typeof data !== "object" || !data.__fs__) return;
+        handleFsProxy(data.__fs__, lazyBridge);
+      };
+      lazyCh.port1.start();
+      transferPorts.push(lazyCh.port2);
+      lazyFsPort = lazyCh.port2;
+    }
+
     const initMsg: MainToWorker_Init = {
       type: "init",
       pid,
       cwd: spawnConfig.cwd,
       env: spawnConfig.env,
       snapshot: spawnConfig.snapshot,
-      sharedBuffer: spawnConfig.sharedBuffer,
       syncBuffer: spawnConfig.syncBuffer,
       wasiFsPorts,
+      lazyFsPort,
     };
     handle.init(initMsg, transferPorts);
 
@@ -335,11 +377,53 @@ export class ProcessManager extends EventEmitter {
   }
 
   private static _workerBlobUrl: string | null = null;
+  private static _externalWorkerSource: string | null = null;
+  private static _workerProbePromise: Promise<void> | null = null;
+
+  /**
+   * Try to load the worker bundle from a same-origin asset
+   * (dist/__worker__.js) so spawns don't need the embedded string copy.
+   * Fire-and-forget from boot; until (and unless) it resolves, spawns use
+   * the embedded bundle. Explicit `workerUrl` wins over auto-detection.
+   */
+  static probeExternalWorkerBundle(workerUrl?: string): Promise<void> {
+    if (ProcessManager._workerProbePromise) return ProcessManager._workerProbePromise;
+
+    ProcessManager._workerProbePromise = (async () => {
+      if (typeof fetch === "undefined") return;
+      let url: string | null = workerUrl ?? null;
+      if (!url) {
+        try {
+          // resolves next to the built library (dist/index.mjs → dist/__worker__.js)
+          url = new URL("./__worker__.js", import.meta.url).href;
+        } catch {
+          return;
+        }
+        // blob:/data: base URLs can't host a sibling asset
+        if (!/^https?:/.test(url)) return;
+      }
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) return;
+        const contentType = resp.headers.get("content-type") || "";
+        // guard against SPA index.html fallbacks answering for missing paths
+        if (contentType && !/javascript|ecmascript/i.test(contentType)) return;
+        const text = await resp.text();
+        if (text.length > 0) ProcessManager._externalWorkerSource = text;
+      } catch {
+        /* asset not served — embedded fallback keeps working */
+      }
+    })();
+
+    return ProcessManager._workerProbePromise;
+  }
 
   private _createWorker(): Worker {
-    // blob URL from pre-bundled source works in any environment
+    // blob URL built once from whichever source is available first; the
+    // external asset (if probed successfully) avoids the embedded copy
     if (!ProcessManager._workerBlobUrl) {
-      const blob = new Blob([PROCESS_WORKER_BUNDLE], { type: "application/javascript" });
+      const source = ProcessManager._externalWorkerSource ?? PROCESS_WORKER_BUNDLE;
+      const blob = new Blob([source], { type: "application/javascript" });
       ProcessManager._workerBlobUrl = URL.createObjectURL(blob);
     }
     return new Worker(ProcessManager._workerBlobUrl);
@@ -407,50 +491,6 @@ export class ProcessManager extends EventEmitter {
       if (this._vfsBridge) {
         this._vfsBridge.handleWorkerDelete(path);
         this._vfsBridge.broadcastChange(path, null, handle.pid);
-      }
-    });
-
-    handle.on("vfs-read", (requestId: number, path: string) => {
-      try {
-        if (this._volume.existsSync(path)) {
-          const stat = this._volume.statSync(path);
-          if (stat.isDirectory()) {
-            handle.postMessage({
-              type: "vfs-sync",
-              path,
-              content: null,
-              isDirectory: true,
-            });
-          } else {
-            const data = this._volume.readFileSync(path);
-            // must copy into a fresh ArrayBuffer — .buffer.slice() returns SAB when storage is shared, and SAB can't be transferred via postMessage (throws DataCloneError)
-            const buffer = new ArrayBuffer(data.byteLength);
-            new Uint8Array(buffer).set(data);
-            handle.postMessage({
-              type: "vfs-sync",
-              path,
-              content: buffer,
-              isDirectory: false,
-            }, [buffer]);
-          }
-        } else {
-          handle.postMessage({
-            type: "vfs-sync",
-            path,
-            content: null,
-            isDirectory: false,
-          });
-        }
-      } catch {
-        // send null so the worker doesn't hang
-        try {
-          handle.postMessage({
-            type: "vfs-sync",
-            path,
-            content: null,
-            isDirectory: false,
-          });
-        } catch { /* worker may have died */ }
       }
     });
 
@@ -1000,23 +1040,48 @@ export class ProcessManager extends EventEmitter {
     };
   }
 
+  // content larger than this is broadcast as a path-only invalidation in lean
+  // mode — workers drop their copy and re-pull over the lazy fs proxy.
+  // TODO(plan 013/011): once lean spawns are the default, the invalidation
+  // path can become the norm for all sizes (pure pull model, no byte traffic).
+  private static readonly VFS_BROADCAST_MAX_BYTES = 4 * 1024 * 1024;
+
   broadcastVFSChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
+    // build the outgoing payload once — postMessage without a transfer list
+    // structured-clones per recipient, so no explicit per-recipient copy is
+    // needed on the main thread. copy only if the source is SAB-backed
+    // (TypeScript lets SAB satisfy ArrayBuffer; SAB can't be cloned to workers)
+    let payload: ArrayBuffer | null = null;
+    if (content) {
+      if (typeof SharedArrayBuffer !== "undefined" && (content as unknown) instanceof SharedArrayBuffer) {
+        payload = new ArrayBuffer(content.byteLength);
+        new Uint8Array(payload).set(new Uint8Array(content));
+      } else {
+        payload = content;
+      }
+    }
+
+    // size gate: only when workers can re-pull the bytes (lean mode + SAB)
+    const invalidateInstead =
+      payload !== null &&
+      !isDirectory &&
+      payload.byteLength > ProcessManager.VFS_BROADCAST_MAX_BYTES &&
+      this._spawnSnapshotMode === "lean" &&
+      this._syncBuffer !== null;
+
     for (const [pid, handle] of this._processes) {
       if (pid === excludePid || handle.state === "exited") continue;
       try {
-        // ArrayBuffer can only be transferred once, so clone per recipient
-        // explicit copy rather than .slice(0) — if `content` is actually SAB (TypeScript lets SAB satisfy ArrayBuffer), SAB.prototype.slice() returns SAB which can't be transferred
-        let clonedContent: ArrayBuffer | null = null;
-        if (content) {
-          clonedContent = new ArrayBuffer(content.byteLength);
-          new Uint8Array(clonedContent).set(new Uint8Array(content));
+        if (invalidateInstead) {
+          handle.postMessage({ type: "vfs-invalidate", path });
+        } else {
+          handle.postMessage({
+            type: "vfs-sync",
+            path,
+            content: payload,
+            isDirectory,
+          });
         }
-        handle.postMessage({
-          type: "vfs-sync",
-          path,
-          content: clonedContent,
-          isDirectory,
-        }, clonedContent ? [clonedContent] : []);
       } catch {
         /* ignore */
       }

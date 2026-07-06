@@ -6,6 +6,9 @@
 export interface VFSBinarySnapshot {
   manifest: VFSSnapshotEntry[];
   data: ArrayBuffer;
+  // directory names excluded from the snapshot (lean spawn mode). the worker
+  // installs a lazy fs fallback for paths under these names.
+  lazyDirNames?: string[];
 }
 
 export interface VFSSnapshotEntry {
@@ -23,11 +26,13 @@ export interface MainToWorker_Init {
   cwd: string;
   env: Record<string, string>;
   snapshot: VFSBinarySnapshot;
-  sharedBuffer?: SharedArrayBuffer;
   syncBuffer?: SharedArrayBuffer;
   // tab-side fs proxy ports, one per WASI worker the spawned process will
   // create. chrome BC workaround (see process-manager spawn). #54 follow-up
   wasiFsPorts?: MessagePort[];
+  // dedicated fs proxy port for the process worker's own lazy VFS reads
+  // (lean spawn mode — snapshot excluded node_modules etc.)
+  lazyFsPort?: MessagePort;
 }
 
 export interface MainToWorker_Exec {
@@ -67,6 +72,14 @@ export interface MainToWorker_VFSSync {
   path: string;
   content: ArrayBuffer | null; // null = deleted
   isDirectory: boolean;
+}
+
+// large-file change notification (lean spawn mode): no bytes on the wire,
+// the worker drops its local copy and re-pulls over the lazy fs proxy on
+// next access
+export interface MainToWorker_VFSInvalidate {
+  type: "vfs-invalidate";
+  path: string;
 }
 
 export interface MainToWorker_VFSChunk {
@@ -143,6 +156,7 @@ export type MainToWorkerMessage =
   | MainToWorker_Signal
   | MainToWorker_Resize
   | MainToWorker_VFSSync
+  | MainToWorker_VFSInvalidate
   | MainToWorker_VFSChunk
   | MainToWorker_SpawnResult
   | MainToWorker_ChildOutput
@@ -192,12 +206,6 @@ export interface WorkerToMain_VFSWrite {
 
 export interface WorkerToMain_VFSDelete {
   type: "vfs-delete";
-  path: string;
-}
-
-export interface WorkerToMain_VFSRead {
-  type: "vfs-read";
-  requestId: number;
   path: string;
 }
 
@@ -324,7 +332,6 @@ export type WorkerToMainMessage =
   | WorkerToMain_Console
   | WorkerToMain_VFSWrite
   | WorkerToMain_VFSDelete
-  | WorkerToMain_VFSRead
   | WorkerToMain_SpawnRequest
   | WorkerToMain_ForkRequest
   | WorkerToMain_WorkerThreadRequest
@@ -348,7 +355,6 @@ export interface SpawnConfig {
   cwd: string;
   env: Record<string, string>;
   snapshot: VFSBinarySnapshot;
-  sharedBuffer?: SharedArrayBuffer;
   syncBuffer?: SharedArrayBuffer;
   parentPid?: number;
 }

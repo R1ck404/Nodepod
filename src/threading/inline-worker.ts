@@ -168,6 +168,30 @@ const DEFAULT_DEFINE = {
   "import.meta": "import_meta",
 };
 
+// esbuild (~10MB) loads lazily on the first transform/build task — warm-up
+// only pulls pako, which every extract task needs. With lazy install
+// transforms most pool workers never fetch esbuild at all.
+let _esbuildInitPromise = null;
+
+function ensureEsbuild() {
+  if (esbuildEngine) return Promise.resolve();
+  if (_esbuildInitPromise) return _esbuildInitPromise;
+  _esbuildInitPromise = (async function () {
+    const esbuildMod = await cdnImport(ESBUILD_ESM_URL);
+    const engine = esbuildMod.default || esbuildMod;
+    try {
+      await engine.initialize({ wasmURL: ESBUILD_WASM_URL });
+    } catch (err) {
+      if (!(err instanceof Error && err.message.includes('Cannot call "initialize" more than once'))) {
+        throw err;
+      }
+    }
+    esbuildEngine = engine;
+  })();
+  _esbuildInitPromise.catch(function () { _esbuildInitPromise = null; });
+  return _esbuildInitPromise;
+}
+
 const endpoint = {
   async init() {
     if (_initialized) return;
@@ -175,21 +199,11 @@ const endpoint = {
     const pakoMod = await cdnImport(PAKO_URL);
     pakoModule = pakoMod.default || pakoMod;
 
-    const esbuildMod = await cdnImport(ESBUILD_ESM_URL);
-    esbuildEngine = esbuildMod.default || esbuildMod;
-
-    try {
-      await esbuildEngine.initialize({ wasmURL: ESBUILD_WASM_URL });
-    } catch (err) {
-      if (!(err instanceof Error && err.message.includes('Cannot call "initialize" more than once'))) {
-        throw err;
-      }
-    }
-
     _initialized = true;
   },
 
   async transform(task) {
+    await ensureEsbuild();
     if (!esbuildEngine) throw new Error("Worker not initialized");
 
     const opts = task.options || {};
@@ -236,12 +250,17 @@ const endpoint = {
   async extract(task) {
     if (!pakoModule) throw new Error("Worker not initialized");
 
-    const response = await fetch(task.tarballUrl);
-    if (!response.ok) {
-      throw new Error("Archive download failed (HTTP " + response.status + "): " + task.tarballUrl);
+    // main thread passes cached tarball bytes on warm runs — skip the fetch
+    let compressed;
+    if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
+      compressed = new Uint8Array(task.tarballBytes);
+    } else {
+      const response = await fetch(task.tarballUrl);
+      if (!response.ok) {
+        throw new Error("Archive download failed (HTTP " + response.status + "): " + task.tarballUrl);
+      }
+      compressed = new Uint8Array(await response.arrayBuffer());
     }
-
-    const compressed = new Uint8Array(await response.arrayBuffer());
     const tarBytes = pakoModule.inflate(compressed);
 
     const files = [];
@@ -271,10 +290,18 @@ const endpoint = {
       }
     }
 
-    return { type: "extract", id: task.id, files: files };
+    const result = { type: "extract", id: task.id, files: files };
+    // hand the compressed bytes back so main can persist them (tarball cache)
+    if (task.wantTarball) {
+      result.tarballBytes = compressed.buffer.byteLength === compressed.byteLength
+        ? compressed.buffer
+        : compressed.slice().buffer;
+    }
+    return result;
   },
 
   async build(task) {
+    await ensureEsbuild();
     if (!esbuildEngine) throw new Error("Worker not initialized");
 
     const fileMap = new Map();

@@ -28,6 +28,8 @@ const allExternal = [
  * JS string. This is necessary because consumers of nodepod (Next.js, Webpack,
  * etc.) can't resolve Vite-specific worker chunk URLs. Instead, we embed the
  * entire worker bundle as a string and create Blob URL workers at runtime.
+ * The same bundle is also emitted as dist/__worker__.js so runtimes that can
+ * reach it as a same-origin asset skip parsing the embedded copy entirely.
  */
 function inlineProcessWorkerPlugin() {
   const VIRTUAL_ID = "virtual:process-worker-bundle";
@@ -44,7 +46,8 @@ function inlineProcessWorkerPlugin() {
         platform: "browser",
         target: "esnext",
         write: false,
-        minify: false,
+        minify: true,
+        legalComments: "none",
         sourcemap: false,
         // Don't externalize anything — the worker must be fully self-contained
       });
@@ -57,6 +60,13 @@ function inlineProcessWorkerPlugin() {
       if (id === RESOLVED_ID) {
         return `export const PROCESS_WORKER_BUNDLE = ${JSON.stringify(workerBundle)};`;
       }
+    },
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "__worker__.js",
+        source: workerBundle,
+      });
     },
   };
 }

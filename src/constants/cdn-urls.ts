@@ -7,7 +7,6 @@ export const PINNED_LIGHTNINGCSS_WASM = '1.31.1';
 
 export const CDN_ESBUILD_ESM = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}`;
 export const CDN_ESBUILD_BINARY = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/esbuild.wasm`;
-export const CDN_ESBUILD_BROWSER = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/esm/browser.min.js`;
 export const CDN_ROLLUP_BROWSER = `https://esm.sh/@rollup/browser@${PINNED_ROLLUP_BROWSER}`;
 // jsdelivr serves raw files without rebundling. esm.sh rebundles everything
 // which breaks brotli-wasm's circular WASM/JS-glue dependencies, causing

@@ -3,57 +3,23 @@
 // Transforms are offloaded to Web Workers when available.
 
 import type { MemoryVolume } from "./memory-volume";
-import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY, cdnImport } from "./constants/cdn-urls";
 import { offload, taskId, TaskPriority } from "./threading/offload";
 import type { TransformResult } from "./threading/offload-types";
+import { getEsbuild, getEsbuildIfReady } from "./helpers/esbuild-engine";
 
 const inBrowser = typeof window !== "undefined";
 
-// load and init esbuild-wasm from CDN (reuses existing instance)
+// load and init esbuild-wasm from CDN (realm-wide singleton, shared with the esbuild polyfill)
 export async function prepareTransformer(): Promise<void> {
   if (!inBrowser) {
     return;
   }
-
-  if (window.__esbuildEngine) {
-    return;
-  }
-
-  if (window.__esbuildReady) {
-    return window.__esbuildReady;
-  }
-
-  window.__esbuildReady = (async () => {
-    try {
-      const loaded = await cdnImport(CDN_ESBUILD_ESM);
-      const engine = loaded.default || loaded;
-
-      try {
-        await engine.initialize({ wasmURL: CDN_ESBUILD_BINARY });
-      } catch (initErr) {
-        if (
-          initErr instanceof Error &&
-          initErr.message.includes('Cannot call "initialize" more than once')
-        ) {
-          /* already initialized, ignore */
-        } else {
-          throw initErr;
-        }
-      }
-
-      window.__esbuildEngine = engine;
-    } catch (err) {
-      window.__esbuildReady = undefined;
-      throw err;
-    }
-  })();
-
-  return window.__esbuildReady;
+  await getEsbuild();
 }
 
 export function isTransformerLoaded(): boolean {
   if (!inBrowser) return true;
-  return window.__esbuildEngine !== undefined;
+  return getEsbuildIfReady() !== null;
 }
 
 function containsJsx(source: string): boolean {
@@ -136,8 +102,7 @@ export async function convertFileDirect(
 ): Promise<string> {
   if (!inBrowser) return source;
 
-  if (!window.__esbuildEngine) await prepareTransformer();
-  const engine = window.__esbuildEngine;
+  const engine = await getEsbuild();
   if (!engine) throw new Error("esbuild engine not available");
 
   const loader = detectLoader(filePath, source);

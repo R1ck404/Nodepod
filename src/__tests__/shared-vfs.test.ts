@@ -208,9 +208,10 @@ describe("SharedVFSController + SharedVFSReader", () => {
     });
 
     it("writeFile returns false when data won't fit", () => {
-      // need a buffer big enough for the fixed table (16+16384*264) plus a
-      // tiny bit of data, then try to overflow that tiny bit.
-      const HEADER_AND_TABLE = 16 + 16384 * 264;
+      // need a buffer big enough for the fixed table (32+16384*272, see
+      // shared-vfs.ts layout) plus a tiny bit of data, then try to overflow
+      // that tiny bit.
+      const HEADER_AND_TABLE = 32 + 16384 * 272;
       const ctrl = new SharedVFSController(HEADER_AND_TABLE + 1024);
 
       expect(ctrl.writeFile("/small.dat", new Uint8Array(500))).toBe(true);
@@ -412,12 +413,14 @@ describe("cross-thread attach (SAB via worker_threads)", () => {
 
       // inline reader so the worker doesn't have to import the TS source.
       // same shape as what a sibling worker would do in production.
-      const HEADER_SIZE = 16;
-      const ENTRY_SIZE = 264;
+      // NOTE: constants mirror the layout in src/threading/shared-vfs.ts —
+      // keep in sync when the layout changes (plan 014 added the hash field).
+      const HEADER_SIZE = 32;
+      const ENTRY_SIZE = 272;
       const ENTRY_FLAGS_OFFSET = 0;
       const ENTRY_CONTENT_OFFSET = 4;
       const ENTRY_CONTENT_LENGTH = 8;
-      const ENTRY_PATH_OFFSET = 16;
+      const ENTRY_PATH_OFFSET = 20;
       const ENTRY_PATH_MAX = 248;
       const DATA_OFFSET = HEADER_SIZE + 16384 * ENTRY_SIZE;
       const FLAG_ACTIVE = 1;
@@ -476,5 +479,141 @@ describe("cross-thread attach (SAB via worker_threads)", () => {
     expect(result.dataBytes).toEqual([42, 43, 44]);
     expect(result.projOneJs).toBe("module.exports = 1");
     expect(result.missing).toBeNull();
+  });
+});
+
+describe("compaction + waste accounting (plan 014)", () => {
+  // fixed header+table plus a 4MB data region for churn tests
+  const HEADER_AND_TABLE = 32 + 16384 * 272;
+  const DATA_REGION = 4 * 1024 * 1024;
+  const SMALL = HEADER_AND_TABLE + DATA_REGION;
+
+  it("tracks wasteBytes on overwrite and delete", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    ctrl.writeFile("/a.txt", new Uint8Array(100));
+    expect(ctrl.getStats().wasteBytes).toBe(0);
+
+    ctrl.writeFile("/a.txt", new Uint8Array(50)); // orphans the 100 old bytes
+    expect(ctrl.getStats().wasteBytes).toBe(100);
+
+    ctrl.writeFile("/b.txt", new Uint8Array(30));
+    ctrl.deleteFile("/b.txt");
+    expect(ctrl.getStats().wasteBytes).toBe(130);
+  });
+
+  it("churn does not exhaust the data region (overwrites reclaim via compaction)", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    const payload = new Uint8Array(64 * 1024);
+    // 1000 × 64KB appends = ~64MB — impossible in a 4MB region without compaction
+    for (let i = 0; i < 1000; i++) {
+      payload[0] = i % 256;
+      expect(ctrl.writeFile("/hot.js", payload)).toBe(true);
+    }
+    const stats = ctrl.getStats();
+    expect(stats.droppedWrites).toBe(0);
+    expect(stats.compactions).toBeGreaterThan(0);
+    expect(stats.wasteBytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+
+    const out = ctrl.readFile("/hot.js")!;
+    expect(out[0]).toBe(999 % 256);
+    expect(out.byteLength).toBe(64 * 1024);
+  });
+
+  it("deleted files' space is reclaimed for new writes", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    const big = new Uint8Array(1024 * 1024);
+    // fill most of the 4MB data region
+    expect(ctrl.writeFile("/one.bin", big)).toBe(true);
+    expect(ctrl.writeFile("/two.bin", big)).toBe(true);
+    expect(ctrl.writeFile("/three.bin", big)).toBe(true);
+    ctrl.deleteFile("/one.bin");
+    ctrl.deleteFile("/two.bin");
+    // without reclamation this would fail for space; rescue-compaction saves it
+    expect(ctrl.writeFile("/four.bin", big)).toBe(true);
+    expect(ctrl.readFile("/four.bin")!.byteLength).toBe(big.byteLength);
+    expect(ctrl.readFile("/three.bin")!.byteLength).toBe(big.byteLength);
+    expect(ctrl.readFile("/one.bin")).toBeNull();
+  });
+
+  it("a reader sees correct content immediately after compaction", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    const reader = new SharedVFSReader(ctrl.buffer);
+    ctrl.writeFile("/keep.txt", new TextEncoder().encode("keep me"));
+    ctrl.writeDirectory("/dir");
+    ctrl.writeFile("/dir/nested.txt", new TextEncoder().encode("nested"));
+    ctrl.writeFile("/gone.txt", new TextEncoder().encode("bye"));
+    ctrl.deleteFile("/gone.txt");
+    ctrl.writeFile("/keep.txt", new TextEncoder().encode("keep me v2"));
+
+    const versionBefore = reader.version;
+    ctrl.compact();
+    expect(reader.version).toBeGreaterThan(versionBefore);
+
+    expect(new TextDecoder().decode(reader.readFileSync("/keep.txt")!)).toBe("keep me v2");
+    expect(new TextDecoder().decode(reader.readFileSync("/dir/nested.txt")!)).toBe("nested");
+    expect(reader.isDirectorySync("/dir")).toBe(true);
+    expect(reader.readFileSync("/gone.txt")).toBeNull();
+    expect(reader.readdirSync("/dir")).toEqual(["nested.txt"]);
+    expect(ctrl.getStats().wasteBytes).toBe(0);
+  });
+
+  it("compaction drops tombstoned entries from the table", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    ctrl.writeFile("/a", new Uint8Array(1));
+    ctrl.writeFile("/b", new Uint8Array(1));
+    ctrl.deleteFile("/a");
+    expect(ctrl.getStats().entries).toBe(2);
+    ctrl.compact();
+    const stats = ctrl.getStats();
+    expect(stats.entries).toBe(1);
+    expect(stats.activeEntries).toBe(1);
+    expect(ctrl.exists("/b")).toBe(true);
+    expect(ctrl.exists("/a")).toBe(false);
+  });
+
+  it("dropped writes are counted when the region genuinely cannot fit", () => {
+    const ctrl = new SharedVFSController(SMALL);
+    // larger than the whole data region — impossible even after compaction
+    const tooBig = new Uint8Array(DATA_REGION + 1024);
+    expect(ctrl.writeFile("/huge.bin", tooBig)).toBe(false);
+    expect(ctrl.getStats().droppedWrites).toBe(1);
+  });
+
+  it("hash collisions still resolve by byte compare", () => {
+    // brute-force two distinct paths with equal fnv1a
+    function fnv1a(str: string): number {
+      let hash = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = (hash * 0x01000193) >>> 0;
+      }
+      return hash;
+    }
+    const buckets = new Map<number, string>();
+    let a: string | null = null;
+    let b: string | null = null;
+    outer: for (let i = 0; i < 5_000_000; i++) {
+      const p = `/f${i.toString(36)}`;
+      const h = fnv1a(p);
+      const prev = buckets.get(h);
+      if (prev !== undefined && prev !== p) {
+        a = prev;
+        b = p;
+        break outer;
+      }
+      buckets.set(h, p);
+    }
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+
+    const ctrl = new SharedVFSController(SMALL);
+    const reader = new SharedVFSReader(ctrl.buffer);
+    ctrl.writeFile(a!, new TextEncoder().encode("content-a"));
+    ctrl.writeFile(b!, new TextEncoder().encode("content-b"));
+
+    expect(new TextDecoder().decode(reader.readFileSync(a!)!)).toBe("content-a");
+    expect(new TextDecoder().decode(reader.readFileSync(b!)!)).toBe("content-b");
+    expect(new TextDecoder().decode(ctrl.readFile(a!)!)).toBe("content-a");
+    expect(new TextDecoder().decode(ctrl.readFile(b!)!)).toBe("content-b");
   });
 });

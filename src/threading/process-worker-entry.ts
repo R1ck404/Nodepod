@@ -4,6 +4,7 @@
 import { MemoryVolume } from "../memory-volume";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
 import { SyncChannelWorker } from "./sync-channel";
+import { createLazyFsClient } from "./lazy-fs-client";
 import type {
   MainToWorkerMessage,
   MainToWorker_Init,
@@ -96,6 +97,17 @@ self.addEventListener("message", (ev: MessageEvent) => {
     case "vfs-sync":
       handleVFSSync(msg);
       break;
+    case "vfs-invalidate":
+      // large-file change: drop local copy, re-pull lazily on next access
+      if (_volume) {
+        _suppressVFSWatch = true;
+        try {
+          _volume.markLazyInvalidated(msg.path);
+        } finally {
+          _suppressVFSWatch = false;
+        }
+      }
+      break;
     case "vfs-chunk":
       handleVFSChunk(msg);
       break;
@@ -152,6 +164,21 @@ function handleInit(msg: MainToWorker_Init): void {
   _env = msg.env || {};
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
+
+  // lean spawn mode: snapshot excluded heavy dirs (node_modules etc.) —
+  // install a synchronous fallback that pulls misses from the main thread.
+  // needs SAB for Atomics.wait; without it main falls back to full snapshots.
+  if (
+    msg.snapshot.lazyDirNames &&
+    msg.snapshot.lazyDirNames.length > 0 &&
+    msg.lazyFsPort &&
+    typeof SharedArrayBuffer !== "undefined"
+  ) {
+    _volume.setMissHandler(
+      createLazyFsClient(msg.lazyFsPort),
+      msg.snapshot.lazyDirNames,
+    );
+  }
 
   // watch local writes and forward to main — suppressed during inbound vfs-sync to prevent echo
   _volume.watch("/", { recursive: true }, (event, filename) => {

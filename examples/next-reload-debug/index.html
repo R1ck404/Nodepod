@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>next reload debug</title>
+  <style>
+    body { font-family: monospace; font-size: 12px; background: #111; color: #ddd; margin: 0; display: flex; height: 100vh; }
+    #left { flex: 1; display: flex; flex-direction: column; min-width: 0; border-right: 1px solid #444; }
+    #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .title { padding: 4px 8px; background: #222; border-bottom: 1px solid #444; flex-shrink: 0; }
+    pre { flex: 1; overflow: auto; margin: 0; padding: 8px; white-space: pre-wrap; word-break: break-all; }
+    iframe { flex: 1; border: none; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <div class="title" id="status">booting…</div>
+    <pre id="dbg"></pre>
+  </div>
+  <div id="right">
+    <div class="title">preview (loads: <span id="loads">0</span>)</div>
+    <iframe id="frame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>
+    <pre id="srv"></pre>
+  </div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const statusEl = document.getElementById("status");
+    const dbgEl = document.getElementById("dbg");
+    const srvEl = document.getElementById("srv");
+    const loadsEl = document.getElementById("loads");
+    const frame = document.getElementById("frame");
+
+    window.__DBG = [];
+    window.__SRV = [];
+    let loads = 0;
+
+    function dbg(msg) {
+      const line = (performance.now() / 1000).toFixed(2) + " " + msg;
+      window.__DBG.push(line);
+      dbgEl.textContent += line + "\n";
+      dbgEl.scrollTop = dbgEl.scrollHeight;
+    }
+    function srvLog(chunk) {
+      window.__SRV.push(chunk);
+      srvEl.textContent = window.__SRV.join("").slice(-4000);
+      srvEl.scrollTop = srvEl.scrollHeight;
+    }
+
+    window.addEventListener("message", (ev) => {
+      const d = ev.data;
+      if (d && d.__nrd) dbg(d.__nrd);
+    });
+
+    frame.addEventListener("load", () => {
+      loads++;
+      loadsEl.textContent = String(loads);
+      dbg("[outer] iframe load #" + loads);
+    });
+
+    const previewScript = [
+      '(function() {',
+      '  function report(msg) {',
+      '    try { window.parent.postMessage({ __nrd: msg }, "*"); } catch (e) {}',
+      '  }',
+      '  report("[doc] load " + location.href);',
+      '  window.addEventListener("pagehide", function() { report("[doc] pagehide (navigating away)"); });',
+      '  window.addEventListener("error", function(ev) {',
+      '    report("[err] " + (ev.message || "") + " @ " + (ev.filename || "") + ":" + (ev.lineno || 0));',
+      '  });',
+      '  window.addEventListener("unhandledrejection", function(ev) {',
+      '    var r = ev.reason;',
+      '    report("[rej] " + (r && (r.stack || r.message) || String(r)).slice(0, 300));',
+      '  });',
+      '  var origWarn = console.warn, origErr = console.error;',
+      '  console.warn = function() { report("[con.warn] " + Array.prototype.map.call(arguments, String).join(" ").slice(0, 300)); return origWarn.apply(console, arguments); };',
+      '  console.error = function() { report("[con.err] " + Array.prototype.map.call(arguments, String).join(" ").slice(0, 300)); return origErr.apply(console, arguments); };',
+      '  var InnerWS = window.WebSocket;',
+      '  function LoggedWS(url, protocols) {',
+      '    var ws = new InnerWS(url, protocols);',
+      '    var id = Math.random().toString(36).slice(2, 6);',
+      '    report("[ws " + id + "] connect " + url);',
+      '    var origSend = ws.send;',
+      '    ws.send = function(data) {',
+      '      report("[ws " + id + "] send " + String(data).slice(0, 200));',
+      '      return origSend.call(ws, data);',
+      '    };',
+      '    ws.addEventListener("open", function() { report("[ws " + id + "] open"); });',
+      '    ws.addEventListener("close", function(ev) { report("[ws " + id + "] close code=" + ev.code); });',
+      '    ws.addEventListener("error", function() { report("[ws " + id + "] error"); });',
+      '    ws.addEventListener("message", function(ev) {',
+      '      if (typeof ev.data === "string") { report("[ws " + id + "] recv " + ev.data.slice(0, 300)); return; }',
+      '      try {',
+      '        var bytes = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : null;',
+      '        if (bytes) {',
+      '          var head = new TextDecoder().decode(bytes.slice(0, 300));',
+      '          report("[ws " + id + "] recv BINARY len=" + bytes.length + " head=" + JSON.stringify(head));',
+      '        } else { report("[ws " + id + "] recv non-arraybuffer binary"); }',
+      '      } catch (e) { report("[ws " + id + "] recv binary decode fail: " + e.message); }',
+      '    });',
+      '    return ws;',
+      '  }',
+      '  LoggedWS.CONNECTING = 0; LoggedWS.OPEN = 1; LoggedWS.CLOSING = 2; LoggedWS.CLOSED = 3;',
+      '  LoggedWS.prototype = InnerWS.prototype;',
+      '  window.WebSocket = LoggedWS;',
+      '})();',
+    ].join("\n");
+
+    const files = {
+      "/home/app/package.json": JSON.stringify({
+        name: "app",
+        private: true,
+        scripts: { dev: "next dev" },
+        dependencies: {
+          next: "16.2.10",
+          react: "19.2.3",
+          "react-dom": "19.2.3",
+        },
+      }, null, 2),
+      "/home/app/app/globals.css": "body { background: rgb(240, 240, 255); font-family: sans-serif; }",
+      "/home/app/app/layout.js": [
+        'import "./globals.css";',
+        'export const metadata = { title: "reload debug" };',
+        'export default function RootLayout({ children }) {',
+        '  return (<html lang="en"><body>{children}</body></html>);',
+        '}',
+      ].join("\n"),
+      "/home/app/app/page.js": [
+        'export default function Home() {',
+        '  return <h1>hello from next</h1>;',
+        '}',
+      ].join("\n"),
+    };
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/home/app",
+      allowedFetchDomains: null,
+      files,
+      onServerReady(_port, url) {
+        dbg("[outer] server ready: " + url);
+        statusEl.textContent = "dev server live";
+        frame.src = url;
+      },
+    });
+    window.__nodepod = nodepod;
+
+    await nodepod.setPreviewScript(previewScript);
+
+    statusEl.textContent = "npm install…";
+    dbg("[outer] npm install starting");
+    const install = await nodepod.spawn("npm", ["install"], { cwd: "/home/app" });
+    install.on("output", srvLog);
+    install.on("error", srvLog);
+    const ir = await install.completion;
+    dbg("[outer] npm install exited " + ir.exitCode);
+    if (ir.exitCode !== 0) {
+      statusEl.textContent = "npm install FAILED";
+      srvLog("\n---INSTALL FAILED---\n" + ir.stderr.slice(-2000));
+    } else {
+      statusEl.textContent = "starting next dev --webpack…";
+      const dev = await nodepod.spawn("npm", ["run", "dev", "--", "--webpack"], { cwd: "/home/app" });
+      dev.on("output", srvLog);
+      dev.on("error", srvLog);
+      window.__dev = dev;
+    }
+  </script>
+</body>
+</html>

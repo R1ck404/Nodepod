@@ -57,10 +57,10 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-// start eagerly in browsers so WASM is ready by the time transform() is called
-if (typeof window !== "undefined" || typeof (globalThis as any).importScripts === "function") {
-  ensureInit().catch(() => {}); // swallow, functions retry on call
-}
+// No eager init at bundle import: the ~16MB WASM only loads when something
+// actually uses lightningcss. The script engine's native-package fallback
+// syncAwaits init() before handing this polyfill to the requiring module,
+// so the sync APIs (transform, bundle, ...) are ready by then.
 
 function requireInit(): void {
   if (!wasmMod) throw new Error("lightningcss: WASM not ready yet — call await init() first");

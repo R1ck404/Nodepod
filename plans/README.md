@@ -34,16 +34,16 @@ architecture. Written against `78bec2c` + the batch-1 working tree.
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
-| 011 | Spawn snapshot diet — exclude `node_modules`, lazy fs fallback | P0 | L | MED-HIGH | — | TODO |
-| 012 | Bound worker transform caches (LRU, shared per worker) | P0 | S | LOW | — | TODO |
-| 013 | VFS broadcast hygiene — single-allocation fan-out, dead fields | P1 | S | LOW-MED | coordinate w/ 011 | TODO |
-| 014 | SharedVFS hash index + compaction + failure visibility | P1 | M | MED | — | TODO |
-| 015 | Persistent install caches (tarballs + binary snapshots, shell parity) | P0 | M | LOW-MED | — | TODO |
-| 016 | Lazy package transforms (extract at install, transform on require) | P0 | M | MED | 012 first | TODO |
-| 017 | WASM module cache + streaming + remove sync XHR | P1 | M | MED | — | TODO |
-| 018 | Unify esbuild init, lazy heavy polyfills, boot preload | P1 | M | MED | — | TODO |
-| 019 | Externalize + minify embedded worker bundle | P2 | M | MED | — | TODO |
-| 020 | SPIKE: copy-on-write shared VFS for spawns | P1 | L | HIGH | after 011+014 | TODO |
+| 011 | Spawn snapshot diet — exclude `node_modules`, lazy fs fallback | P0 | L | MED-HIGH | — | DONE |
+| 012 | Bound worker transform caches (LRU, shared per worker) | P0 | S | LOW | — | DONE |
+| 013 | VFS broadcast hygiene — single-allocation fan-out, dead fields | P1 | S | LOW-MED | coordinate w/ 011 | DONE |
+| 014 | SharedVFS hash index + compaction + failure visibility | P1 | M | MED | — | DONE |
+| 015 | Persistent install caches (tarballs + binary snapshots, shell parity) | P0 | M | LOW-MED | — | DONE |
+| 016 | Lazy package transforms (extract at install, transform on require) | P0 | M | MED | 012 first | DONE |
+| 017 | WASM module cache + streaming + remove sync XHR | P1 | M | MED | — | DONE |
+| 018 | Unify esbuild init, lazy heavy polyfills, boot preload | P1 | M | MED | — | DONE |
+| 019 | Externalize + minify embedded worker bundle | P2 | M | MED | — | DONE |
+| 020 | SPIKE: copy-on-write shared VFS for spawns | P1 | L | HIGH | after 011+014 | DONE — NO-GO, see `020-cow-vfs-spike.RESULTS.md` |
 
 Recommended order (memory-first): **012 → 011 → 013 → 014** (memory tier),
 then **015 → 016** (install tier), then **017 → 018 → 019**, then the **020**

@@ -83,14 +83,18 @@ async function mainThreadExtract(
   const { parseTarArchive } = await import("../packages/archive-extractor");
   const { bytesToBase64 } = await import("../helpers/byte-encoding");
 
-  const response = await fetch(task.tarballUrl);
-  if (!response.ok) {
-    throw new Error(
-      `Archive download failed (HTTP ${response.status}): ${task.tarballUrl}`,
-    );
+  let compressed: Uint8Array;
+  if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
+    compressed = new Uint8Array(task.tarballBytes);
+  } else {
+    const response = await fetch(task.tarballUrl);
+    if (!response.ok) {
+      throw new Error(
+        `Archive download failed (HTTP ${response.status}): ${task.tarballUrl}`,
+      );
+    }
+    compressed = new Uint8Array(await response.arrayBuffer());
   }
-
-  const compressed = new Uint8Array(await response.arrayBuffer());
   const tarBytes = pako.inflate(compressed);
 
   const files: ExtractResult["files"] = [];
@@ -115,7 +119,14 @@ async function mainThreadExtract(
     files.push({ path: relative, data, isBinary });
   }
 
-  return { type: "extract", id: task.id, files };
+  const result: ExtractResult = { type: "extract", id: task.id, files };
+  if (task.wantTarball) {
+    result.tarballBytes =
+      compressed.buffer instanceof ArrayBuffer && compressed.byteLength === compressed.buffer.byteLength
+        ? compressed.buffer
+        : compressed.slice().buffer as ArrayBuffer;
+  }
+  return result;
 }
 
 async function mainThreadBuild(task: BuildTask): Promise<BuildResult> {

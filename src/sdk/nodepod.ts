@@ -36,6 +36,7 @@ import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import { buildFileSystemBridge } from "../polyfills/fs";
+import { getEsbuild } from "../helpers/esbuild-engine";
 
 // short url-safe id. always starts with a letter so it can't be confused
 // with a port number in /__virtual__/{id}/{port}
@@ -288,6 +289,22 @@ export class Nodepod {
       makeInstanceId(),
     );
     nodepod._wasiFsChannel = wasiFsChannel;
+
+    if (opts.spawnSnapshot) {
+      // ProcessManager double-checks SAB availability per spawn and falls
+      // back to full snapshots with a one-time warning
+      nodepod._processManager.setSpawnSnapshotMode(opts.spawnSnapshot);
+    }
+
+    // warm the shared esbuild instance while the rest of boot proceeds;
+    // fire-and-forget — consumers await getEsbuild() themselves
+    if (opts.preloadEsbuild !== false && typeof window !== "undefined") {
+      getEsbuild().catch(() => {});
+    }
+
+    // probe for the external worker asset so first spawn can skip the
+    // embedded bundle string; fire-and-forget with embedded fallback
+    ProcessManager.probeExternalWorkerBundle(opts.workerUrl).catch(() => {});
 
     if (opts.files) {
       for (const [path, content] of Object.entries(opts.files)) {

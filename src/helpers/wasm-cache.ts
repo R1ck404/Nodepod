@@ -1,6 +1,19 @@
 // WASM compilation cache. Browsers block sync WebAssembly.Module() for large
 // buffers on the main thread, so we either precompile in the background or
 // offload to a worker where there's no size limit.
+//
+// Two tiers:
+//   L1 — in-memory map keyed by a fast synchronous content hash (dual-lane
+//        FNV-1a + length), consulted from the patched WebAssembly.Module
+//        constructor which cannot await.
+//   L2 — IndexedDB keyed by SHA-256, storing the compiled WebAssembly.Module
+//        via structured clone (Chromium/Firefox). Warm reloads skip compile.
+
+import {
+  getWasmModuleCache,
+  quickWasmHash,
+  wasmContentHash,
+} from "../persistence/wasm-module-cache";
 
 const PRECOMPILE_THRESHOLD = 4 * 1024 * 1024; // 4 MB
 
@@ -9,27 +22,16 @@ type CacheEntry = {
   module: WebAssembly.Module | null;
 };
 
-// Keyed by byte length -- good enough since multiple same-size .wasm files are rare
-const sizeCache = new Map<number, CacheEntry>();
+// L1: keyed by quickWasmHash(bytes) — content-derived, sync to compute
+const moduleCache = new Map<string, CacheEntry>();
 
-function actualByteLength(bytes: BufferSource): number {
-  if (bytes instanceof ArrayBuffer) return bytes.byteLength;
-  return (bytes as ArrayBufferView).byteLength;
+function actualByteLength(bytes: ArrayBuffer | ArrayBufferView): number {
+  return bytes.byteLength;
 }
 
-function toUint8(bytes: Uint8Array | ArrayBuffer): Uint8Array {
+function toUint8(bytes: ArrayBuffer | ArrayBufferView): Uint8Array {
   if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
-  if (
-    bytes.byteOffset !== 0 ||
-    bytes.byteLength !== (bytes.buffer as ArrayBuffer).byteLength
-  ) {
-    return new Uint8Array(
-      bytes.buffer as ArrayBuffer,
-      bytes.byteOffset,
-      bytes.byteLength,
-    );
-  }
-  return bytes;
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
 function toArrayBuffer(bytes: Uint8Array | ArrayBuffer): ArrayBuffer {
@@ -40,90 +42,159 @@ function toArrayBuffer(bytes: Uint8Array | ArrayBuffer): ArrayBuffer {
   ) as ArrayBuffer;
 }
 
+// Persist a compiled module to IDB, keyed by SHA-256 of its bytes.
+function persistModule(bytes: Uint8Array, module: WebAssembly.Module): void {
+  wasmContentHash(bytes)
+    .then(async (hash) => {
+      const cache = await getWasmModuleCache();
+      if (cache) await cache.put(hash, module);
+    })
+    .catch(() => {});
+}
+
+// Look up a previously-persisted module. Returns null on any failure.
+async function loadPersistedModule(
+  bytes: Uint8Array,
+): Promise<WebAssembly.Module | null> {
+  try {
+    const cache = await getWasmModuleCache();
+    if (!cache) return null;
+    return await cache.get(await wasmContentHash(bytes));
+  } catch {
+    return null;
+  }
+}
+
+// Register an externally-compiled module (e.g. from compileStreaming) in
+// both tiers so later sync constructions hit the cache.
+export function registerCompiledModule(
+  bytes: Uint8Array,
+  module: WebAssembly.Module,
+): void {
+  const key = quickWasmHash(bytes);
+  moduleCache.set(key, { promise: Promise.resolve(module), module });
+  persistModule(bytes, module);
+}
+
 // Call as early as possible (e.g. when writing .wasm to VFS)
 export function precompileWasm(bytes: Uint8Array | ArrayBuffer): void {
   if (typeof WebAssembly === "undefined") return;
-
-  const len = bytes instanceof ArrayBuffer ? bytes.byteLength : bytes.byteLength;
-  if (len < PRECOMPILE_THRESHOLD) return;
-  if (sizeCache.has(len)) return;
+  if (actualByteLength(bytes) < PRECOMPILE_THRESHOLD) return;
 
   const view = toUint8(bytes);
+  const key = quickWasmHash(view);
+  if (moduleCache.has(key)) return;
+
+  // Hold a stable copy: callers may mutate/transfer their buffer, and both
+  // the IDB-miss compile and the SHA-256 hash need the original bytes.
+  const stable = view.slice();
   const entry: CacheEntry = {
-    promise: WebAssembly.compile(view as BufferSource),
+    promise: (async () => {
+      const persisted = await loadPersistedModule(stable);
+      if (persisted) return persisted;
+      const mod = await WebAssembly.compile(stable as BufferSource);
+      persistModule(stable, mod);
+      return mod;
+    })(),
     module: null,
   };
   entry.promise.then(
     (m) => { entry.module = m; },
-    () => {},
+    () => { moduleCache.delete(key); },
   );
-  sizeCache.set(len, entry);
+  moduleCache.set(key, entry);
 }
 
 export function getCachedModule(bytes: BufferSource): WebAssembly.Module | null {
-  const len = actualByteLength(bytes);
-  const entry = sizeCache.get(len);
+  // hashing is a single pass over the buffer; only paid on wasm construction
+  const entry = moduleCache.get(quickWasmHash(toUint8(bytes)));
   if (entry?.module) return entry.module;
   return null;
 }
 
-// Worker-based compilation (no size limit in workers)
-let _workerUrl: string | null = null;
+// Worker-based compilation (no size limit in workers). One persistent worker
+// is lazily created and reused across compiles instead of a throwaway worker
+// per call.
+let _compileWorker: Worker | null = null;
+let _nextCompileId = 1;
+const _pendingCompiles = new Map<
+  number,
+  { resolve: (m: WebAssembly.Module) => void; reject: (e: Error) => void }
+>();
 
-function getWorkerUrl(): string {
-  if (_workerUrl) return _workerUrl;
+function getCompileWorker(): Worker {
+  if (_compileWorker) return _compileWorker;
   const code = `
     self.onmessage = function(e) {
       try {
         var mod = new WebAssembly.Module(e.data.bytes);
-        self.postMessage({ ok: true, module: mod });
+        self.postMessage({ id: e.data.id, ok: true, module: mod });
       } catch (err) {
-        self.postMessage({ ok: false, error: err.message });
+        self.postMessage({ id: e.data.id, ok: false, error: err.message });
       }
     };
   `;
-  _workerUrl = URL.createObjectURL(
+  const url = URL.createObjectURL(
     new Blob([code], { type: "application/javascript" }),
   );
-  return _workerUrl;
+  const worker = new Worker(url);
+  URL.revokeObjectURL(url);
+  worker.onmessage = (e: MessageEvent) => {
+    const { id, ok, module, error } = e.data;
+    const pending = _pendingCompiles.get(id);
+    if (!pending) return;
+    _pendingCompiles.delete(id);
+    if (ok) pending.resolve(module);
+    else pending.reject(new Error(error));
+  };
+  worker.onerror = (e) => {
+    const err = new Error(e.message || "Worker compilation failed");
+    for (const pending of _pendingCompiles.values()) pending.reject(err);
+    _pendingCompiles.clear();
+    worker.terminate();
+    if (_compileWorker === worker) _compileWorker = null;
+  };
+  _compileWorker = worker;
+  return worker;
 }
 
 export function compileWasmInWorker(
   bytes: Uint8Array | ArrayBuffer,
 ): Promise<WebAssembly.Module> {
-  return new Promise((resolve, reject) => {
-    try {
-      const worker = new Worker(getWorkerUrl());
-      worker.onmessage = (e: MessageEvent) => {
-        worker.terminate();
-        if (e.data.ok) {
-          const len = bytes instanceof ArrayBuffer ? bytes.byteLength : bytes.byteLength;
-          const entry = sizeCache.get(len);
-          if (entry) {
-            entry.module = e.data.module;
-          } else {
-            sizeCache.set(len, {
-              promise: Promise.resolve(e.data.module),
-              module: e.data.module,
-            });
-          }
-          resolve(e.data.module);
-        } else {
-          reject(new Error(e.data.error));
-        }
-      };
-      worker.onerror = (e) => {
-        worker.terminate();
-        reject(new Error(e.message || "Worker compilation failed"));
-      };
-      const ab = toArrayBuffer(bytes);
-      worker.postMessage({ bytes: ab }, [ab]);
-    } catch (e) {
-      // No workers -- fall back to async compile
-      const view = toUint8(bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes);
-      WebAssembly.compile(view as BufferSource).then(resolve, reject);
-    }
-  });
+  const view = toUint8(bytes);
+  const key = quickWasmHash(view);
+
+  const existing = moduleCache.get(key);
+  if (existing?.module) return Promise.resolve(existing.module);
+
+  const stable = view.slice();
+  const promise = (async () => {
+    const persisted = await loadPersistedModule(stable);
+    if (persisted) return persisted;
+
+    const mod = await new Promise<WebAssembly.Module>((resolve, reject) => {
+      try {
+        const worker = getCompileWorker();
+        const id = _nextCompileId++;
+        _pendingCompiles.set(id, { resolve, reject });
+        const ab = toArrayBuffer(stable.slice());
+        worker.postMessage({ id, bytes: ab }, [ab]);
+      } catch {
+        // No workers — fall back to async compile on this thread
+        WebAssembly.compile(stable as BufferSource).then(resolve, reject);
+      }
+    });
+    persistModule(stable, mod);
+    return mod;
+  })();
+
+  const entry: CacheEntry = { promise, module: null };
+  promise.then(
+    (m) => { entry.module = m; },
+    () => { moduleCache.delete(key); },
+  );
+  moduleCache.set(key, entry);
+  return promise;
 }
 
 export function needsAsyncCompile(bytes: BufferSource): boolean {

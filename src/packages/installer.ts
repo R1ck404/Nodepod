@@ -15,7 +15,11 @@ import type { PackageManifest } from "../types/manifest";
 import * as path from "../polyfills/path";
 import type { IDBSnapshotCache } from "../persistence/idb-cache";
 import { quickDigest } from "../helpers/digest";
-import { base64ToBytes } from "../helpers/byte-encoding";
+import {
+  createFilteredBinarySnapshot,
+  restoreBinarySnapshot,
+} from "../persistence/binary-snapshot";
+import { getTarballCache } from "../persistence/tarball-cache";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -28,8 +32,18 @@ export interface InstallFlags {
   withDevDeps?: boolean;
   withOptionalDeps?: boolean;
   onProgress?: (message: string) => void;
-  // default: true
-  transformModules?: boolean;
+  /**
+   * Module transform timing. Default is lazy: install only downloads and
+   * extracts; the runtime module loader converts ESM/CJS on first require()
+   * (and caches it). Pass "eager" (or the legacy `true`) to run esbuild over
+   * every installed file at install time like before.
+   */
+  transformModules?: boolean | "eager";
+}
+
+// "eager" | true → install-time transforms; false | undefined → lazy (default)
+export function isEagerTransform(value: boolean | "eager" | undefined): boolean {
+  return value === "eager" || value === true;
 }
 
 export interface InstallOutcome {
@@ -144,7 +158,56 @@ export class DependencyInstaller {
       resolutionOpts,
     );
 
+    // snapshot cache keyed by the resolved package set — skips download,
+    // extract, and transform on warm runs (resolution still hit the registry).
+    // TODO(follow-up): upgrade quickDigest to SHA-256 via sync-digest.ts
+    const treeKey = this._snapshotCache
+      ? "tree:" + quickDigest(
+          [...tree].map(([n, d]) => `${n}@${d.version}`).sort().join(",") +
+            "|" + this.workingDir,
+        )
+      : null;
+
+    if (this._snapshotCache && treeKey) {
+      try {
+        const cached = await this._snapshotCache.get(treeKey);
+        if (cached) {
+          onProgress?.("Restoring cached packages...");
+          const restored = restoreBinarySnapshot(this.vol, cached);
+          // bin stubs + lock file are deterministic — recreate from the tree
+          const nmRoot = path.join(this.workingDir, "node_modules");
+          for (const [depName] of tree) {
+            this.createBinStubs(nmRoot, depName, path.join(nmRoot, depName));
+          }
+          this.writeLockFile(tree);
+          if (flags.persist || flags.persistDev) {
+            const entry = tree.get(targetName);
+            if (entry) {
+              await this.patchManifest(targetName, `^${entry.version}`, !!flags.persistDev);
+            }
+          }
+          onProgress?.(`Restored ${restored} cached entries`);
+          return { resolved: tree, newPackages: [] };
+        }
+      } catch {
+        // cache error — proceed with normal install
+      }
+    }
+
     const newPkgs = await this.materializePackages(tree, flags);
+
+    // cache just this tree's package dirs so unrelated node_modules content
+    // from the session doesn't leak into the entry
+    if (this._snapshotCache && treeKey && newPkgs.length > 0) {
+      try {
+        const nmRoot = path.join(this.workingDir, "node_modules");
+        const prefixes = [...tree.keys()].map((n) => path.join(nmRoot, n));
+        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
+          prefixes.some((prefix) => p === prefix || p.startsWith(prefix + "/")),
+        );
+        await this._snapshotCache.set(treeKey, snapshot);
+      } catch { /* cache write failure is non-fatal */ }
+    }
 
     if (flags.persist || flags.persistDev) {
       const entry = tree.get(targetName);
@@ -184,23 +247,8 @@ export class DependencyInstaller {
         const cached = await this._snapshotCache.get(cacheKey);
         if (cached) {
           onProgress?.("Restoring cached node_modules...");
-          const { entries } = cached;
-          // Restore only node_modules entries from the snapshot
-          for (const entry of entries) {
-            if (!entry.path.includes('/node_modules/')) continue;
-            if (entry.kind === 'directory') {
-              if (!this.vol.existsSync(entry.path)) {
-                this.vol.mkdirSync(entry.path, { recursive: true });
-              }
-            } else if (entry.kind === 'file' && entry.data) {
-              const parentDir = entry.path.substring(0, entry.path.lastIndexOf('/')) || '/';
-              if (parentDir !== '/' && !this.vol.existsSync(parentDir)) {
-                this.vol.mkdirSync(parentDir, { recursive: true });
-              }
-              this.vol.writeFileSync(entry.path, base64ToBytes(entry.data));
-            }
-          }
-          onProgress?.(`Restored ${entries.length} cached entries`);
+          const restored = restoreBinarySnapshot(this.vol, cached);
+          onProgress?.(`Restored ${restored} cached entries`);
           return { resolved: new Map(), newPackages: [] };
         }
       } catch {
@@ -223,15 +271,14 @@ export class DependencyInstaller {
 
     const newPkgs = await this.materializePackages(tree, flags);
 
-    // Cache the installed node_modules snapshot for future reuse
+    // Cache the installed node_modules snapshot for future reuse (raw bytes,
+    // no base64 — restores go through the bulk binary path)
     if (this._snapshotCache && cacheKey && newPkgs.length > 0) {
       try {
-        const snapshot = this.vol.toSnapshot();
-        // Filter to only node_modules entries to keep cache lean
-        const nmSnapshot = {
-          entries: snapshot.entries.filter(e => e.path.includes('/node_modules/')),
-        };
-        await this._snapshotCache.set(cacheKey, nmSnapshot);
+        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
+          p.includes("/node_modules/"),
+        );
+        await this._snapshotCache.set(cacheKey, snapshot);
       } catch { /* cache write failure is non-fatal */ }
     }
 
@@ -315,7 +362,7 @@ export class DependencyInstaller {
     }
 
     // Only need main-thread transformer as fallback when workers aren't available
-    const shouldTransform = flags.transformModules !== false;
+    const shouldTransform = isEagerTransform(flags.transformModules);
     if (shouldTransform && !transformerReady) {
       if (typeof Worker === "undefined") {
         onProgress?.("Preparing module transformer...");
@@ -367,6 +414,13 @@ export class DependencyInstaller {
     }
 
     this.writeLockFile(tree);
+
+    // keep the tarball cache under its byte/age budget (fire and forget)
+    if (additions.length > 0) {
+      getTarballCache()
+        .then((cache) => cache?.prune())
+        .catch(() => {});
+    }
 
     return additions;
   }

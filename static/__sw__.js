@@ -21,7 +21,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 8;
+const SW_VERSION = 10;
 const DEFAULT_INSTANCE = "default";
 
 let nextId = 1;
@@ -279,7 +279,16 @@ self.addEventListener("message", (event) => {
   // clientId so a page can't claim for a pod it isn't already tied to.
   if (data.type === "nodepod-path-claim" && typeof data.path === "string") {
     const clientId = event.source && event.source.id;
-    const pod = clientId ? previewClients.get(clientId) : null;
+    let pod = clientId ? previewClients.get(clientId) : null;
+    // reloaded preview documents can commit under a clientId the SW never
+    // registered (the resultingClientId recorded at navigation time doesn't
+    // always match the committed client). the document still runs the
+    // injected location patch, which only pod-served HTML carries, so when
+    // its path already maps to a pod we adopt the new client for that pod.
+    if (!pod && clientId) {
+      pod = pathToPodMap.get(data.path) || null;
+      if (pod) previewClients.set(clientId, pod);
+    }
     if (pod) {
       if (pathToPodMap.size >= PATH_MAP_MAX) {
         const oldest = pathToPodMap.keys().next().value;
@@ -425,9 +434,13 @@ self.addEventListener("fetch", (event) => {
   //    virtual server. catches module imports like /@react-refresh etc.
   //    only same-origin, let cross-origin (google fonts, CDNs) pass through
   const clientId = event.clientId;
+  const sameOriginHost =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "0.0.0.0" ||
+    url.hostname === self.location.hostname;
   if (clientId && previewClients.has(clientId)) {
-    const host = url.hostname;
-    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname) {
+    if (sameOriginHost) {
       const { instanceId, serverPort } = previewClients.get(clientId);
       // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
       // (or legacy forms) if the browser resolved a relative URL against the
@@ -444,7 +457,7 @@ self.addEventListener("fetch", (event) => {
   // 4. fallback: check Referer header. Handles the Firefox race where the first
   //    subresource after a navigation arrives with event.clientId === "".
   const referer = event.request.referrer;
-  if (referer) {
+  if (referer && sameOriginHost) {
     try {
       const refUrl = new URL(referer);
       // Try new then legacy shape in the referer path
@@ -452,24 +465,54 @@ self.addEventListener("fetch", (event) => {
         matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
         matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
       if (refHit) {
-        const host = url.hostname;
-        if (
-          host === "localhost" ||
-          host === "127.0.0.1" ||
-          host === "0.0.0.0" ||
-          host === self.location.hostname
-        ) {
-          const { instanceId, port: serverPort } = refHit;
-          let path = stripPreviewPrefix(url.pathname);
-          path += url.search;
-          if (clientId) {
-            previewClients.set(clientId, { instanceId, serverPort });
-          }
-          event.respondWith(
-            proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
-          );
-          return;
+        const { instanceId, port: serverPort } = refHit;
+        let path = stripPreviewPrefix(url.pathname);
+        path += url.search;
+        if (clientId) {
+          previewClients.set(clientId, { instanceId, serverPort });
         }
+        event.respondWith(
+          proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
+        );
+        return;
+      }
+
+      // 4b. referer is a STRIPPED path a preview iframe claimed. This is a
+      //     subresource of an iframe document that reloaded at its stripped
+      //     URL: the reload commits under a clientId the SW never registered
+      //     (previewClients only knows resultingClientId from the original
+      //     prefixed navigation), and the referer carries no /__virtual__/
+      //     prefix, so routes 3 and 4 both miss and every asset would fall
+      //     through to the host server and 404. Resolve the pod through the
+      //     path-claim map, but only adopt clients that really are nested
+      //     iframes so a top-level tab that happens to sit on a claimed path
+      //     (e.g. "/") keeps its normal network behavior.
+      const pathPod =
+        refUrl.origin === self.location.origin
+          ? pathToPodMap.get(refUrl.pathname)
+          : null;
+      if (pathPod && clientId) {
+        const { instanceId, serverPort } = pathPod;
+        const path = stripPreviewPrefix(url.pathname) + url.search;
+        event.respondWith(
+          (async () => {
+            let nested = previewClients.has(clientId);
+            if (!nested) {
+              try {
+                const client = await self.clients.get(clientId);
+                nested = !!client && client.frameType === "nested";
+              } catch {
+                nested = false;
+              }
+            }
+            if (!nested) return fetch(event.request);
+            previewClients.set(clientId, { instanceId, serverPort });
+            return proxyToVirtualServer(
+              event.request, instanceId, serverPort, path, event.request,
+            );
+          })(),
+        );
+        return;
       }
     } catch {
       // Invalid referer URL, ignore
@@ -687,6 +730,49 @@ function getWsShimScript(instanceId, serverPort) {
   };
 
   window.WebSocket = NodepodWS;
+})();
+</script>`;
+}
+
+// ── Navigation timing patch ──
+//
+// Documents served from a service worker's synthetic Response report
+// transferSize/encodedBodySize/decodedBodySize of 0 on their
+// PerformanceNavigationTiming entry — indistinguishable from a disk-cache
+// hit. Frameworks use transferSize === 0 as a "served from HTTP cache"
+// signal (e.g. dev clients force-reload to get a fresh server render, which
+// here loops forever because every load reports 0). Pod-served documents
+// are never cache hits — the virtual server rendered them — so fill in the
+// real byte counts the SW just served.
+function getNavTimingPatchScript(bodyBytes) {
+  const size = Number.isFinite(bodyBytes) && bodyBytes > 0 ? Math.floor(bodyBytes) : 1;
+  return `<script>
+(function() {
+  if (window.__nodepodNavTiming) return;
+  window.__nodepodNavTiming = true;
+  var bodySize = ${size};
+  try {
+    if (typeof PerformanceNavigationTiming === "undefined") return;
+    var resProto = PerformanceResourceTiming.prototype;
+    var navProto = PerformanceNavigationTiming.prototype;
+    function shadow(prop, value) {
+      var orig = Object.getOwnPropertyDescriptor(resProto, prop);
+      if (!orig || !orig.get) return;
+      Object.defineProperty(navProto, prop, {
+        configurable: true,
+        enumerable: true,
+        get: function() {
+          var v = orig.get.call(this);
+          return v === 0 ? value : v;
+        }
+      });
+    }
+    shadow("encodedBodySize", bodySize);
+    shadow("decodedBodySize", bodySize);
+    // spec: transferSize = encoded body + ~300 bytes of headers when the
+    // response comes over the network rather than from a cache
+    shadow("transferSize", bodySize + 300);
+  } catch (e) {}
 })();
 </script>`;
 }
@@ -984,7 +1070,10 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
     if (ct.includes("text/html") && responseBody) {
       // location patch runs first so user scripts see the stripped URL
-      let injection = LOCATION_PATCH_SCRIPT + getWsShimScript(instanceId, serverPort);
+      let injection =
+        getNavTimingPatchScript(responseBody.byteLength) +
+        LOCATION_PATCH_SCRIPT +
+        getWsShimScript(instanceId, serverPort);
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
         const safe = String(previewScript).replace(/<\/script/gi, "<\\/script");

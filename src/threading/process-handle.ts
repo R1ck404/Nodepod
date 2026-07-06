@@ -207,10 +207,6 @@ export class ProcessHandle extends EventEmitter {
           this.emit("vfs-delete", msg.path);
           break;
 
-        case "vfs-read":
-          this.emit("vfs-read", msg.requestId, msg.path);
-          break;
-
         case "spawn-request":
           this.emit("spawn-request", msg);
           break;

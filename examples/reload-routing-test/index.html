@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>reload routing test</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #ddd; padding: 16px; }
+    #log { white-space: pre; border: 1px solid #444; padding: 8px; margin-top: 8px; }
+    iframe { width: 480px; height: 200px; border: 1px solid #444; background: #fff; }
+  </style>
+</head>
+<body>
+  <h3>reload routing test</h3>
+  <div id="status">booting…</div>
+  <iframe id="frame" hidden sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>
+  <div id="log">(no requests yet)</div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const frame = document.getElementById("frame");
+
+    let serverUrl = "";
+
+    const serverCode = [
+      'const http = require("http");',
+      'const seen = [];',
+      'const server = http.createServer((req, res) => {',
+      '  const path = req.url.split("?")[0];',
+      '  if (path !== "/__seen") seen.push(req.method + " " + req.url);',
+      '  if (path === "/__seen") {',
+      '    res.writeHead(200, { "Content-Type": "application/json" });',
+      '    res.end(JSON.stringify(seen));',
+      '  } else if (path === "/style.css") {',
+      '    res.writeHead(200, { "Content-Type": "text/css" });',
+      '    res.end("body{background:rgb(10,200,30)}");',
+      '  } else if (path === "/app.js") {',
+      '    res.writeHead(200, { "Content-Type": "application/javascript" });',
+      '    res.end("document.title = \\"js-loaded\\"; window.__appLoaded = true;");',
+      '  } else if (path === "/") {',
+      '    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });',
+      '    res.end([',
+      '      "<!DOCTYPE html><html><head>",',
+      '      "<link rel=\\"stylesheet\\" href=\\"/style.css\\">",',
+      '      "<script src=\\"/app.js\\"></" + "script>",',
+      '      "</head><body><h1>pod page</h1>",',
+      '      "<script>",',
+      '      "var last = Number(sessionStorage.getItem(\\"reloadedAt\\") || 0);",',
+      '      "if (Date.now() - last > 5000) {",',
+      '      "  sessionStorage.setItem(\\"reloadedAt\\", String(Date.now()));",',
+      '      "  setTimeout(() => location.reload(), 700);",',
+      '      "}",',
+      '      "</" + "script>",',
+      '      "</body></html>",',
+      '    ].join(""));',
+      '  } else {',
+      '    res.writeHead(404, { "Content-Type": "text/plain" });',
+      '    res.end("not found: " + req.url);',
+      '  }',
+      '});',
+      'server.listen(3000, () => console.log("listening on 3000"));',
+    ].join("\n");
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/home",
+      allowedFetchDomains: null,
+      files: { "/home/index.js": serverCode },
+      onServerReady(_port, url) {
+        serverUrl = url;
+        statusEl.textContent = "server live at " + url;
+        frame.hidden = false;
+        frame.src = url;
+      },
+    });
+
+    const proc = await nodepod.spawn("node", ["index.js"]);
+    proc.stdout?.on?.("data", () => {});
+
+    setInterval(async () => {
+      if (!serverUrl) return;
+      try {
+        const res = await fetch(serverUrl + "/__seen");
+        const seen = await res.json();
+        logEl.textContent = "SERVER SAW:\n" + seen.join("\n");
+        logEl.dataset.count = String(seen.length);
+      } catch (e) {
+        logEl.textContent = "poll error: " + e.message;
+      }
+    }, 500);
+  </script>
+</body>
+</html>

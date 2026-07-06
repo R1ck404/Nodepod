@@ -164,18 +164,19 @@ const DEFAULT_DEFINE: Record<string, string> = {
   "import.meta": "import_meta",
 };
 
-const workerEndpoint: OffloadWorkerEndpoint = {
-  async init(): Promise<void> {
-    if (initialized) return;
+// esbuild (~10MB) loads lazily on the first transform task — warm-up only
+// pulls pako, which every extract task needs. With lazy install transforms,
+// most workers never pay the esbuild download at all.
+let esbuildInitPromise: Promise<void> | null = null;
 
-    const pakoMod = await cdnImport(PAKO_URL);
-    pakoModule = pakoMod.default || pakoMod;
-
+function ensureEsbuild(): Promise<void> {
+  if (esbuildEngine) return Promise.resolve();
+  if (esbuildInitPromise) return esbuildInitPromise;
+  esbuildInitPromise = (async () => {
     const esbuildMod = await cdnImport(ESBUILD_ESM_URL);
-    esbuildEngine = esbuildMod.default || esbuildMod;
-
+    const engine = esbuildMod.default || esbuildMod;
     try {
-      await esbuildEngine.initialize({ wasmURL: ESBUILD_WASM_URL });
+      await engine.initialize({ wasmURL: ESBUILD_WASM_URL });
     } catch (err: any) {
       if (
         !(
@@ -186,11 +187,24 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         throw err;
       }
     }
+    esbuildEngine = engine;
+  })();
+  esbuildInitPromise.catch(() => { esbuildInitPromise = null; });
+  return esbuildInitPromise;
+}
+
+const workerEndpoint: OffloadWorkerEndpoint = {
+  async init(): Promise<void> {
+    if (initialized) return;
+
+    const pakoMod = await cdnImport(PAKO_URL);
+    pakoModule = pakoMod.default || pakoMod;
 
     initialized = true;
   },
 
   async transform(task: TransformTask): Promise<TransformResult> {
+    await ensureEsbuild();
     if (!esbuildEngine) throw new Error("Worker not initialized");
 
     const opts = task.options || {};
@@ -344,6 +358,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
   },
 
   async build(task: BuildTask): Promise<BuildResult> {
+    await ensureEsbuild();
     if (!esbuildEngine) throw new Error("Worker not initialized");
 
     const fileMap = new Map<string, string>();

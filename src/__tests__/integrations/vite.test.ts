@@ -3,8 +3,13 @@ import nodepod from "../../integrations/vite";
 import { createServer, build } from "vite";
 import type { RollupOutput } from "rollup";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The worker bundle asset only exists after `pnpm run build:lib`; the plugin
+// (and these assertions) treat it as optional so test order doesn't matter.
+const workerAssetBuilt = existsSync(join(process.cwd(), "dist", "__worker__.js"));
 
 describe("integrations/vite", () => {
   it("factory returns a Vite plugin object with expected hooks", () => {
@@ -37,9 +42,17 @@ describe("integrations/vite", () => {
       bundle: unknown,
     ) => Promise<void>).call(ctx, {}, {});
 
-    expect(emitted).toHaveLength(1);
-    expect(emitted[0].fileName).toBe("__sw__.js");
-    expect(emitted[0].source.length).toBeGreaterThan(1000);
+    const sw = emitted.find((a) => a.fileName === "__sw__.js");
+    expect(sw).toBeDefined();
+    expect(sw!.source.length).toBeGreaterThan(1000);
+
+    const worker = emitted.find((a) => a.fileName === "__worker__.js");
+    if (workerAssetBuilt) {
+      expect(worker).toBeDefined();
+      expect(worker!.source.length).toBeGreaterThan(1000);
+    } else {
+      expect(worker).toBeUndefined();
+    }
   });
 
   it("configureServer mounts a middleware that serves the SW at /__sw__.js", async () => {
@@ -177,6 +190,13 @@ describe("integrations/vite end-to-end", () => {
           : Buffer.from(sw.source).toString("utf8");
         expect(src.length).toBeGreaterThan(1000);
         expect(src).toMatch(/self\.addEventListener/);
+      }
+
+      if (workerAssetBuilt) {
+        const worker = assets.find(
+          (a) => a.type === "asset" && a.fileName === "__worker__.js",
+        );
+        expect(worker).toBeDefined();
       }
     } finally {
       await rm(dir, { recursive: true, force: true });

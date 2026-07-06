@@ -13,6 +13,7 @@ export class VFSBridge {
   private _sharedVFS: SharedVFSController | null = null;
   // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
+  private _warnedSharedVFSDrop = false;
 
   constructor(volume: MemoryVolume) {
     this._volume = volume;
@@ -26,11 +27,18 @@ export class VFSBridge {
     this._sharedVFS = controller;
   }
 
-  // packs all files into one ArrayBuffer plus a manifest
-  createSnapshot(): VFSBinarySnapshot {
+  // packs all files into one ArrayBuffer plus a manifest.
+  // excludeDirNames (lean spawn mode): directories with these names are
+  // recorded as empty dir entries but not descended into — the worker
+  // hydrates their contents lazily via the fs proxy.
+  createSnapshot(opts?: { excludeDirNames?: string[] }): VFSBinarySnapshot {
     const manifest: VFSSnapshotEntry[] = [];
     const chunks: Uint8Array[] = [];
     let totalSize = 0;
+    const exclude =
+      opts?.excludeDirNames && opts.excludeDirNames.length > 0
+        ? new Set(opts.excludeDirNames)
+        : null;
 
     this._walkVolume("/", (path, isDirectory, content) => {
       if (isDirectory) {
@@ -50,7 +58,7 @@ export class VFSBridge {
         chunks.push(content);
         totalSize += content.byteLength;
       }
-    });
+    }, exclude);
 
     const data = new ArrayBuffer(totalSize);
     const view = new Uint8Array(data);
@@ -60,7 +68,9 @@ export class VFSBridge {
       offset += chunk.byteLength;
     }
 
-    return { manifest, data };
+    const snapshot: VFSBinarySnapshot = { manifest, data };
+    if (exclude) snapshot.lazyDirNames = opts!.excludeDirNames!.slice();
+    return snapshot;
   }
 
   // split into chunks for large transfers
@@ -120,10 +130,23 @@ export class VFSBridge {
       }
       this._volume.writeFileSync(path, content);
       if (this._sharedVFS) {
-        this._sharedVFS.writeFile(path, content);
+        this._sharedVFSWrite(path, content);
       }
     } finally {
       this._suppressWatch = false;
+    }
+  }
+
+  // writeFile returns false on table/data exhaustion — silent drops mean
+  // workers stop seeing updates, so surface it once per session
+  private _sharedVFSWrite(path: string, content: Uint8Array): void {
+    if (!this._sharedVFS!.writeFile(path, content) && !this._warnedSharedVFSDrop) {
+      this._warnedSharedVFSDrop = true;
+      const stats = this._sharedVFS!.getStats();
+      console.warn(
+        `[VFSBridge] SharedVFS write dropped for "${path}" (entries: ${stats.entries}, data: ${stats.dataUsed}/${stats.bufferSize} bytes). ` +
+          `Workers may see stale reads. Further drops counted in getStats().droppedWrites.`,
+      );
     }
   }
 
@@ -223,7 +246,7 @@ export class VFSBridge {
             const buffer = new ArrayBuffer(data.byteLength);
             new Uint8Array(buffer).set(data);
             this.broadcastChange(absPath, buffer, -1);
-            if (this._sharedVFS) this._sharedVFS.writeFile(absPath, data);
+            if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
           }
         } else {
           this.broadcastChange(absPath, null, -1);
@@ -240,6 +263,7 @@ export class VFSBridge {
   private _walkVolume(
     dir: string,
     visitor: (path: string, isDirectory: boolean, content: Uint8Array | null) => void,
+    excludeDirNames?: Set<string> | null,
   ): void {
     try {
       const entries = this._volume.readdirSync(dir);
@@ -249,7 +273,9 @@ export class VFSBridge {
           const stat = this._volume.statSync(fullPath);
           if (stat.isDirectory()) {
             visitor(fullPath, true, null);
-            this._walkVolume(fullPath, visitor);
+            // record the dir itself but don't descend — worker fetches lazily
+            if (excludeDirNames?.has(name)) continue;
+            this._walkVolume(fullPath, visitor, excludeDirNames);
           } else {
             const content = this._volume.readFileSync(fullPath);
             visitor(fullPath, false, content);

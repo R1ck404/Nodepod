@@ -8,6 +8,7 @@ import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
+import { getWorkerTransformCache } from "../threading/worker-transform-cache";
 import type { PackageManifest } from "../types/manifest";
 import { resetActiveInterfaceCount } from "./readline";
 import {
@@ -629,13 +630,33 @@ function formatWarn(msg: string, pm: PkgManager): string {
   }
 }
 
+// shell installs get the same IDB snapshot cache the SDK uses (plan 015).
+// opened once per realm; IDB is available in workers, where the shell runs.
+let _shellSnapshotCache:
+  | import("../persistence/idb-cache").IDBSnapshotCache
+  | null
+  | undefined;
+
+async function getShellSnapshotCache() {
+  if (_shellSnapshotCache === undefined) {
+    try {
+      const { openSnapshotCache } = await import("../persistence/idb-cache");
+      _shellSnapshotCache = await openSnapshotCache();
+    } catch {
+      _shellSnapshotCache = null;
+    }
+  }
+  return _shellSnapshotCache;
+}
+
 async function installPackages(
   args: string[],
   ctx: ShellContext,
   pm: PkgManager = "npm",
 ): Promise<ShellResult> {
   const { DependencyInstaller } = await import("../packages/installer");
-  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd });
+  const snapshotCache = await getShellSnapshotCache();
+  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache });
   let out = "";
   const write = _stdoutSink ?? ((_s: string) => {});
   const startTime = Date.now();
@@ -1114,6 +1135,8 @@ export async function executeNodeBinary(
     cwd: ctx.cwd,
     env: ctx.env,
     enableSharedArrayBuffer: _sabEnabled,
+    // shared per-realm LRU: bounds memory and lets repeat runs reuse transforms
+    transformCache: getWorkerTransformCache() as unknown as Map<string, string>,
     onConsole: (m: string, cArgs: unknown[]) => {
       // filter out process.exit sentinel errors logged by library code
       if (cArgs.length === 1) {

@@ -7,7 +7,10 @@ describe("AsyncLocalStorage", () => {
     als.run("hello", () => {
       expect(als.getStore()).toBe("hello");
     });
-    expect(als.getStore()).toBeUndefined();
+    // Deliberate divergence from Node: the last run's store stays visible
+    // (sticky fallback) so late continuations spawned inside run() — which a
+    // polyfill can't track across native await resumptions — still see it.
+    expect(als.getStore()).toBe("hello");
   });
 
   it("propagates store across await", async () => {
@@ -66,43 +69,43 @@ describe("AsyncLocalStorage", () => {
     });
   });
 
-  it("matches Next.js createAsyncLocalStorage module-load capture", async () => {
-    const maybeGlobal = (globalThis as any).AsyncLocalStorage;
-    function createAsyncLocalStorage<T>() {
-      return new maybeGlobal() as AsyncLocalStorage<T>;
-    }
-    const workUnitAsyncStorage = createAsyncLocalStorage<{ type: string }>();
+  it("late continuations spawned inside run() still see the store after run settles", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-    async function getRSCPayload() {
-      await Promise.resolve();
-      await new Promise((r) => setTimeout(r, 5));
-      return workUnitAsyncStorage.getStore();
-    }
+    let lateResult: string | undefined = "unset";
+    let lateDone: () => void;
+    const latePromise = new Promise<void>((r) => (lateDone = r));
 
-    const store = await workUnitAsyncStorage.run({ type: "request" }, getRSCPayload);
-    expect(store).toEqual({ type: "request" });
+    await als.run("request", async () => {
+      // Streaming-style work that outlives the awaited response promise.
+      void (async () => {
+        await delay(20);
+        lateResult = als.getStore();
+        lateDone();
+      })();
+      await delay(1);
+    });
+
+    await latePromise;
+    expect(lateResult).toBe("request");
   });
 
-  it("keeps store for React work after sync run() like renderToFlightStream", async () => {
-    const workAsync = new AsyncLocalStorage<{ w: number }>();
-    const workUnit = new AsyncLocalStorage<{ u: number }>();
-    const requestStore = { u: 1 };
-
-    await workAsync.run({ w: 1 }, async () => {
-      await workUnit.run(requestStore, async () => {
-        await Promise.resolve();
+  it("exit() hides the store even with a sticky last run", () => {
+    const als = new AsyncLocalStorage<string>();
+    als.run("outer", () => {
+      als.exit(() => {
+        expect(als.getStore()).toBeUndefined();
       });
-
-      // Next.js: sync workUnitAsyncStorage.run(..., renderToFlightStream, ...)
-      workUnit.run(requestStore, () => ({ stream: true }));
-
-      await new Promise<void>((resolve) => {
-        queueMicrotask(() => {
-          expect(workUnit.getStore()).toBe(requestStore);
-          expect(workAsync.getStore()).toEqual({ w: 1 });
-          resolve();
-        });
-      });
+      expect(als.getStore()).toBe("outer");
     });
+  });
+
+  it("disable() clears current and sticky stores", () => {
+    const als = new AsyncLocalStorage<string>();
+    als.run("x", () => {});
+    expect(als.getStore()).toBe("x");
+    als.disable();
+    expect(als.getStore()).toBeUndefined();
   });
 });

@@ -81,10 +81,11 @@ export async function preloadBrotli(): Promise<boolean> {
   return (await ensureBrotli()) !== null;
 }
 
-// Eagerly kick off brotli loading so it's available for sync callers ASAP.
-// This is fire-and-forget — if it fails the sync functions will still throw
-// a descriptive error, and the async functions will retry on next call.
-ensureBrotli();
+// Brotli WASM no longer loads at bundle import (it cost ~1MB of download +
+// an instance for apps that never touch brotli). The script engine calls
+// preloadBrotli() when user code first require()s "zlib", preserving the
+// old "kicked off early, usually ready by first sync call" semantics.
+// Async APIs and brotliDecompressSync (pure-JS fallback) work regardless.
 
 
 type CompressCallback = (err: Error | null, result: Buffer) => void;

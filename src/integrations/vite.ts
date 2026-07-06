@@ -10,7 +10,10 @@
 
 import type { Plugin } from "vite";
 import { readServiceWorkerSource } from "./shared/read-sw";
+import { readWorkerBundleSource } from "./shared/read-worker";
 import { swResponseHeaders, DEFAULT_SW_PATH } from "./shared/headers";
+
+const WORKER_ASSET_PATH = "/__worker__.js";
 
 export interface NodepodVitePluginOptions {
   /** Path to serve the SW from. Same origin as the page, must end in .js. Defaults to /__sw__.js. */
@@ -31,6 +34,17 @@ export default function nodepod(
       // still hits this handler.
       server.middlewares.use(async (req, res, next) => {
         const url = req.url?.split("?")[0];
+        if (url === WORKER_ASSET_PATH) {
+          // process-worker bundle: only exists in built packages; fall
+          // through (404) so the runtime uses its embedded copy
+          const source = await readWorkerBundleSource(import.meta.url).catch(() => null);
+          if (source === null) return next();
+          res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+          res.setHeader("Cache-Control", "no-cache");
+          res.statusCode = 200;
+          res.end(source);
+          return;
+        }
         if (url !== swPath) return next();
         try {
           const source = await readServiceWorkerSource(import.meta.url);
@@ -53,6 +67,14 @@ export default function nodepod(
         fileName: assetFileName,
         source,
       });
+      const workerSource = await readWorkerBundleSource(import.meta.url).catch(() => null);
+      if (workerSource !== null) {
+        this.emitFile({
+          type: "asset",
+          fileName: WORKER_ASSET_PATH.replace(/^\/+/, ""),
+          source: workerSource,
+        });
+      }
     },
   };
 }

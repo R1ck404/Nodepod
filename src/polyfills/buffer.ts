@@ -107,8 +107,13 @@ class BufferPolyfill extends Uint8Array {
     return merged;
   }
 
+  // Real Node returns false for plain Uint8Arrays. Code branches on this to
+  // decide whether Buffer methods exist on the value (e.g. Next's
+  // indexOfUint8Array calls haystack.indexOf(needleBytes), which only does a
+  // subsequence search on a real Buffer — native Uint8Array#indexOf compares
+  // elements against the needle object and always misses).
   static isBuffer(candidate: unknown): candidate is BufferPolyfill {
-    return candidate instanceof BufferPolyfill || candidate instanceof Uint8Array;
+    return candidate instanceof BufferPolyfill;
   }
 
   static isEncoding(enc: string): boolean {

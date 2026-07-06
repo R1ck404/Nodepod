@@ -10,6 +10,7 @@ import type {
 import { makeSystemError } from "../memory-volume";
 import { bytesToBase64, bytesToHex } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
+import { prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
@@ -1376,45 +1377,18 @@ export function buildFileSystemBridge(
         if (p.endsWith(".wasm")) precompileWasm(raw);
         return wrapAsBuffer(raw);
       } catch (err: any) {
-        // fall back to CDN for .wasm in node_modules that failed to extract (e.g. >15MB), script engine handles >4MB async compile
+        // .wasm under node_modules missing from the VFS (e.g. >15MB binary
+        // that skipped extraction): kick an async CDN prefetch so a retry
+        // succeeds, but never block this thread with a sync download.
         if (
           err?.code === "ENOENT" &&
           p.endsWith(".wasm") &&
-          p.includes("/node_modules/") &&
-          typeof XMLHttpRequest !== "undefined"
+          p.includes("/node_modules/")
         ) {
-          const nmIdx = p.lastIndexOf("/node_modules/");
-          const afterNm = p.substring(nmIdx + "/node_modules/".length);
-          const parts = afterNm.split("/");
-          let pkgName: string;
-          let filePath: string;
-          if (parts[0].startsWith("@")) {
-            pkgName = parts[0] + "/" + parts[1];
-            filePath = parts.slice(2).join("/");
-          } else {
-            pkgName = parts[0];
-            filePath = parts.slice(1).join("/");
-          }
-          let version = "latest";
-          try {
-            const pkgJsonPath = p.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
-            const pkgJson = JSON.parse(volume.readFileSync(pkgJsonPath, "utf8"));
-            if (pkgJson.version) version = pkgJson.version;
-          } catch { /* use latest */ }
-          const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
-          try {
-            const xhr = new XMLHttpRequest();
-            xhr.open("GET", cdnUrl, false); // synchronous
-            xhr.responseType = "arraybuffer";
-            xhr.send();
-            if (xhr.status === 200 && xhr.response) {
-              const bytes = new Uint8Array(xhr.response as ArrayBuffer);
-              // cache in VFS so subsequent reads hit it
-              volume.writeFileSync(p, bytes);
-              precompileWasm(bytes);
-              return wrapAsBuffer(bytes);
-            }
-          } catch { /* CDN fallback failed, rethrow original */ }
+          console.warn(
+            `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
+          );
+          prefetchWasmFromCdn(volume, p).catch(() => {});
         }
         throw err;
       }

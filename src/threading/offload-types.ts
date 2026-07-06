@@ -35,6 +35,10 @@ export interface ExtractTask {
   stripComponents: number;
   priority: TaskPriority;
   expectedShasum?: string;
+  // cached compressed tarball bytes — worker skips its fetch when provided
+  tarballBytes?: ArrayBuffer;
+  // ask the worker to return the compressed bytes so main can cache them
+  wantTarball?: boolean;
 }
 
 export interface ExtractedFile {
@@ -48,6 +52,8 @@ export interface ExtractResult {
   type: "extract";
   id: string;
   files: ExtractedFile[];
+  // compressed tarball bytes, present when the task set wantTarball
+  tarballBytes?: ArrayBuffer;
 }
 
 export interface BuildTask {

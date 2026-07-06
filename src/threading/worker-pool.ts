@@ -174,7 +174,8 @@ export class WorkerPool {
         id,
       };
 
-      // Pre-warm esbuild-wasm + pako. Timeout prevents stalled CDN from hanging.
+      // Pre-warm pako only (esbuild loads lazily on the first transform/build
+      // task). Timeout prevents stalled CDN from hanging.
       if (this.config.warmUpOnCreate) {
         const INIT_TIMEOUT = TIMEOUTS.WORKER_INIT_TIMEOUT;
         const initCall = endpoint.init();

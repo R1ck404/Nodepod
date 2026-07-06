@@ -12,11 +12,6 @@
 type StoreFrame = Map<object, unknown>;
 
 let currentFrame: StoreFrame = new Map();
-let activeRunDepth = 0;
-// Last store passed to run()/enterWith per ALS instance. Next.js calls
-// workUnitAsyncStorage.run() synchronously for renderToFlightStream; React
-// consumes the returned stream in later microtasks and still expects getStore().
-const ambientStores = new Map<object, unknown>();
 let asyncContextInstalled = false;
 
 function captureFrame(): StoreFrame {
@@ -25,15 +20,10 @@ function captureFrame(): StoreFrame {
 
 const NativePromise = Promise;
 
-function beginRun(frame: StoreFrame, prev: StoreFrame): () => void {
-  currentFrame = frame;
-  activeRunDepth++;
-  return () => {
-    activeRunDepth--;
-    currentFrame = prev;
-  };
-}
-
+// Synchronous frame switch. Always restores in finally: continuations
+// registered outside an active run() fire interleaved with the run's awaits,
+// and leaving their (often empty) frame current would clobber the run's store
+// for every subsequent native-await resumption.
 function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
   currentFrame = frame;
@@ -44,9 +34,19 @@ function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
   }
 }
 
+// Frame switch that survives native async/await inside fn. If fn returns a
+// promise, the frame is held current until it settles, because V8 resumes
+// async function bodies through internal promise reactions that bypass any
+// user-visible then(). Restore is guarded so a scope that settles while a
+// newer scope's frame is current doesn't stomp it.
 function runScoped<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
-  const finish = beginRun(frame, prev);
+  currentFrame = frame;
+  const finish = () => {
+    if (currentFrame === frame) {
+      currentFrame = prev;
+    }
+  };
   try {
     const result = fn();
     const maybePromise = result as unknown;
@@ -67,12 +67,11 @@ function wrapCallback<T extends (...args: any[]) => any>(
 ): T | undefined | null {
   if (typeof cb !== "function") return cb;
   const wrapped = function (this: unknown, ...args: unknown[]) {
-    // Inside AsyncLocalStorage.run(), keep the run-scoped frame. Re-entering a
-    // captured frame here breaks async/await because V8 runs the real continuation
-    // after this wrapper returns.
-    if (activeRunDepth > 0) {
-      return cb.apply(this, args);
-    }
+    // Sync restore (runWithFrame, NOT runScoped): if this callback captured
+    // an empty/stale frame and held it across its own awaits, it would be
+    // current when an active run()'s native-await resumptions fire and would
+    // clobber the run's store. The run's frame is held by runScoped instead,
+    // so restoring here hands control straight back to it.
     return runWithFrame(frame, () => cb.apply(this, args));
   } as T;
   return wrapped;
@@ -163,6 +162,7 @@ function patchTimerContext(): void {
   const wrapTimer = <F extends (...args: any[]) => void>(fn: F): F => {
     const frame = captureFrame();
     return ((...args: unknown[]) => {
+      // Sync restore for the same reason as wrapCallback.
       runWithFrame(frame, () => fn(...args));
     }) as F;
   };
@@ -204,11 +204,9 @@ export function installAsyncContext(): void {
   }
 
   patchTimerContext();
-
-  // Next.js captures globalThis.AsyncLocalStorage once when
-  // server/app-render/async-local-storage.js first loads. Install early.
-  (globalThis as any).AsyncLocalStorage = AsyncLocalStorage;
 }
+
+installAsyncContext();
 
 /* ------------------------------------------------------------------ */
 /*  AsyncResource                                                      */
@@ -281,59 +279,50 @@ AsyncLocalStorage.bind = function bind<F extends (...a: any[]) => any>(fn: F): F
   } as F;
 };
 
+// Marks "explicitly no store" inside exit() frames, so the sticky fallback
+// below doesn't resurrect a store the caller asked to leave.
+const EXCLUDED: unique symbol = Symbol("nodepod.als.excluded");
+
 AsyncLocalStorage.prototype.disable = function disable(): void {
   this._enabled = false;
+  this._stickyStore = undefined;
 };
 
+// Sticky fallback: when the current frame has no entry for this storage,
+// return the store of the most recent run(). Real AsyncLocalStorage carries
+// context per-continuation, so work spawned inside run() (e.g. Next.js
+// streaming Suspense chunks that flush AFTER the awaited response promise
+// settled) still sees the request store. We can't observe native async/await
+// resumptions from a polyfill, so without this fallback that late work reads
+// undefined and Next throws "Expected workUnitAsyncStorage to have a store".
+// Trade-off: code running truly outside any run() sees the last run's store
+// instead of undefined — acceptable for a dev sandbox, where a missing store
+// is fatal but a stale one is not.
 AsyncLocalStorage.prototype.getStore = function getStore() {
   if (this._enabled === false) return undefined;
-  if (ambientStores.has(this)) return ambientStores.get(this);
-  return currentFrame.get(this);
+  if (currentFrame.has(this)) {
+    const value = currentFrame.get(this);
+    return value === EXCLUDED ? undefined : value;
+  }
+  return this._stickyStore;
 };
 
 AsyncLocalStorage.prototype.run = function run(store: any, fn: (...args: any[]) => any, ...args: any[]) {
+  this._stickyStore = store;
   const frame = captureFrame();
   frame.set(this, store);
-  const prevAmbient = ambientStores.get(this);
-  ambientStores.set(this, store);
-  const restoreAmbient = () => {
-    if (prevAmbient !== undefined) ambientStores.set(this, prevAmbient);
-    else ambientStores.delete(this);
-  };
-  const result = runScoped(frame, () => fn(...args));
-  const maybePromise = result as unknown;
-  if (maybePromise != null && typeof (maybePromise as PromiseLike<unknown>).then === "function") {
-    return NativePromise.resolve(maybePromise as PromiseLike<unknown>).finally(() => {
-      if (ambientStores.get(this) === store) restoreAmbient();
-    }) as typeof result;
-  }
-  // Sync run that returns a stream/object (e.g. renderToFlightStream) keeps the
-  // ambient store for later React microtasks. Primitive/void sync runs restore.
-  if (maybePromise === null || typeof maybePromise !== "object") {
-    restoreAmbient();
-  }
-  return result;
+  return runScoped(frame, () => fn(...args));
 };
 
 AsyncLocalStorage.prototype.exit = function exit(fn: (...args: any[]) => any, ...args: any[]) {
   const frame = captureFrame();
-  frame.delete(this);
-  const prevAmbient = ambientStores.get(this);
-  ambientStores.delete(this);
-  const result = runScoped(frame, () => fn(...args));
-  const maybePromise = result as unknown;
-  if (maybePromise != null && typeof (maybePromise as PromiseLike<unknown>).then === "function") {
-    return NativePromise.resolve(maybePromise as PromiseLike<unknown>).finally(() => {
-      if (prevAmbient !== undefined) ambientStores.set(this, prevAmbient);
-    }) as typeof result;
-  }
-  if (prevAmbient !== undefined) ambientStores.set(this, prevAmbient);
-  return result;
+  frame.set(this, EXCLUDED);
+  return runScoped(frame, () => fn(...args));
 };
 
 AsyncLocalStorage.prototype.enterWith = function enterWith(store: any): void {
+  this._stickyStore = store;
   currentFrame.set(this, store);
-  ambientStores.set(this, store);
 };
 
 /* ------------------------------------------------------------------ */
@@ -366,8 +355,6 @@ export function executionAsyncResource(): object {
 export function triggerAsyncId(): number {
   return 0;
 }
-
-installAsyncContext();
 
 /* ------------------------------------------------------------------ */
 /*  Default export                                                     */

@@ -126,7 +126,10 @@ import {
   getCachedModule,
   precompileWasm,
   compileWasmInWorker,
+  registerCompiledModule,
+  PRECOMPILE_THRESHOLD,
 } from "./helpers/wasm-cache";
+import { buildCdnWasmUrl } from "./helpers/wasm-cdn";
 import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
 
@@ -891,6 +894,9 @@ export interface EngineOptions {
   };
   handler?: import("./memory-handler").MemoryHandler;
   enableSharedArrayBuffer?: boolean;
+  /** Injected transform cache (e.g. the shared worker LRU). Takes precedence
+   *  over `handler`'s cache. Must behave like Map<string, string>. */
+  transformCache?: Map<string, string>;
 }
 
 export interface ResolverFn {
@@ -1793,6 +1799,12 @@ function buildResolver(
     if (id === "fs/promises") return fsBridge.promises;
     if (id === "process") return proc;
     if (id === "console") return wrapConsole(opts.onConsole);
+    if (id === "zlib") {
+      // brotli WASM is lazy now — kick the load on first require so sync
+      // brotli APIs are usually ready by the time code calls them
+      compressionPolyfill.preloadBrotli().catch(() => {});
+      return CORE_MODULES["zlib"];
+    }
     if (id === "worker_threads") {
       if (opts.workerThreadsOverride) {
         const base = CORE_MODULES["worker_threads"];
@@ -2081,8 +2093,10 @@ export class ScriptEngine {
   private transformCache: Map<string, string>;
 
   constructor(vol: MemoryVolume, opts: EngineOptions = {}) {
-    // Use handler's LRU transform cache if available, else a plain Map
-    if (opts.handler) {
+    // Precedence: explicit injected cache > handler's LRU > plain Map
+    if (opts.transformCache) {
+      this.transformCache = opts.transformCache;
+    } else if (opts.handler) {
       this.transformCache = opts.handler.transformCache as unknown as Map<
         string,
         string
@@ -2204,29 +2218,45 @@ export class ScriptEngine {
                 );
               } catch {
                 // .wasm under node_modules that aren't in the VFS (big binaries that didn't extract), pull from CDN
-                if (vfsPath.endsWith(".wasm") && vfsPath.includes("/node_modules/")) {
-                  const nmIdx = vfsPath.lastIndexOf("/node_modules/");
-                  const afterNm = vfsPath.substring(nmIdx + "/node_modules/".length);
-                  // afterNm looks like "lightningcss-wasm/lightningcss_node.wasm" or "@scope/pkg/file.wasm"
-                  const parts = afterNm.split("/");
-                  let pkgName: string;
-                  let filePath: string;
-                  if (parts[0].startsWith("@")) {
-                    pkgName = parts[0] + "/" + parts[1];
-                    filePath = parts.slice(2).join("/");
-                  } else {
-                    pkgName = parts[0];
-                    filePath = parts.slice(1).join("/");
-                  }
-                  // grab version from package.json if present
-                  let version = "latest";
-                  try {
-                    const pkgJsonPath = vfsPath.substring(0, nmIdx + "/node_modules/".length) + pkgName + "/package.json";
-                    const pkgJson = JSON.parse(v.readFileSync(pkgJsonPath, "utf8"));
-                    if (pkgJson.version) version = pkgJson.version;
-                  } catch { /* use latest */ }
-                  const cdnUrl = `https://cdn.jsdelivr.net/npm/${pkgName}@${version}/${filePath}`;
-                  return origFetch(cdnUrl);
+                const cdnUrl = buildCdnWasmUrl(v, vfsPath);
+                if (cdnUrl) {
+                  return origFetch(cdnUrl).then((resp) => {
+                    if (resp.ok) {
+                      try {
+                        // overlap compile with the caller's byte read, and
+                        // persist to VFS so the next read skips the network
+                        const forCompile =
+                          typeof WebAssembly !== "undefined" &&
+                          typeof WebAssembly.compileStreaming === "function"
+                            ? resp.clone()
+                            : null;
+                        const forBytes = resp.clone();
+                        (async () => {
+                          const streaming = forCompile
+                            ? WebAssembly.compileStreaming(forCompile)
+                            : null;
+                          streaming?.catch(() => {});
+                          const bytes = new Uint8Array(await forBytes.arrayBuffer());
+                          try {
+                            const dir =
+                              vfsPath.substring(0, vfsPath.lastIndexOf("/")) || "/";
+                            v.mkdirSync(dir, { recursive: true });
+                            v.writeFileSync(vfsPath, bytes);
+                          } catch { /* best-effort */ }
+                          if (streaming && bytes.byteLength >= PRECOMPILE_THRESHOLD) {
+                            try {
+                              registerCompiledModule(bytes, await streaming);
+                            } catch {
+                              precompileWasm(bytes);
+                            }
+                          } else {
+                            precompileWasm(bytes);
+                          }
+                        })().catch(() => {});
+                      } catch { /* clone unsupported — plain passthrough */ }
+                    }
+                    return resp;
+                  });
                 }
                 return Promise.resolve(
                   new Response("Not found", { status: 404 }),
