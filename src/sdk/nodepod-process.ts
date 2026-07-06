@@ -56,6 +56,17 @@ export class NodepodProcess extends EventEmitter {
     this.emit("error", chunk);
   }
 
+  // Worker exit messages carry the full buffered stdout/stderr. Streaming chunks
+  // may be missing (e.g. output only flushed at process end), so merge any tail.
+  _mergeExitOutput(stdout?: string, stderr?: string): void {
+    if (stdout && stdout.length > this._stdout.length) {
+      this._pushStdout(stdout.slice(this._stdout.length));
+    }
+    if (stderr && stderr.length > this._stderr.length) {
+      this._pushStderr(stderr.slice(this._stderr.length));
+    }
+  }
+
   // Idempotent -- safe to call twice
   _finish(exitCode: number): void {
     if (this._exitCode !== null) return;

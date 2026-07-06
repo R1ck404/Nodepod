@@ -1805,6 +1805,10 @@ function buildResolver(
       compressionPolyfill.preloadBrotli().catch(() => {});
       return CORE_MODULES["zlib"];
     }
+    if (id === "sqlite") {
+      sqlitePolyfill.preloadSqlite().catch(() => {});
+      return CORE_MODULES["sqlite"];
+    }
     if (id === "worker_threads") {
       if (opts.workerThreadsOverride) {
         const base = CORE_MODULES["worker_threads"];
@@ -2125,6 +2129,8 @@ export class ScriptEngine {
       });
     watcherPolyfill.setVolume(vol);
     scannerPolyfill.setVolume(vol);
+    sqlitePolyfill.setVolume(vol);
+    sqlitePolyfill.setSqliteCwd(opts.cwd ?? "/");
     esbuildPolyfill.setVolume(vol);
     rollupPolyfill.setVFSBridge(
       (path, opts) => vol.mkdirSync(path, opts),

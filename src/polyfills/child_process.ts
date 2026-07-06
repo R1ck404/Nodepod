@@ -1493,6 +1493,13 @@ export async function executeNodeBinary(
             continue;
           }
         }
+        // Handles may close in the same turn as promise continuations that
+        // still need to run (e.g. await preloadSqlite() in an async script).
+        await new Promise<void>((r) => _nativeSetTimeout(r, 0));
+        if (registry.activeRefedCount() > 0) {
+          beforeExitEmitted = false;
+          continue;
+        }
         break;
       }
 

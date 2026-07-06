@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>nodepod - sqlite test</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: monospace;
+                background: #1a1a2e;
+                color: #e0e0e0;
+                padding: 24px;
+            }
+            h1 {
+                font-size: 18px;
+                margin-bottom: 8px;
+                color: #fff;
+            }
+            p {
+                font-size: 13px;
+                color: #888;
+                margin-bottom: 20px;
+            }
+            .toolbar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 16px;
+            }
+            button {
+                background: #252545;
+                border: 1px solid #444;
+                color: #e0e0e0;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 13px;
+                font-family: monospace;
+                cursor: pointer;
+            }
+            button:hover:not(:disabled) {
+                border-color: #666;
+            }
+            button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            input {
+                background: #0d0d1a;
+                border: 1px solid #333;
+                border-radius: 6px;
+                color: #e0e0e0;
+                padding: 8px 12px;
+                font-size: 13px;
+                font-family: monospace;
+                min-width: 160px;
+            }
+            .form-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 16px;
+                align-items: center;
+            }
+            .panel {
+                background: #0d0d1a;
+                border: 1px solid #333;
+                border-radius: 6px;
+                margin-bottom: 16px;
+                overflow: hidden;
+            }
+            .panel-header {
+                padding: 8px 12px;
+                border-bottom: 1px solid #333;
+                font-size: 12px;
+                color: #888;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }
+            th,
+            td {
+                padding: 8px 12px;
+                text-align: left;
+                border-bottom: 1px solid #222;
+            }
+            th {
+                color: #aaa;
+            }
+            .empty {
+                padding: 16px;
+                text-align: center;
+                color: #555;
+            }
+            #output {
+                padding: 16px;
+                min-height: 160px;
+                max-height: 240px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+            .stdout {
+                color: #a8e6a3;
+            }
+            .stderr {
+                color: #e68a8a;
+            }
+            .info {
+                color: #8ac4e6;
+            }
+            .dim {
+                color: #555;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>nodepod - sqlite test</h1>
+        <p>Table UI over <code>node:sqlite</code> on MemoryVolume.</p>
+
+        <div class="toolbar">
+            <button id="btn-init" disabled>Seed</button>
+            <button id="btn-refresh" disabled>Refresh</button>
+            <button id="btn-persist" disabled>Test persistence</button>
+            <button id="btn-tag" disabled>Tag-store query</button>
+        </div>
+
+        <div class="form-row">
+            <input id="name" type="text" placeholder="Name" disabled />
+            <input id="email" type="email" placeholder="Email" disabled />
+            <button id="btn-add" disabled>Add user</button>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">users</div>
+            <div style="overflow-x: auto">
+                <table>
+                    <thead id="table-head"></thead>
+                    <tbody id="table-body">
+                        <tr>
+                            <td colspan="5" class="empty">No data yet</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">Output</div>
+            <div id="output"></div>
+        </div>
+
+        <script type="module">
+            import { Nodepod } from "/dist/index.mjs"; // use 'https://esm.sh/@scelar/nodepod' in production
+
+            const out = document.getElementById("output");
+            const tableHead = document.getElementById("table-head");
+            const tableBody = document.getElementById("table-body");
+            const nameInput = document.getElementById("name");
+            const emailInput = document.getElementById("email");
+            const buttons = [
+                document.getElementById("btn-init"),
+                document.getElementById("btn-refresh"),
+                document.getElementById("btn-persist"),
+                document.getElementById("btn-tag"),
+                document.getElementById("btn-add"),
+            ];
+
+            function log(text, cls = "stdout") {
+                const span = document.createElement("span");
+                span.className = cls;
+                span.textContent = text + "\n";
+                out.appendChild(span);
+                out.scrollTop = out.scrollHeight;
+            }
+
+            function setBusy(busy) {
+                for (const btn of buttons) btn.disabled = busy;
+                nameInput.disabled = busy;
+                emailInput.disabled = busy;
+            }
+
+            function renderTable(columns, rows) {
+                tableHead.innerHTML = "";
+                tableBody.innerHTML = "";
+
+                if (!rows.length) {
+                    const tr = document.createElement("tr");
+                    const td = document.createElement("td");
+                    td.colSpan = Math.max(columns.length + 1, 1);
+                    td.className = "empty";
+                    td.textContent = "No rows";
+                    tr.appendChild(td);
+                    tableBody.appendChild(tr);
+                    return;
+                }
+
+                const headRow = document.createElement("tr");
+                for (const col of columns) {
+                    const th = document.createElement("th");
+                    th.textContent = col;
+                    headRow.appendChild(th);
+                }
+                headRow.appendChild(document.createElement("th"));
+                tableHead.appendChild(headRow);
+
+                for (const row of rows) {
+                    const tr = document.createElement("tr");
+                    for (const col of columns) {
+                        const td = document.createElement("td");
+                        td.textContent = row[col] ?? "";
+                        tr.appendChild(td);
+                    }
+                    const td = document.createElement("td");
+                    const del = document.createElement("button");
+                    del.textContent = "Delete";
+                    del.addEventListener("click", () => run("delete", [String(row.id)]));
+                    td.appendChild(del);
+                    tr.appendChild(td);
+                    tableBody.appendChild(tr);
+                }
+            }
+
+            function handleLine(line) {
+                if (line.startsWith("__SQLITE_JSON__")) {
+                    try {
+                        const payload = JSON.parse(line.slice("__SQLITE_JSON__".length));
+                        if (payload.type === "rows") {
+                            renderTable(payload.columns, payload.rows);
+                        } else if (payload.type === "log") {
+                            log(payload.message, "info");
+                        } else if (payload.type === "error") {
+                            log(payload.message, "stderr");
+                        }
+                    } catch (e) {
+                        log("Bad JSON: " + e.message, "stderr");
+                    }
+                    return;
+                }
+                if (line.trim()) log(line, "stdout");
+            }
+
+            let nodepod;
+
+            async function run(command, args = []) {
+                setBusy(true);
+                log(`--- node sqlite-app.js ${command} ${args.join(" ")} ---`.trim(), "dim");
+
+                const proc = await nodepod.spawn("node", ["sqlite-app.js", command, ...args]);
+                let buffer = "";
+                proc.on("output", (text) => {
+                    buffer += text;
+                    const parts = buffer.split("\n");
+                    buffer = parts.pop() ?? "";
+                    for (const line of parts) handleLine(line);
+                });
+                proc.on("error", (text) => log(text.trimEnd(), "stderr"));
+                const res = await proc.completion;
+                if (buffer) handleLine(buffer);
+                if (res.exitCode !== 0) log(`exit=${res.exitCode}`, "stderr");
+                setBusy(false);
+            }
+
+            log("Booting nodepod...", "info");
+
+            nodepod = await Nodepod.boot({
+                files: {
+                    "/sqlite-app.js": `
+const { DatabaseSync, preloadSqlite } = require('node:sqlite');
+
+const DB_PATH = '/data/contacts.db';
+
+function emit(payload) {
+  console.log('__SQLITE_JSON__' + JSON.stringify(payload));
+}
+
+function openDb() {
+  return new DatabaseSync(DB_PATH);
+}
+
+function ensureSchema(db) {
+  db.exec(\`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  \`);
+}
+
+function listUsers(db) {
+  const rows = db.prepare(
+    'SELECT id, name, email, created_at FROM users ORDER BY id',
+  ).all();
+  emit({ type: 'rows', columns: ['id', 'name', 'email', 'created_at'], rows });
+}
+
+if (!(await preloadSqlite())) {
+  emit({ type: 'error', message: 'Failed to load wa-sqlite WASM' });
+  process.exit(1);
+}
+
+const cmd = process.argv[2] || 'list';
+  const arg1 = process.argv[3];
+  const arg2 = process.argv[4];
+
+  if (cmd === 'init') {
+    const db = openDb();
+    ensureSchema(db);
+    const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+    if (count === 0) {
+      const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+      insert.run('Alice', 'alice@example.com');
+      insert.run('Bob', 'bob@example.com');
+      insert.run('Carol', 'carol@example.com');
+      emit({ type: 'log', message: 'Seeded 3 demo users' });
+    } else {
+      emit({ type: 'log', message: 'Database already has ' + count + ' user(s)' });
+    }
+    listUsers(db);
+    db.close();
+    return;
+  }
+
+  if (cmd === 'list') {
+    const db = openDb();
+    ensureSchema(db);
+    listUsers(db);
+    db.close();
+    return;
+  }
+
+  if (cmd === 'add') {
+    if (!arg1 || !arg2) {
+      emit({ type: 'error', message: 'Usage: add <name> <email>' });
+      process.exit(1);
+    }
+    const db = openDb();
+    ensureSchema(db);
+    try {
+      db.prepare('INSERT INTO users (name, email) VALUES (?, ?)').run(arg1, arg2);
+      emit({ type: 'log', message: 'Added ' + arg1 });
+      listUsers(db);
+    } catch (e) {
+      emit({ type: 'error', message: e.message });
+      process.exit(1);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (cmd === 'delete') {
+    const id = Number(arg1);
+    if (!id) {
+      emit({ type: 'error', message: 'Usage: delete <id>' });
+      process.exit(1);
+    }
+    const db = openDb();
+    ensureSchema(db);
+    const result = db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    emit({ type: 'log', message: 'Deleted ' + result.changes + ' row(s)' });
+    listUsers(db);
+    db.close();
+    return;
+  }
+
+  if (cmd === 'persist') {
+    const db = openDb();
+    ensureSchema(db);
+    const before = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+    db.close();
+    const db2 = openDb();
+    const after = db2.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+    emit({
+      type: 'log',
+      message: 'Reopened /data/contacts.db — ' + after + ' user(s) still present (was ' + before + ')',
+    });
+    listUsers(db2);
+    db2.close();
+    return;
+  }
+
+  if (cmd === 'tag') {
+    const db = openDb();
+    ensureSchema(db);
+    const sql = db.createTagStore();
+    const user = sql.get\`SELECT * FROM users WHERE email = \${'alice@example.com'}\`;
+    emit({ type: 'log', message: 'Tag-store lookup: ' + JSON.stringify(user) });
+    listUsers(db);
+    db.close();
+    return;
+  }
+
+  emit({ type: 'error', message: 'Unknown command: ' + cmd });
+  process.exit(1);
+                    `.trim(),
+                },
+            });
+
+            log("Booted!\n", "info");
+            setBusy(false);
+
+            document.getElementById("btn-init").addEventListener("click", () => run("init"));
+            document.getElementById("btn-refresh").addEventListener("click", () => run("list"));
+            document.getElementById("btn-persist").addEventListener("click", () => run("persist"));
+            document.getElementById("btn-tag").addEventListener("click", () => run("tag"));
+            document.getElementById("btn-add").addEventListener("click", () => {
+                const name = nameInput.value.trim();
+                const email = emailInput.value.trim();
+                if (!name || !email) {
+                    log("Name and email required", "stderr");
+                    return;
+                }
+                run("add", [name, email]).then(() => {
+                    nameInput.value = "";
+                    emailInput.value = "";
+                });
+            });
+
+            await run("init");
+        </script>
+    </body>
+</html>

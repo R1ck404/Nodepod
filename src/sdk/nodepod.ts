@@ -389,8 +389,11 @@ export class Nodepod {
       if (!proc.exited) proc._pushStderr(data);
     });
 
-    handle.on("exit", (exitCode: number) => {
-      if (!proc.exited) proc._finish(exitCode);
+    handle.on("exit", (exitCode: number, stdout?: string, stderr?: string) => {
+      if (!proc.exited) {
+        proc._mergeExitOutput(stdout, stderr);
+        proc._finish(exitCode);
+      }
     });
 
     handle.on("worker-error", (message: string) => {
@@ -430,7 +433,7 @@ export class Nodepod {
       handle.exec({
         type: "exec",
         filePath,
-        args: args ?? [],
+        args: args?.slice(1) ?? [],
         cwd: execCwd,
         env: opts?.env,
         isShell: false,

@@ -60,5 +60,7 @@ createServer((req, res) => {
   console.log(`  typebox 1.x (#56):    http://localhost:${port}/examples/issue-56-typebox-1x/`);
   console.log(`  Vite HMR test:        http://localhost:${port}/examples/vite-hmr-test/`);
   console.log(`  Dev playground:       http://localhost:${port}/examples/dev-playground/`);
+  console.log(`  SQLite test:          http://localhost:${port}/examples/sqlite-test/`);
+  console.log(`  Better Auth + Vite:   http://localhost:${port}/examples/better-auth-vite/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
 });

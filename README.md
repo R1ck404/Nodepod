@@ -194,7 +194,7 @@ await proc.completion;             // wait for exit
 
 ## Polyfills
 
-**Full:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode, worker_threads
+**Full:** fs, path, events, stream, buffer, process, http, https, net, crypto, zlib, sqlite, url, querystring, util, os, tty, child_process, assert, readline, module, timers, string_decoder, perf_hooks, constants, punycode, worker_threads
 
 **Stubs:** dns, vm, v8, tls, dgram, cluster, http2, inspector, domain, diagnostics_channel, async_hooks
 

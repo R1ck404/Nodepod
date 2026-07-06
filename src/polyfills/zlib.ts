@@ -7,6 +7,7 @@ import { CDN_BROTLI_WASM, cdnImport } from "../constants/cdn-urls";
 // @ts-ignore - no type declarations for brotli/decompress
 import brotliJsDecompress from "brotli/decompress";
 import pako from "pako";
+import { getRegistry } from "../helpers/event-loop";
 
 
 export type BrotliEngine = {
@@ -59,7 +60,8 @@ async function ensureBrotli(): Promise<BrotliEngine | null> {
     const prev = await brotliLoading;
     if (prev) return prev;
   }
-  brotliLoading = loadBrotli();
+  const loadHandle = getRegistry().register("WASMWork");
+  brotliLoading = loadBrotli().finally(() => loadHandle.close());
   return brotliLoading;
 }
 
@@ -155,21 +157,29 @@ export function brotliCompress(
 ): void {
   const callback =
     typeof optsOrCb === "function" ? (optsOrCb as CompressCallback) : cb!;
+  const opHandle = getRegistry().register("WASMWork");
+  const finish = (err: Error | null, result: Buffer): void => {
+    try {
+      callback(err, result);
+    } finally {
+      opHandle.close();
+    }
+  };
   ensureBrotli()
     .then((engine) => {
       if (!engine) {
-        callback(new Error("Brotli WASM is not available"), Buffer.alloc(0));
+        finish(new Error("Brotli WASM is not available"), Buffer.alloc(0));
         return;
       }
       try {
         const data = typeof input === "string" ? Buffer.from(input) : input;
         const out = engine.compress(new Uint8Array(data));
-        callback(null, Buffer.from(out));
+        finish(null, Buffer.from(out));
       } catch (e) {
-        callback(e as Error, Buffer.alloc(0));
+        finish(e as Error, Buffer.alloc(0));
       }
     })
-    .catch((e) => callback(e as Error, Buffer.alloc(0)));
+    .catch((e) => finish(e as Error, Buffer.alloc(0)));
 }
 
 export function brotliDecompress(
@@ -179,20 +189,28 @@ export function brotliDecompress(
 ): void {
   const callback =
     typeof optsOrCb === "function" ? (optsOrCb as CompressCallback) : cb!;
+  const opHandle = getRegistry().register("WASMWork");
+  const finish = (err: Error | null, result: Buffer): void => {
+    try {
+      callback(err, result);
+    } finally {
+      opHandle.close();
+    }
+  };
   ensureBrotli()
     .then((engine) => {
       if (!engine) {
-        callback(new Error("Brotli WASM is not available"), Buffer.alloc(0));
+        finish(new Error("Brotli WASM is not available"), Buffer.alloc(0));
         return;
       }
       try {
         const out = engine.decompress(new Uint8Array(input));
-        callback(null, Buffer.from(out));
+        finish(null, Buffer.from(out));
       } catch (e) {
-        callback(e as Error, Buffer.alloc(0));
+        finish(e as Error, Buffer.alloc(0));
       }
     })
-    .catch((e) => callback(e as Error, Buffer.alloc(0)));
+    .catch((e) => finish(e as Error, Buffer.alloc(0)));
 }
 
 
