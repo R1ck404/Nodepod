@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import nodepod from "../../integrations/vite";
 import { createServer, build } from "vite";
-import type { RollupOutput } from "rollup";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -110,6 +109,12 @@ describe("integrations/vite", () => {
   });
 });
 
+interface BuildAsset {
+  type: string;
+  fileName?: string;
+  source?: string | Uint8Array;
+}
+
 class MockRes {
   statusCode: number | undefined;
   headers: Record<string, string> = {};
@@ -178,7 +183,9 @@ describe("integrations/vite end-to-end", () => {
       });
       const outputs = Array.isArray(result) ? result : [result];
       const assets = outputs.flatMap((o) =>
-        "output" in o ? (o as RollupOutput).output : [],
+        o && typeof o === "object" && "output" in o
+          ? (o as { output: BuildAsset[] }).output
+          : [],
       );
       const sw = assets.find(
         (a) => a.type === "asset" && a.fileName === "__sw__.js",
@@ -187,7 +194,7 @@ describe("integrations/vite end-to-end", () => {
       if (sw && sw.type === "asset") {
         const src = typeof sw.source === "string"
           ? sw.source
-          : Buffer.from(sw.source).toString("utf8");
+          : Buffer.from(sw.source ?? []).toString("utf8");
         expect(src.length).toBeGreaterThan(1000);
         expect(src).toMatch(/self\.addEventListener/);
       }
