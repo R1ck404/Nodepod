@@ -656,9 +656,17 @@ self.addEventListener("fetch", (event) => {
         refUrl.origin === self.location.origin
           ? pathToPodMap.get(refUrl.pathname)
           : null;
-      if (pathPod && clientId) {
+      if (pathPod) {
         const { instanceId, serverPort } = pathPod;
         const path = stripPreviewPrefix(url.pathname) + url.search;
+        if (!clientId) {
+          event.respondWith(
+            proxyToVirtualServer(
+              event.request, instanceId, serverPort, path, event.request,
+            ),
+          );
+          return;
+        }
         event.respondWith(
           (async () => {
             let nested = previewClients.has(clientId);

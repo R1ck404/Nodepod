@@ -878,6 +878,12 @@ export class MemoryVolume {
     this.writeInternal(norm, data, true);
   }
 
+  // runtime cache write — skips watcher and onGlobalChange notifications
+  writeCacheSync(p: string, data: string | Uint8Array | ArrayBuffer | ArrayBufferView | unknown): void {
+    const norm = this.normalize(p);
+    this.writeInternal(norm, data, false);
+  }
+
   mkdirSync(p: string, options?: { recursive?: boolean }): void {
     const norm = this.normalize(p);
 

@@ -4,6 +4,7 @@
 import { EventEmitter } from "../polyfills/events";
 import type { MemoryVolume } from "../memory-volume";
 import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 import { precompileWasm } from "../helpers/wasm-cache";
 import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
 import { ProcessHandle } from "./process-handle";
@@ -533,14 +534,18 @@ export class ProcessManager extends EventEmitter {
         } else {
           this._vfsBridge.handleWorkerWrite(path, new Uint8Array(content));
         }
-        this._vfsBridge.broadcastChange(path, content, handle.pid);
+        if (!isInternalVfsPath(path)) {
+          this._vfsBridge.broadcastChange(path, content, handle.pid);
+        }
       }
     });
 
     handle.on("vfs-delete", (path: string) => {
       if (this._vfsBridge) {
         this._vfsBridge.handleWorkerDelete(path);
-        this._vfsBridge.broadcastChange(path, null, handle.pid);
+        if (!isInternalVfsPath(path)) {
+          this._vfsBridge.broadcastChange(path, null, handle.pid);
+        }
       }
     });
 

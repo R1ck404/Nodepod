@@ -3,6 +3,7 @@
 // ES6 classes forbid calling without `new`, which breaks tons of npm packages.
 
 import { isExitSentinel } from "../helpers/event-loop";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;
@@ -29,7 +30,11 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
   const DEBOUNCE_MS = 50;
 
   const cleanup = vol.onGlobalChange((path: string, event: string) => {
-    if (path.includes('/node_modules/') || path.includes('/.cache/')) {
+    if (
+      path.includes("/node_modules/") ||
+      path.includes("/.cache/") ||
+      isInternalVfsPath(path)
+    ) {
       return;
     }
 

@@ -15,6 +15,7 @@ import {
   WASM_SAB_HEADER_BYTES,
   WASM_SAB_MAX_BYTES,
 } from "../polyfills/sqlite";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
@@ -94,7 +95,7 @@ function installSqliteHostBridge(): void {
         if (parent && parent !== "/" && !_volume!.existsSync(parent)) {
           _volume!.mkdirSync(parent, { recursive: true });
         }
-        _volume!.writeFileSync(WASM_CACHE_PATH, bytes.slice());
+        _volume!.writeCacheSync(WASM_CACHE_PATH, bytes.slice());
       }
     },
   });
@@ -258,7 +259,7 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
 
   // watch local writes and forward to main — suppressed during inbound vfs-sync to prevent echo
   _volume.watch("/", { recursive: true }, (event, filename) => {
-    if (!filename || _suppressVFSWatch) return;
+    if (!filename || _suppressVFSWatch || isInternalVfsPath(filename)) return;
     try {
       if (_volume!.existsSync(filename)) {
         const stat = _volume!.statSync(filename);

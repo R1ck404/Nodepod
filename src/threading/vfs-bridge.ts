@@ -2,6 +2,7 @@
 // creates snapshots for init, applies worker writes, broadcasts changes
 
 import type { MemoryVolume } from "../memory-volume";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
 import type { SharedVFSController } from "./shared-vfs";
 
@@ -128,7 +129,11 @@ export class VFSBridge {
       if (parentDir !== "/" && !this._volume.existsSync(parentDir)) {
         this._volume.mkdirSync(parentDir, { recursive: true });
       }
-      this._volume.writeFileSync(path, content);
+      if (isInternalVfsPath(path)) {
+        this._volume.writeCacheSync(path, content);
+      } else {
+        this._volume.writeFileSync(path, content);
+      }
       if (this._sharedVFS) {
         this._sharedVFSWrite(path, content);
       }
@@ -219,6 +224,7 @@ export class VFSBridge {
   }
 
   broadcastChange(path: string, content: ArrayBuffer | null, excludePid: number): void {
+    if (isInternalVfsPath(path)) return;
     if (this._broadcaster) {
       this._broadcaster(path, content, excludePid);
     }
@@ -233,6 +239,7 @@ export class VFSBridge {
       // writing /hello.txt while watching / comes through as "hello.txt".
       // SharedVFS and broadcast keys are absolute, promote it here.
       const absPath = filename.startsWith("/") ? filename : "/" + filename;
+      if (isInternalVfsPath(absPath)) return;
 
       try {
         if (this._volume.existsSync(absPath)) {
@@ -269,6 +276,7 @@ export class VFSBridge {
       const entries = this._volume.readdirSync(dir);
       for (const name of entries) {
         const fullPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
+        if (isInternalVfsPath(fullPath)) continue;
         try {
           const stat = this._volume.statSync(fullPath);
           if (stat.isDirectory()) {
