@@ -122,6 +122,15 @@ export interface MainToWorker_HttpRequest {
   body: string | null;
 }
 
+export interface MainToWorker_HttpClientResponse {
+  type: "http-client-response";
+  requestId: number;
+  statusCode: number;
+  statusMessage: string;
+  headers: Record<string, string | string[]>;
+  body: string | ArrayBuffer;
+}
+
 export interface MainToWorker_IPC {
   type: "ipc-message";
   data: unknown;
@@ -162,6 +171,7 @@ export type MainToWorkerMessage =
   | MainToWorker_ChildOutput
   | MainToWorker_ChildExit
   | MainToWorker_HttpRequest
+  | MainToWorker_HttpClientResponse
   | MainToWorker_IPC
   | MainToWorker_WsUpgrade
   | MainToWorker_WsData
@@ -276,6 +286,16 @@ export interface WorkerToMain_HttpRequest {
   body: string | null;
 }
 
+export interface WorkerToMain_HttpClientRequest {
+  type: "http-client-request";
+  requestId: number;
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: string | null;
+}
+
 export interface WorkerToMain_CwdChange {
   type: "cwd-change";
   cwd: string;
@@ -291,7 +311,7 @@ export interface WorkerToMain_HttpResponse {
   requestId: number;
   statusCode: number;
   statusMessage: string;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   body: string | ArrayBuffer;
 }
 
@@ -339,6 +359,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_ServerListen
   | WorkerToMain_ServerClose
   | WorkerToMain_HttpRequest
+  | WorkerToMain_HttpClientRequest
   | WorkerToMain_CwdChange
   | WorkerToMain_StdinRawStatus
   | WorkerToMain_HttpResponse

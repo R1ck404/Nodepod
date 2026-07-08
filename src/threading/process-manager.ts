@@ -16,6 +16,7 @@ import type {
   WorkerToMain_WorkerThreadRequest,
   WorkerToMain_SpawnSync,
   WorkerToMain_HttpResponse,
+  WorkerToMain_HttpClientRequest,
 } from "./worker-protocol";
 import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
@@ -282,7 +283,7 @@ export class ProcessManager extends EventEmitter {
     path: string,
     headers: Record<string, string>,
     body?: string | null,
-  ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string>; body: string | ArrayBuffer }> {
+  ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string | string[]>; body: string | ArrayBuffer }> {
     const pid = this._serverPorts.get(port);
     if (pid === undefined) {
       return Promise.resolve({
@@ -340,6 +341,51 @@ export class ProcessManager extends EventEmitter {
         body: body ?? null,
       });
     });
+  }
+
+  private _handleWorkerHttpClientRequest(
+    clientHandle: ProcessHandle,
+    msg: WorkerToMain_HttpClientRequest,
+  ): void {
+    this.dispatchHttpRequest(
+      msg.port,
+      msg.method,
+      msg.path,
+      msg.headers,
+      msg.body ?? null,
+    )
+      .then((resp) => {
+        let bodyVal: string | ArrayBuffer = "";
+        const transferList: Transferable[] = [];
+        if (resp.body instanceof ArrayBuffer) {
+          bodyVal = resp.body;
+          transferList.push(resp.body);
+        } else if (typeof resp.body === "string") {
+          bodyVal = resp.body;
+        }
+        clientHandle.postMessage(
+          {
+            type: "http-client-response",
+            requestId: msg.requestId,
+            statusCode: resp.statusCode,
+            statusMessage: resp.statusMessage,
+            headers: resp.headers,
+            body: bodyVal,
+          },
+          transferList,
+        );
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        clientHandle.postMessage({
+          type: "http-client-response",
+          requestId: msg.requestId,
+          statusCode: 502,
+          statusMessage: "Bad Gateway",
+          headers: { "Content-Type": "text/plain" },
+          body: message,
+        });
+      });
   }
 
   // returns owning pid, or -1 if no server found
@@ -1014,6 +1060,10 @@ export class ProcessManager extends EventEmitter {
     handle.on("http-response", (msg: WorkerToMain_HttpResponse) => {
       const entry = this._httpCallbacks.get(msg.requestId);
       if (entry) entry.fn(msg);
+    });
+
+    handle.on("http-client-request", (msg: WorkerToMain_HttpClientRequest) => {
+      this._handleWorkerHttpClientRequest(handle, msg);
     });
 
     handle.on("ws-frame", (msg: any) => {

@@ -1,0 +1,15 @@
+[
+  "package.json",
+  "vite.config.js",
+  "index.html",
+  "server/auth-server.mjs",
+  "src/main.jsx",
+  "src/App.jsx",
+  "src/index.css",
+  "src/lib/auth-client.js",
+  "src/components/ProtectedRoute.jsx",
+  "src/pages/HomePage.jsx",
+  "src/pages/LoginPage.jsx",
+  "src/pages/SignupPage.jsx",
+  "src/pages/DashboardPage.jsx"
+]

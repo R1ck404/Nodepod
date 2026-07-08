@@ -224,14 +224,20 @@ Readable.prototype.once = function once(
 Readable.prototype.push = function push(chunk: any): boolean {
   if (chunk === null) {
     this._terminated = true;
-    this.readableEnded = true;
-    this.readable = false;
-    if (this._active && this._queue.length === 0 && !this._endFired) {
-      this._endFired = true;
-      queueMicrotask(() => {
-        this._endEmitted = true;
-        this.emit("end");
-      });
+    // Match Node: EOF is signaled but buffered data remains readable until drained.
+    if (this._queue.length === 0) {
+      this.readableEnded = true;
+      this.readable = false;
+      if (this._active && !this._endFired) {
+        this._endFired = true;
+        queueMicrotask(() => {
+          this._endEmitted = true;
+          this.emit("end");
+        });
+      }
+    }
+    if (this._active) {
+      this._drain();
     }
     return false;
   }
@@ -278,6 +284,8 @@ Readable.prototype._drain = function _drain(): void {
   }
   this._draining = false;
   if (this._terminated && this._queue.length === 0 && !this._endFired) {
+    this.readableEnded = true;
+    this.readable = false;
     this._endFired = true;
     queueMicrotask(() => {
       this._endEmitted = true;

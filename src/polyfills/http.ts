@@ -8,6 +8,7 @@ import { Buffer } from "./buffer";
 import { TcpSocket, TcpServer, type NetAddress } from "./net";
 import { createHash } from "./crypto";
 import { resolveProxyUrl } from "../cross-origin";
+import { fetchHeadersToNodeRecord } from "./fetch-response";
 // no event-loop import, the net.Server under us already registers TCPServerWrap
 import { TIMEOUTS } from "../constants/config";
 
@@ -38,7 +39,7 @@ export interface ConnectionOptions {
 export interface CompletedResponse {
   statusCode: number;
   statusMessage: string;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   body: Buffer;
 }
 
@@ -73,7 +74,6 @@ export interface IncomingMessageConstructor {
     verb: string,
     target: string,
     hdrs: Record<string, string>,
-    payload?: Buffer | string,
   ): IncomingMessage;
 }
 
@@ -112,28 +112,29 @@ IncomingMessage.prototype.destroy = function destroy(err?: Error): any {
 };
 
 IncomingMessage.prototype._injectBody = function _injectBody(raw: Buffer | string | null): void {
-  if (raw === null) {
-    this._payload = null;
-  } else {
-    this._payload = typeof raw === "string" ? Buffer.from(raw) : raw;
+  if (raw !== null && raw !== undefined) {
+    this.push(typeof raw === "string" ? Buffer.from(raw) : raw);
   }
-  // Defer push to next microtask so that stream consumers (body-parser, raw-body)
-  // can attach 'data'/'end' listeners before the stream is marked as ended.
-  // Without this, push(null) sets readable=false immediately and raw-body
-  // bails out with "stream is not readable".
-  const self = this;
-  queueMicrotask(() => {
-    if (self._payload) self.push(self._payload);
-    self.push(null);
-    self.complete = true;
-  });
+  this.push(null);
+  this.complete = true;
 };
+
+function ensureContentLength(
+  hdrs: Record<string, string>,
+  payload?: Buffer | string | null,
+): void {
+  if (payload === undefined || payload === null) return;
+  const hasLength = Object.keys(hdrs).some((k) => k.toLowerCase() === "content-length");
+  const hasTe = Object.keys(hdrs).some((k) => k.toLowerCase() === "transfer-encoding");
+  if (hasLength || hasTe) return;
+  const bytes = typeof payload === "string" ? Buffer.byteLength(payload) : payload.byteLength;
+  hdrs["content-length"] = String(bytes);
+}
 
 IncomingMessage.build = function build(
   verb: string,
   target: string,
   hdrs: Record<string, string>,
-  payload?: Buffer | string,
 ): IncomingMessage {
   const sock = new TcpSocket();
   sock.remoteAddress = "127.0.0.1";
@@ -149,17 +150,28 @@ IncomingMessage.build = function build(
     msg.rawHeaders.push(k, v);
   }
   msg.headers = lowerHdrs;
-  if (payload) {
-    msg._injectBody(payload);
-  } else {
-    // Defer end signal for bodyless requests too, for consistent behavior
-    queueMicrotask(() => {
-      msg.push(null);
-      msg.complete = true;
-    });
-  }
   return msg;
 };
+
+/** Populate IncomingMessage headers + rawHeaders with Node-correct set-cookie pairs. */
+function applyHeadersToIncomingMessage(
+  msg: IncomingMessage,
+  headers: Record<string, string | string[] | undefined>,
+): void {
+  for (const [k, v] of Object.entries(headers)) {
+    if (v === undefined) continue;
+    const lk = k.toLowerCase();
+    msg.headers[lk] = v;
+    if (lk === "set-cookie") {
+      const cookies = Array.isArray(v) ? v : [v];
+      for (const cookie of cookies) {
+        msg.rawHeaders.push("set-cookie", cookie);
+      }
+    } else {
+      msg.rawHeaders.push(k, Array.isArray(v) ? v.join(", ") : v);
+    }
+  }
+}
 
 // ServerResponse
 
@@ -241,7 +253,12 @@ ServerResponse.prototype.detachSocket = function detachSocket(_socket: TcpSocket
 
 ServerResponse.prototype.setHeader = function setHeader(key: string, val: string | string[] | number): any {
   if (this.headersSent) throw new Error("Headers already dispatched");
-  this._hdrs.set(key.toLowerCase(), String(val));
+  const lk = key.toLowerCase();
+  if (Array.isArray(val)) {
+    this._hdrs.set(lk, val.map(String));
+  } else {
+    this._hdrs.set(lk, String(val));
+  }
   return this;
 };
 
@@ -267,13 +284,16 @@ ServerResponse.prototype.hasHeader = function hasHeader(key: string): boolean {
 
 ServerResponse.prototype.appendHeader = function appendHeader(key: string, val: string | string[]): any {
   const lk = key.toLowerCase();
+  const incoming = Array.isArray(val) ? val.map(String) : [String(val)];
   const existing = this._hdrs.get(lk);
   if (existing === undefined) {
-    this._hdrs.set(lk, Array.isArray(val) ? val.join(", ") : val);
+    this._hdrs.set(lk, lk === "set-cookie" ? incoming : incoming.join(", "));
+  } else if (lk === "set-cookie") {
+    const cur = Array.isArray(existing) ? existing : [existing];
+    this._hdrs.set(lk, cur.concat(incoming));
   } else {
-    const append = Array.isArray(val) ? val.join(", ") : val;
     const cur = Array.isArray(existing) ? existing.join(", ") : existing;
-    this._hdrs.set(lk, cur + ", " + append);
+    this._hdrs.set(lk, cur + ", " + incoming.join(", "));
   }
   return this;
 };
@@ -368,9 +388,13 @@ ServerResponse.prototype.end = function end(
   this.writableFinished = true;
 
   if (this._completionCallback) {
-    const flatHdrs: Record<string, string> = {};
+    const flatHdrs: Record<string, string | string[]> = {};
     this._hdrs.forEach((v: string | string[], k: string) => {
-      flatHdrs[k] = Array.isArray(v) ? v.join(", ") : v;
+      if (k === "set-cookie" && Array.isArray(v)) {
+        flatHdrs[k] = v;
+      } else {
+        flatHdrs[k] = Array.isArray(v) ? v.join(", ") : v;
+      }
     });
     const finalBody = Buffer.concat(this._chunks);
     this._completionCallback({
@@ -617,7 +641,7 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
 ): Promise<CompletedResponse> {
   const self = this;
   return new Promise((resolve, reject) => {
-    const req = IncomingMessage.build(verb, target, hdrs, payload);
+    const req = IncomingMessage.build(verb, target, hdrs);
     const res = new ServerResponse(req);
     res._onComplete((completed) => {
       resolve(completed);
@@ -659,6 +683,14 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
     };
 
     try {
+      // Queue payload before handlers run so middleware/proxies can attach
+      // listeners and read during the handler (matches socket chunk arrival).
+      if (payload !== undefined && payload !== null) {
+        ensureContentLength(req.headers, payload);
+        const chunk = typeof payload === "string" ? Buffer.from(payload) : payload;
+        req.push(chunk);
+      }
+
       self.emit("request", req, res);
       if (typeof self._handler === "function") {
         const result = self._handler(req, res);
@@ -677,6 +709,9 @@ Server.prototype.dispatchRequest = async function dispatchRequest(
           });
         }
       }
+
+      req.push(null);
+      req.complete = true;
     } catch (err) {
       clearTimeout(timer);
       reportErr("sync", err);
@@ -928,9 +963,10 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
     const isLocal = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0";
     const port = Number(this._opts.port) || (this._proto === "https" ? 443 : 80);
     if (isLocal) {
+      const body = this._pending.length > 0 ? Buffer.concat(this._pending) : undefined;
+      if (body) ensureContentLength(this.headers, body);
       const vServer = _registry.get(port);
       if (vServer) {
-        const body = this._pending.length > 0 ? Buffer.concat(this._pending) : undefined;
         try {
           const result = await vServer.dispatchRequest(
             this.method,
@@ -942,10 +978,28 @@ ClientRequest.prototype._dispatch = async function _dispatch(): Promise<void> {
           const incoming = new IncomingMessage();
           incoming.statusCode = result.statusCode;
           incoming.statusMessage = result.statusMessage;
-          for (const [k, v] of Object.entries(result.headers)) {
-            incoming.headers[k.toLowerCase()] = v;
-            incoming.rawHeaders.push(k, v);
-          }
+          applyHeadersToIncomingMessage(incoming, result.headers);
+          incoming._injectBody(result.body);
+          this.emit("response", incoming);
+        } catch (err) {
+          this.emit("error", err);
+        }
+        return;
+      }
+      if (_httpClientBridge) {
+        try {
+          const result = await _httpClientBridge(
+            port,
+            this.method,
+            this._opts.path ?? "/",
+            this.headers,
+            body,
+          );
+          if (this._cancelled) return;
+          const incoming = new IncomingMessage();
+          incoming.statusCode = result.statusCode;
+          incoming.statusMessage = result.statusMessage;
+          applyHeadersToIncomingMessage(incoming, result.headers);
           incoming._injectBody(result.body);
           this.emit("response", incoming);
         } catch (err) {
@@ -1013,10 +1067,7 @@ ClientRequest.prototype._mapResponse = async function _mapResponse(resp: Respons
   const msg = new IncomingMessage();
   msg.statusCode = resp.status;
   msg.statusMessage = resp.statusText || STATUS_CODES[resp.status] || "";
-  resp.headers.forEach((v: string, k: string) => {
-    msg.headers[k.toLowerCase()] = v;
-    msg.rawHeaders.push(k, v);
-  });
+  applyHeadersToIncomingMessage(msg, fetchHeadersToNodeRecord(resp.headers));
   const raw = await resp.arrayBuffer();
   msg._injectBody(Buffer.from(raw));
   return msg;
@@ -1240,6 +1291,16 @@ const _serverOwnership = new Map<number, number>(); // port → pid
 let _onBind: RegistryHook | null = null;
 let _onUnbind: ((port: number) => void) | null = null;
 
+export type HttpClientBridge = (
+  port: number,
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: Buffer,
+) => Promise<CompletedResponse>;
+
+let _httpClientBridge: HttpClientBridge | null = null;
+
 function _addServer(port: number, srv: Server, ownerPid?: number): void {
   // loop liveness is held by the inner net.TcpServer's TCPServerWrap handle.
   // this registry is just the port -> Server map for internal routing.
@@ -1295,6 +1356,10 @@ export function setServerCloseCallback(
   fn: ((port: number) => void) | null,
 ): void {
   _onUnbind = fn;
+}
+
+export function setHttpClientBridge(fn: HttpClientBridge | null): void {
+  _httpClientBridge = fn;
 }
 
 // Agent
@@ -1477,6 +1542,7 @@ export default {
   getAllServers,
   setServerListenCallback,
   setServerCloseCallback,
+  setHttpClientBridge,
   _buildClientRequest,
   Agent,
   globalAgent,

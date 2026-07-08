@@ -25,6 +25,11 @@ import {
   NodepodSWSetupError,
   detectFrameworkHint,
 } from "./integrations/shared/errors";
+import {
+  VirtualCookieJar,
+  mergeCookieHeaders,
+} from "./cookie-jar";
+import { recordToFetchHeaders } from "./polyfills/fetch-response";
 
 export { NodepodSWSetupError };
 export type { NodepodSWFrameworkHint } from "./integrations/shared/errors";
@@ -89,6 +94,12 @@ interface InstanceState {
 
 export { CompletedResponse };
 
+type HandleRequestOptions = {
+  /** when true, skip merging the local cookie jar into headers — SW
+   *  requests already carry the authoritative jar from proxyToVirtualServer */
+  skipCookieInject?: boolean;
+};
+
 export class RequestProxy extends EventEmitter {
   static DEBUG = false;
   // ── Shared (process-wide) state ──
@@ -111,6 +122,10 @@ export class RequestProxy extends EventEmitter {
 
   // ── WS bridge (one BroadcastChannel for the page, messages tagged per-instance) ──
   private _wsBridge: BroadcastChannel | null = null;
+
+  /** In-memory cookie jar for virtual dev-server origins. Browsers ignore
+   *  Set-Cookie on synthetic SW responses, so we replay Cookie headers here. */
+  private _cookieJar = new VirtualCookieJar();
 
   constructor(opts: ProxyOptions = {}) {
     super();
@@ -277,6 +292,40 @@ export class RequestProxy extends EventEmitter {
     this.notifySW("server-unregistered", { instanceId, port });
   }
 
+  private _extractSetCookie(
+    headers: Record<string, string | string[]>,
+  ): string | string[] | undefined {
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === "set-cookie") return headers[k];
+    }
+    return undefined;
+  }
+
+  private _storeResponseCookies(
+    instanceId: string,
+    port: number,
+    headers: Record<string, string | string[]>,
+  ): void {
+    const setCookie = this._extractSetCookie(headers);
+    if (setCookie) this._cookieJar.store(instanceId, port, setCookie);
+  }
+
+  private _injectVirtualCookies(
+    instanceId: string,
+    port: number,
+    url: string,
+    headers: Record<string, string>,
+  ): void {
+    const jarCookie = this._cookieJar.cookieHeader(instanceId, port, url);
+    const browserCookie = headers["cookie"] ?? headers["Cookie"];
+    const merged = mergeCookieHeaders(browserCookie, jarCookie);
+    if (merged) headers["cookie"] = merged;
+    else {
+      delete headers["cookie"];
+      delete headers["Cookie"];
+    }
+  }
+
   // Sends a script to the Service Worker that gets injected into every HTML
   // response served to preview iframes. Runs before any page content.
   setPreviewScript(instanceId: string, script: string | null): void;
@@ -395,6 +444,20 @@ export class RequestProxy extends EventEmitter {
     let url: string;
     let headers: Record<string, string>;
     let body: ArrayBuffer | undefined;
+    let skipCookieInject = false;
+
+    const last = args[args.length - 1];
+    if (
+      last &&
+      typeof last === "object" &&
+      !(last instanceof ArrayBuffer) &&
+      !ArrayBuffer.isView(last) &&
+      "skipCookieInject" in last
+    ) {
+      skipCookieInject = !!(last as HandleRequestOptions).skipCookieInject;
+      args = args.slice(0, -1);
+    }
+
     if (typeof args[0] === "string") {
       [instanceId, port, method, url, headers, body] = args;
     } else {
@@ -413,6 +476,9 @@ export class RequestProxy extends EventEmitter {
           `No server on ${instanceId}/${port}`,
         ),
       };
+    }
+    if (!skipCookieInject) {
+      this._injectVirtualCookies(instanceId, port, url, headers);
     }
     try {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;
@@ -681,7 +747,9 @@ export class RequestProxy extends EventEmitter {
             url,
             headers,
             body,
+            { skipCookieInject: true },
           );
+          this._storeResponseCookies(instanceId, port, resp.headers);
           // 404 + original URL = try fetching from the real network as fallback
           // (handles cross-origin resources like Google Fonts, CDN assets, etc.)
           if (resp.statusCode === 404 && originalUrl) {
@@ -779,8 +847,9 @@ export class RequestProxy extends EventEmitter {
         (
           statusCode: number,
           statusMessage: string,
-          h: Record<string, string>,
+          h: Record<string, string | string[]>,
         ) => {
+          this._storeResponseCookies(instanceId, port, h);
           this.channel?.port1.postMessage({
             type: "stream-start",
             id,
@@ -807,6 +876,7 @@ export class RequestProxy extends EventEmitter {
         headers,
         buf,
       );
+      this._storeResponseCookies(instanceId, port, resp.headers);
       this.channel?.port1.postMessage({
         type: "stream-start",
         id,
@@ -1192,6 +1262,9 @@ export class RequestProxy extends EventEmitter {
         hdrs,
         reqBody,
       );
+      // The browser won't persist Set-Cookie from a synthetic Response, so
+      // the jar is the only place these cookies survive for the next request.
+      this._storeResponseCookies(instanceId, port, resp.headers);
       let body: BodyInit | null = null;
       if (resp.body instanceof Uint8Array) {
         body = new Uint8Array(resp.body.buffer as ArrayBuffer, resp.body.byteOffset, resp.body.byteLength) as Uint8Array<ArrayBuffer>;
@@ -1201,7 +1274,7 @@ export class RequestProxy extends EventEmitter {
       return new Response(body, {
         status: resp.statusCode,
         statusText: resp.statusMessage,
-        headers: resp.headers,
+        headers: recordToFetchHeaders(resp.headers),
       });
     };
   }

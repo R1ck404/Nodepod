@@ -23,6 +23,14 @@ import {
 } from "./constants/config";
 import { buildProcessEnv, ProcessObject } from "./polyfills/process";
 import * as httpPolyfill from "./polyfills/http";
+import {
+  installFetchHeadersSetCookieParity,
+  installNodeFetchClassParity,
+  patchFetchNodeAdapterExports,
+} from "./polyfills/fetch-response";
+
+installFetchHeadersSetCookieParity();
+installNodeFetchClassParity();
 import * as httpsPolyfill from "./polyfills/https";
 import * as tcpPolyfill from "./polyfills/net";
 import eventBusPolyfill from "./polyfills/events";
@@ -1719,6 +1727,9 @@ function buildResolver(
       );
 
       record.loaded = true;
+      patchFetchNodeAdapterExports(
+        record.exports as Record<string, unknown>,
+      );
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
     } catch (err) {
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
@@ -1764,6 +1775,9 @@ function buildResolver(
             SyncPromiseClass,
           );
           record.loaded = true;
+          patchFetchNodeAdapterExports(
+            record.exports as Record<string, unknown>,
+          );
           (record as any).__wasmReady = wasmReady;
           cache[resolved] = record;
         } catch (retryErr) {

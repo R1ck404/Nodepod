@@ -21,7 +21,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 10;
+const SW_VERSION = 11;
 const DEFAULT_INSTANCE = "default";
 
 let nextId = 1;
@@ -50,6 +50,171 @@ let watermarkEnabled = true;
 
 // per-instance ws bridge tokens
 const wsTokens = new Map();
+
+// Per virtual-origin cookie jar.
+//
+// The browser will NOT persist Set-Cookie headers carried on a *synthetic*
+// Service Worker response (one built with `new Response(...)` rather than
+// returned straight from the network). That means cookies a virtual dev server
+// sets would never come back on later requests, and anything relying on
+// cookie-based sessions would break.
+//
+// To match how a real browser behaves when it talks to a real dev server, the
+// SW keeps its own cookie jar per virtual origin: it records Set-Cookie from
+// each virtual-server response and replays a Cookie header on subsequent
+// requests to that same origin. This is transport-level behaviour, not tied to
+// any particular framework.
+//
+// key: instanceId + "\u0000" + serverPort  ->  Map(cookieName -> {value, path, expires})
+const cookieJars = new Map();
+
+function cookieJarKey(instanceId, serverPort) {
+  return instanceId + "\u0000" + serverPort;
+}
+
+function parseSetCookie(raw) {
+  const str = String(raw);
+  const semi = str.split(";");
+  const nameValue = semi.shift();
+  if (nameValue == null) return null;
+  const eq = nameValue.indexOf("=");
+  if (eq < 0) return null;
+  const name = nameValue.slice(0, eq).trim();
+  if (!name) return null;
+  const value = nameValue.slice(eq + 1).trim();
+
+  const rec = { value, path: "/", expires: null };
+  let maxAge = null;
+  let expiresAttr = null;
+  for (const attr of semi) {
+    const i = attr.indexOf("=");
+    const key = (i < 0 ? attr : attr.slice(0, i)).trim().toLowerCase();
+    const val = i < 0 ? "" : attr.slice(i + 1).trim();
+    if (key === "path") {
+      rec.path = val || "/";
+    } else if (key === "max-age") {
+      const secs = parseInt(val, 10);
+      if (!Number.isNaN(secs)) maxAge = secs <= 0 ? 0 : Date.now() + secs * 1000;
+    } else if (key === "expires") {
+      const t = Date.parse(val);
+      if (!Number.isNaN(t)) expiresAttr = t;
+    }
+  }
+  // RFC 6265: Max-Age takes precedence over Expires when both are present.
+  rec.expires = maxAge !== null ? maxAge : expiresAttr;
+  return { name, rec };
+}
+
+// Split a combined Set-Cookie string on cookie boundaries. Commas inside
+// Expires dates ("Expires=Mon, 06 Jul 2026...") must not split; a new cookie
+// only starts at ", token=" where token contains no "=" or ";" before it.
+function splitSetCookieString(combined) {
+  const str = String(combined);
+  const out = [];
+  let start = 0;
+  let pos = 0;
+  while (pos < str.length) {
+    const comma = str.indexOf(",", pos);
+    if (comma === -1) break;
+    // lookahead: skip whitespace, then require "name=" before any ";" or ","
+    let ahead = comma + 1;
+    while (ahead < str.length && (str[ahead] === " " || str[ahead] === "\t")) ahead++;
+    const rest = str.slice(ahead);
+    const eq = rest.indexOf("=");
+    const semi = rest.indexOf(";");
+    const nextComma = rest.indexOf(",");
+    const isBoundary =
+      eq > 0 &&
+      (semi === -1 || eq < semi) &&
+      (nextComma === -1 || eq < nextComma);
+    if (isBoundary) {
+      out.push(str.slice(start, comma).trim());
+      start = ahead;
+      pos = ahead;
+    } else {
+      pos = comma + 1;
+    }
+  }
+  out.push(str.slice(start).trim());
+  return out.filter((c) => c.length > 0);
+}
+
+function storeSetCookies(instanceId, serverPort, setCookieValue) {
+  if (setCookieValue == null) return;
+  const rawList = Array.isArray(setCookieValue) ? setCookieValue : [setCookieValue];
+  // A hop may have joined multiple Set-Cookie headers with ", " — re-split.
+  const list = [];
+  for (const raw of rawList) list.push(...splitSetCookieString(raw));
+  const key = cookieJarKey(instanceId, serverPort);
+  let jar = cookieJars.get(key);
+  if (!jar) {
+    jar = new Map();
+    cookieJars.set(key, jar);
+  }
+  for (const raw of list) {
+    const parsed = parseSetCookie(raw);
+    if (!parsed) continue;
+    const { name, rec } = parsed;
+    if (rec.expires === 0 || (rec.expires !== null && rec.expires <= Date.now())) {
+      jar.delete(name);
+    } else {
+      jar.set(name, rec);
+    }
+  }
+  if (jar.size === 0) cookieJars.delete(key);
+}
+
+// RFC 6265 path-match
+function cookiePathMatches(requestPath, cookiePath) {
+  if (cookiePath === requestPath) return true;
+  if (requestPath.indexOf(cookiePath) === 0) {
+    if (cookiePath.charAt(cookiePath.length - 1) === "/") return true;
+    if (requestPath.charAt(cookiePath.length) === "/") return true;
+  }
+  return false;
+}
+
+function buildCookieHeader(instanceId, serverPort, path) {
+  const jar = cookieJars.get(cookieJarKey(instanceId, serverPort));
+  if (!jar || jar.size === 0) return "";
+  const now = Date.now();
+  const reqPath = (String(path).split("?")[0]) || "/";
+  const out = [];
+  for (const [name, rec] of jar) {
+    if (rec.expires === 0 || (rec.expires !== null && rec.expires <= now)) {
+      jar.delete(name);
+      continue;
+    }
+    if (!cookiePathMatches(reqPath, rec.path)) continue;
+    out.push(name + "=" + rec.value);
+  }
+  return out.join("; ");
+}
+
+// Merge the SW jar's cookies with whatever the browser sent, jar taking
+// precedence on name conflicts (the jar is authoritative for the virtual
+// origin, since the browser can't persist those cookies itself).
+function mergeCookieHeaders(browserCookie, jarCookie) {
+  if (!jarCookie) return browserCookie || "";
+  if (!browserCookie) return jarCookie;
+  const seen = new Set();
+  const pairs = [];
+  for (const part of jarCookie.split(";")) {
+    const p = part.trim();
+    if (!p) continue;
+    const name = p.slice(0, p.indexOf("=")).trim();
+    seen.add(name);
+    pairs.push(p);
+  }
+  for (const part of browserCookie.split(";")) {
+    const p = part.trim();
+    if (!p) continue;
+    const name = p.slice(0, p.indexOf("=")).trim();
+    if (seen.has(name)) continue;
+    pairs.push(p);
+  }
+  return pairs.join("; ");
+}
 
 // any token from any currently connected tab is accepted. used for control
 // messages that aren't tied to a specific instance (set-watermark etc)
@@ -909,11 +1074,50 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-function sanitizeProxyHeaders(h) {
-  const forbidden = ["set-cookie", "set-cookie2", "clear-site-data"];
+function rewriteCookieForPreviewHost(cookie) {
+  let c = String(cookie);
+  c = c.replace(/;\s*Path=[^;]*/gi, "");
+  c = c.replace(/;\s*Domain=[^;]*/gi, "");
+  if (!/;\s*SameSite=/i.test(c)) c += "; SameSite=Lax";
+  // Preview iframes strip /__virtual__/{instance}/{port} from location via
+  // history.replaceState (LOCATION_PATCH_SCRIPT). Subsequent fetches use paths
+  // like /api/... on the host origin, so cookies scoped to the virtual prefix
+  // would never be sent. Path=/ matches native dev-server behaviour.
+  return c + "; Path=/";
+}
+
+function rewriteSetCookieHeaders(headers, _instanceId, _serverPort) {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== "set-cookie") continue;
+    const val = headers[key];
+    const cookies = Array.isArray(val) ? val : [val];
+    headers[key] = cookies.map((cookie) => rewriteCookieForPreviewHost(cookie));
+  }
+}
+
+function buildProxyResponse(body, status, statusText, headers) {
+  const h = new Headers();
+  for (const [key, value] of Object.entries(headers || {})) {
+    const lk = key.toLowerCase();
+    if (lk === "set-cookie") {
+      const cookies = Array.isArray(value) ? value : [value];
+      for (const cookie of cookies) {
+        if (cookie != null && cookie !== "") h.append("Set-Cookie", String(cookie));
+      }
+    } else if (value != null) {
+      h.set(key, Array.isArray(value) ? value.join(", ") : String(value));
+    }
+  }
+  return new Response(body, { status, statusText, headers: h });
+}
+
+function sanitizeProxyHeaders(h, instanceId, serverPort) {
+  const forbidden = ["clear-site-data"];
   for (const key of Object.keys(h)) {
     if (forbidden.includes(key.toLowerCase())) delete h[key];
   }
+  rewriteSetCookieHeaders(h, instanceId, serverPort);
+  // Prevent user dev-server code from poisoning the host cache for these paths.
   h["Cache-Control"] = "no-store";
   return h;
 }
@@ -990,6 +1194,32 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   });
   headers["host"] = `localhost:${serverPort}`;
 
+  // Mutating requests may arrive without Origin when the browser treats them
+  // as same-origin; forward the request URL origin for downstream validation.
+  const method = request.method.toUpperCase();
+  if (
+    method !== "GET" &&
+    method !== "HEAD" &&
+    method !== "OPTIONS" &&
+    !headers["origin"] &&
+    !headers["Origin"] &&
+    !headers["referer"] &&
+    !headers["Referer"]
+  ) {
+    try {
+      headers["origin"] = new URL(request.url).origin;
+    } catch {
+      headers["origin"] = self.location.origin;
+    }
+  }
+
+  // Replay stored cookies for this virtual origin (the browser can't persist
+  // cookies from synthetic SW responses, so the SW jar is authoritative).
+  const jarCookie = buildCookieHeader(instanceId, serverPort, path);
+  const merged = mergeCookieHeaders(headers["cookie"], jarCookie);
+  if (merged) headers["cookie"] = merged;
+  else delete headers["cookie"];
+
   let body = undefined;
   if (request.method !== "GET" && request.method !== "HEAD") {
     try {
@@ -1051,6 +1281,15 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       responseBody = bytes;
     }
     const respHeaders = Object.assign({}, data.headers || {});
+
+    // Capture Set-Cookie into the SW jar before doing anything else, so the
+    // cookies survive even though the browser will ignore them on the
+    // synthetic response we hand back below.
+    for (const k of Object.keys(respHeaders)) {
+      if (k.toLowerCase() === "set-cookie") {
+        storeSetCookies(instanceId, serverPort, respHeaders[k]);
+      }
+    }
 
     // Fix MIME type: SPA fallback middleware may serve index.html (text/html)
     // for non-HTML paths. Correct the Content-Type based on file extension.
@@ -1136,13 +1375,14 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       }
     }
 
-    sanitizeProxyHeaders(respHeaders);
+    sanitizeProxyHeaders(respHeaders, instanceId, serverPort);
 
-    return new Response(finalBody, {
-      status: data.statusCode || 200,
-      statusText: data.statusMessage || "OK",
-      headers: respHeaders,
-    });
+    return buildProxyResponse(
+      finalBody,
+      data.statusCode || 200,
+      data.statusMessage || "OK",
+      respHeaders,
+    );
   } catch (err) {
     const msg = err.message || "Proxy error";
     // If the error is a timeout, it likely means no server is listening

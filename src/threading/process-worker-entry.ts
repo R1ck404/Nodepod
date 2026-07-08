@@ -2,7 +2,14 @@
 // I/O flows through postMessage using the protocol in worker-protocol.ts
 
 import { MemoryVolume } from "../memory-volume";
+import {
+  installFetchHeadersSetCookieParity,
+  installNodeFetchClassParity,
+} from "../polyfills/fetch-response";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
+
+installFetchHeadersSetCookieParity();
+installNodeFetchClassParity();
 import { SyncChannelWorker } from "./sync-channel";
 import { createLazyFsClient } from "./lazy-fs-client";
 import type {
@@ -35,6 +42,20 @@ const _childOutputCallbacks = new Map<number, (stream: string, data: string) => 
 const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
 let _nextRequestId = 1;
+let _nextHttpClientId = 1;
+const _httpClientCallbacks = new Map<
+  number,
+  {
+    resolve: (resp: {
+      statusCode: number;
+      statusMessage: string;
+      headers: Record<string, string | string[]>;
+      body: Buffer | string | null;
+    }) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }
+>();
 
 function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
   (self as unknown as Worker).postMessage(msg, transfer ?? []);
@@ -144,6 +165,9 @@ self.addEventListener("message", (ev: MessageEvent) => {
     case "http-request":
       handleHttpRequest(msg as any);
       break;
+    case "http-client-response":
+      handleHttpClientResponse(msg as any);
+      break;
     case "ws-upgrade":
       handleWsUpgrade(msg as any);
       break;
@@ -250,6 +274,35 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process"
     httpMod.setServerCloseCallback((port: number) => {
       post({ type: "server-close", port });
     });
+    httpMod.setHttpClientBridge((port, method, path, headers, body) =>
+      new Promise((resolve, reject) => {
+        const requestId = _nextHttpClientId++;
+        const timer = setTimeout(() => {
+          _httpClientCallbacks.delete(requestId);
+          reject(new Error(`HTTP client request timed out for localhost:${port}${path}`));
+        }, 30_000);
+        _httpClientCallbacks.set(requestId, {
+          resolve: (resp) => {
+            clearTimeout(timer);
+            resolve(resp);
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+          timer,
+        });
+        post({
+          type: "http-client-request",
+          requestId,
+          port,
+          method,
+          path,
+          headers,
+          body: body ? body.toString("utf8") : null,
+        });
+      }),
+    );
     _shellInitialized = true;
   }
   return _shellMod;
@@ -571,6 +624,36 @@ async function handleHttpRequest(msg: {
       body: e?.message || "Internal Server Error",
     } as any);
   }
+}
+
+function handleHttpClientResponse(msg: {
+  requestId: number;
+  statusCode: number;
+  statusMessage: string;
+  headers: Record<string, string | string[]>;
+  body: string | ArrayBuffer;
+}): void {
+  const entry = _httpClientCallbacks.get(msg.requestId);
+  if (!entry) return;
+  _httpClientCallbacks.delete(msg.requestId);
+  clearTimeout(entry.timer);
+  void (async () => {
+    const { Buffer } = await import("../polyfills/buffer");
+    let bodyVal: Buffer | string | null = null;
+    if (msg.body instanceof ArrayBuffer) {
+      bodyVal = Buffer.from(new Uint8Array(msg.body));
+    } else if (typeof msg.body === "string") {
+      bodyVal = msg.body.length > 0 ? msg.body : null;
+    }
+    entry.resolve({
+      statusCode: msg.statusCode,
+      statusMessage: msg.statusMessage,
+      headers: msg.headers,
+      body: bodyVal,
+    });
+  })().catch((err) => {
+    entry.reject(err instanceof Error ? err : new Error(String(err)));
+  });
 }
 
 // active WS connections: uid → socket (TcpSocket in the worker)

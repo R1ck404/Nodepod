@@ -239,6 +239,10 @@ export class ProcessHandle extends EventEmitter {
           this.emit("http-request", msg);
           break;
 
+        case "http-client-request":
+          this.emit("http-client-request", msg);
+          break;
+
         case "http-response":
           this.emit("http-response", msg);
           break;

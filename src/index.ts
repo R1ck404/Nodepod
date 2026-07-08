@@ -31,6 +31,11 @@ export { buildProcessEnv } from "./polyfills/process";
 export type { ProcessObject, ProcessEnvVars } from "./polyfills/process";
 export * as path from "./polyfills/path";
 export * as http from "./polyfills/http";
+export {
+  setFetchResponse,
+  installFetchHeadersSetCookieParity,
+  installNodeFetchClassParity,
+} from "./polyfills/fetch-response";
 export * as net from "./polyfills/net";
 export * as events from "./polyfills/events";
 export * as stream from "./polyfills/stream";
