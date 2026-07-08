@@ -120,7 +120,7 @@ IncomingMessage.prototype._injectBody = function _injectBody(raw: Buffer | strin
 };
 
 function ensureContentLength(
-  hdrs: Record<string, string>,
+  hdrs: Record<string, string | string[] | undefined>,
   payload?: Buffer | string | null,
 ): void {
   if (payload === undefined || payload === null) return;

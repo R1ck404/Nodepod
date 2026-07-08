@@ -7,6 +7,26 @@ import type { ServerResponse } from "./http";
 const HEADERS_PATCH = Symbol.for("nodepod.fetchHeadersSetCookieParity");
 const FETCH_CLASS_PATCH = Symbol.for("nodepod.fetchClassHeaderParity");
 
+type IterableHeaders = Headers & {
+  entries(): IterableIterator<[string, string]>;
+  [Symbol.iterator](): IterableIterator<[string, string]>;
+};
+
+function iterateHeaders(headers: Headers): Iterable<[string, string]> {
+  const h = headers as IterableHeaders & Partial<Headers>;
+  if (typeof h.entries === "function") {
+    return h.entries();
+  }
+  if (typeof (h as Iterable<[string, string]>)[Symbol.iterator] === "function") {
+    return h as Iterable<[string, string]>;
+  }
+  const pairs: [string, string][] = [];
+  if (typeof h.forEach === "function") {
+    h.forEach((value, key) => pairs.push([key, value]));
+  }
+  return pairs;
+}
+
 /**
  * Copy any HeadersInit into a bare `new Headers()` (guard "none"), which —
  * unlike Request/Response header lists — accepts every header including
@@ -180,7 +200,14 @@ export function patchFetchNodeAdapterExports(
 /** Make Fetch Headers iteration/get behave like Node for Set-Cookie (browser worker parity). */
 export function installFetchHeadersSetCookieParity(): void {
   if (typeof Headers === "undefined") return;
-  const proto = Headers.prototype as Headers & { [HEADERS_PATCH]?: boolean };
+  const proto = Headers.prototype as IterableHeaders & {
+    [HEADERS_PATCH]?: boolean;
+    get(name: string): string | null;
+    forEach(
+      callback: (value: string, key: string, parent: Headers) => void,
+      thisArg?: unknown,
+    ): void;
+  };
   if (proto[HEADERS_PATCH]) return;
   proto[HEADERS_PATCH] = true;
 
@@ -207,7 +234,7 @@ export function installFetchHeadersSetCookieParity(): void {
 
   const iter = Symbol.iterator;
   if (iter in proto) {
-    proto[iter] = function iterator(this: Headers) {
+    (proto as unknown as Record<symbol, unknown>)[iter] = function iterator(this: Headers) {
       return entriesWithSetCookies.call(this);
     };
   }
@@ -239,7 +266,7 @@ export function collectSetCookies(headers: Headers): string[] {
   const fromGet = headers.get("set-cookie");
   if (fromGet) return splitCookiesString(fromGet);
   const cookies: string[] = [];
-  for (const [key, value] of headers) {
+  for (const [key, value] of iterateHeaders(headers)) {
     if (key.toLowerCase() === "set-cookie") {
       cookies.push(...splitCookiesString(value));
     }
@@ -254,7 +281,7 @@ export function fetchHeadersToNodeRecord(
   const out: Record<string, string | string[]> = {};
   const setCookies = collectSetCookies(headers);
   if (setCookies.length > 0) out["set-cookie"] = setCookies;
-  for (const [key, value] of headers) {
+  for (const [key, value] of iterateHeaders(headers)) {
     if (key.toLowerCase() === "set-cookie") continue;
     out[key.toLowerCase()] = value;
   }
@@ -311,7 +338,7 @@ export async function setFetchResponse(
     }
   }
 
-  for (const [key, value] of response.headers) {
+  for (const [key, value] of iterateHeaders(response.headers)) {
     if (key.toLowerCase() === "set-cookie") continue;
     try {
       res.setHeader(key, value);

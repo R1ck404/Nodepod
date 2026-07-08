@@ -58,7 +58,7 @@ describe("setFetchResponse Set-Cookie parity", () => {
           controller.close();
         },
       }),
-    } as Response;
+    } as unknown as Response;
 
     const server = createServer(async (_req, res) => {
       await setFetchResponse(res, response);

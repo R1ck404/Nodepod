@@ -2,6 +2,7 @@
 // I/O flows through postMessage using the protocol in worker-protocol.ts
 
 import { MemoryVolume } from "../memory-volume";
+import type { CompletedResponse } from "../polyfills/http";
 import {
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
@@ -46,12 +47,7 @@ let _nextHttpClientId = 1;
 const _httpClientCallbacks = new Map<
   number,
   {
-    resolve: (resp: {
-      statusCode: number;
-      statusMessage: string;
-      headers: Record<string, string | string[]>;
-      body: Buffer | string | null;
-    }) => void;
+    resolve: (resp: CompletedResponse) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }
@@ -649,7 +645,12 @@ function handleHttpClientResponse(msg: {
       statusCode: msg.statusCode,
       statusMessage: msg.statusMessage,
       headers: msg.headers,
-      body: bodyVal,
+      body:
+        bodyVal == null
+          ? Buffer.alloc(0)
+          : typeof bodyVal === "string"
+            ? Buffer.from(bodyVal)
+            : bodyVal,
     });
   })().catch((err) => {
     entry.reject(err instanceof Error ? err : new Error(String(err)));

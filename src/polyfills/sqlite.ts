@@ -281,7 +281,18 @@ type WaModule = {
   setAuthorizer: (db: number, fn: unknown, userData: unknown) => number;
 };
 
-type WaApi = ReturnType<typeof Factory> & { module?: WaModule; SQLite?: typeof SQLite };
+type WaApi = {
+  module?: WaModule;
+  SQLite?: typeof SQLite;
+  str_new: (db: number, sql: string) => number;
+  str_value: (str: number) => number;
+  str_finish: (str: number) => void;
+  vfs_register: (vfs: unknown, makeDefault?: boolean | number) => number;
+  limit: (db: number, id: number, value: number) => number;
+  value: (valuePtr: number) => unknown;
+  result_null: (ctx: number) => void;
+  result: (ctx: number, value: unknown) => void;
+};
 
 interface SqliteEngine {
   module: WaModule;
@@ -524,13 +535,16 @@ class NodepodVFS {
         vfsPath: name,
         size: existing?.byteLength ?? 0,
         data: existing
-          ? existing.buffer.slice(existing.byteOffset, existing.byteOffset + existing.byteLength)
+          ? (existing.buffer.slice(
+              existing.byteOffset,
+              existing.byteOffset + existing.byteLength,
+            ) as ArrayBuffer)
           : new ArrayBuffer(0),
         dirty: false,
       };
       this.mapNameToFile.set(name, file);
     }
-    this.mapIdToFile.set(fileId, file);
+    this.mapIdToFile.set(fileId, file!);
     pOutFlags.setInt32(0, flags, true);
     return 0;
   }
@@ -661,11 +675,12 @@ async function loadEngine(): Promise<SqliteEngine | null> {
     precompileWasm(wasmBinary);
     let factory: (opts: { wasmBinary: Uint8Array }) => Promise<WaModule>;
     try {
-      factory = (await cdnImport(CDN_WA_SQLITE)).default;
+      factory = (await cdnImport(CDN_WA_SQLITE)).default as typeof factory;
     } catch {
-      factory = (await import(/* @vite-ignore */ "wa-sqlite/dist/wa-sqlite.mjs")).default;
+      factory = (await import(/* @vite-ignore */ "wa-sqlite/dist/wa-sqlite.mjs"))
+        .default as typeof factory;
     }
-    const module = await factory({ wasmBinary });
+    const module = (await factory({ wasmBinary })) as WaModule;
     const api = Factory(module) as WaApi;
     nodepodVfs = new NodepodVFS();
     api.vfs_register(nodepodVfs, false);
@@ -914,19 +929,19 @@ export class SQLTagStore {
   }
 
   run(strings: TemplateStringsArray, ...values: unknown[]) {
-    return this.getStmt(this.tagSql(strings)).run(...values);
+    return this.getStmt(this.tagSql(strings)).run(values);
   }
 
   get(strings: TemplateStringsArray, ...values: unknown[]) {
-    return this.getStmt(this.tagSql(strings)).get(...values);
+    return this.getStmt(this.tagSql(strings)).get(values);
   }
 
   all(strings: TemplateStringsArray, ...values: unknown[]) {
-    return this.getStmt(this.tagSql(strings)).all(...values);
+    return this.getStmt(this.tagSql(strings)).all(values);
   }
 
   *iterate(strings: TemplateStringsArray, ...values: unknown[]) {
-    yield* this.getStmt(this.tagSql(strings)).iterate(...values);
+    yield* this.getStmt(this.tagSql(strings)).iterate(values);
   }
 }
 
@@ -1084,7 +1099,7 @@ export class DatabaseSync implements DatabaseSyncInterface {
     let options: Record<string, unknown> = {};
     let func: (...args: unknown[]) => unknown;
     if (typeof optionsOrFn === "function") {
-      func = optionsOrFn;
+      func = optionsOrFn as (...args: unknown[]) => unknown;
     } else {
       options = optionsOrFn as Record<string, unknown>;
       func = fn!;
@@ -1166,7 +1181,7 @@ export class DatabaseSync implements DatabaseSyncInterface {
       module.setAuthorizer(this._handle!, null, 0);
       return;
     }
-    module.setAuthorizer(this._handle!, (_userData, action, a1, a2, db, trigger) => {
+    module.setAuthorizer(this._handle!, (_userData: unknown, action: number, a1: string | null, a2: string | null, db: string | null, trigger: string | null) => {
       return callback(action, a1, a2, db, trigger);
     }, 0);
   }

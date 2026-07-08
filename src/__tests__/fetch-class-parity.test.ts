@@ -110,7 +110,7 @@ describe("installNodeFetchClassParity", () => {
     const fromRecord = toGuardlessHeaders({
       cookie: "a=1",
       "set-cookie": ["x=1; Path=/", "y=2; Path=/"],
-    });
+    } as unknown as HeadersInit);
     expect(fromRecord.get("cookie")).toBe("a=1");
     expect(collectSetCookies(fromRecord)).toEqual(["x=1; Path=/", "y=2; Path=/"]);
 

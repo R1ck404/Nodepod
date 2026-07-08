@@ -429,6 +429,7 @@ export class RequestProxy extends EventEmitter {
     url: string,
     headers: Record<string, string>,
     body?: ArrayBuffer,
+    options?: HandleRequestOptions,
   ): Promise<CompletedResponse>;
   async handleRequest(
     port: number,
@@ -436,6 +437,7 @@ export class RequestProxy extends EventEmitter {
     url: string,
     headers: Record<string, string>,
     body?: ArrayBuffer,
+    options?: HandleRequestOptions,
   ): Promise<CompletedResponse>;
   async handleRequest(...args: any[]): Promise<CompletedResponse> {
     let instanceId: string;

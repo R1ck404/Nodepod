@@ -4,11 +4,15 @@ import {
   installFetchHeadersSetCookieParity,
 } from "../polyfills/fetch-response";
 
+type IterableHeaders = Headers & {
+  entries(): IterableIterator<[string, string]>;
+};
+
 describe("installFetchHeadersSetCookieParity", () => {
   const patchKey = Symbol.for("nodepod.fetchHeadersSetCookieParity");
 
   afterEach(() => {
-    delete (Headers.prototype as { [key: symbol]: unknown })[patchKey];
+    delete (Headers.prototype as unknown as Record<symbol, unknown>)[patchKey];
   });
 
   it("preserves multiple Set-Cookie values when copying Headers", () => {
@@ -16,7 +20,7 @@ describe("installFetchHeadersSetCookieParity", () => {
 
     const copyHeaders = (target: Headers, source: HeadersInit | undefined) => {
       if (!source) return;
-      for (const [key, value] of new Headers(source).entries()) {
+      for (const [key, value] of (new Headers(source) as IterableHeaders).entries()) {
         if (key.toLowerCase() === "set-cookie") target.append(key, value);
         else target.set(key, value);
       }
