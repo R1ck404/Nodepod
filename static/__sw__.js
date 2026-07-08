@@ -42,6 +42,42 @@ const previewClients = new Map();
 const pathToPodMap = new Map();
 const PATH_MAP_MAX = 512;
 
+function adoptPreviewClient(clientId, pod) {
+  if (clientId) previewClients.set(clientId, pod);
+}
+
+function lookupPodFromReferer(referer) {
+  if (!referer) return null;
+  try {
+    const refUrl = new URL(referer);
+    if (refUrl.origin !== self.location.origin) return null;
+    const refHit =
+      matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
+      matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
+    if (refHit) {
+      return { instanceId: refHit.instanceId, serverPort: refHit.port };
+    }
+    return pathToPodMap.get(refUrl.pathname) || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve which preview pod should serve /api/auth/* when the host dev server
+// shares the same origin port as the virtual app (common with Vite on :5173).
+function resolveAuthApiPod(clientId, referer) {
+  if (clientId && previewClients.has(clientId)) {
+    return previewClients.get(clientId);
+  }
+  const fromReferer = lookupPodFromReferer(referer);
+  if (fromReferer) return fromReferer;
+  if (pathToPodMap.size === 0) return null;
+  // Map preserves insertion order; path-claim re-inserts on each navigation.
+  let last = null;
+  for (const pod of pathToPodMap.values()) last = pod;
+  return last;
+}
+
 // per-instance script injected into preview iframe HTML
 const previewScripts = new Map();
 
@@ -649,9 +685,9 @@ self.addEventListener("fetch", (event) => {
       //     prefixed navigation), and the referer carries no /__virtual__/
       //     prefix, so routes 3 and 4 both miss and every asset would fall
       //     through to the host server and 404. Resolve the pod through the
-      //     path-claim map, but only adopt clients that really are nested
-      //     iframes so a top-level tab that happens to sit on a claimed path
-      //     (e.g. "/") keeps its normal network behavior.
+      //     path-claim map and adopt the client — do not pass through to the
+      //     host when the referer is a claimed preview path. Top-level tabs
+      //     on the same pathname without a prior claim do not appear here.
       const pathPod =
         refUrl.origin === self.location.origin
           ? pathToPodMap.get(refUrl.pathname)
@@ -659,31 +695,11 @@ self.addEventListener("fetch", (event) => {
       if (pathPod) {
         const { instanceId, serverPort } = pathPod;
         const path = stripPreviewPrefix(url.pathname) + url.search;
-        if (!clientId) {
-          event.respondWith(
-            proxyToVirtualServer(
-              event.request, instanceId, serverPort, path, event.request,
-            ),
-          );
-          return;
-        }
+        adoptPreviewClient(clientId, { instanceId, serverPort });
         event.respondWith(
-          (async () => {
-            let nested = previewClients.has(clientId);
-            if (!nested) {
-              try {
-                const client = await self.clients.get(clientId);
-                nested = !!client && client.frameType === "nested";
-              } catch {
-                nested = false;
-              }
-            }
-            if (!nested) return fetch(event.request);
-            previewClients.set(clientId, { instanceId, serverPort });
-            return proxyToVirtualServer(
-              event.request, instanceId, serverPort, path, event.request,
-            );
-          })(),
+          proxyToVirtualServer(
+            event.request, instanceId, serverPort, path, event.request,
+          ),
         );
         return;
       }
@@ -714,6 +730,26 @@ self.addEventListener("fetch", (event) => {
         );
         return;
       }
+    }
+  }
+
+  // 6. Better Auth /api/auth/* on the same origin as the host. When the host
+  //    dev server shares a port with the virtual app (e.g. both on :5173), a
+  //    pass-through fetch hits the host which has no auth routes and returns an
+  //    empty 404. Resolve the pod from the preview client, referer claim, or
+  //    the most recently claimed stripped path.
+  if (sameOriginHost && url.pathname.startsWith("/api/auth")) {
+    const pod = resolveAuthApiPod(clientId, referer);
+    if (pod) {
+      const { instanceId, serverPort } = pod;
+      const path = stripPreviewPrefix(url.pathname) + url.search;
+      adoptPreviewClient(clientId, { instanceId, serverPort });
+      event.respondWith(
+        proxyToVirtualServer(
+          event.request, instanceId, serverPort, path, event.request,
+        ),
+      );
+      return;
     }
   }
 
@@ -1210,9 +1246,7 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     method !== "HEAD" &&
     method !== "OPTIONS" &&
     !headers["origin"] &&
-    !headers["Origin"] &&
-    !headers["referer"] &&
-    !headers["Referer"]
+    !headers["Origin"]
   ) {
     try {
       headers["origin"] = new URL(request.url).origin;
