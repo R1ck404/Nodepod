@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nodepod — Vite dev exit code 1 repro</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, monospace;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 24px;
+      line-height: 1.55;
+    }
+    h1 { font-size: 18px; color: #fff; margin-bottom: 8px; }
+    p { font-size: 13px; color: #888; margin-bottom: 16px; max-width: 90ch; }
+    code { background: #0d0d1a; padding: 1px 5px; border-radius: 3px; color: #a8e6a3; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    button {
+      background: #252545;
+      border: 1px solid #444;
+      color: #e0e0e0;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { border-color: #666; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.active { border-color: #8ac4e6; color: #8ac4e6; }
+    #output {
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 16px;
+      min-height: 420px;
+      white-space: pre-wrap;
+      font-size: 13px;
+      overflow-y: auto;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #555; }
+    .pass { color: #a8e6a3; font-weight: 700; }
+    .fail { color: #e68a8a; font-weight: 700; }
+    #summary {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #121225;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Vite dev server exits with code 1 (Nodepod 1.9.0 repro)</h1>
+  <p>
+    Boots a virtual Vite + React app inside Nodepod, runs <code>npm run dev</code>, and
+    awaits <code>proc.completion</code>. Variant A matches auth-template boot (Better Auth +
+    <code>node:sqlite</code> in <code>vite.config.ts</code>). Variant B is a plain React
+    control. Variant C keeps SQLite at config load only.
+  </p>
+
+  <div class="toolbar">
+    <button id="run-a" data-variant="a">Run variant A (auth + sqlite)</button>
+    <button id="run-b" data-variant="b">Run variant B (react only)</button>
+    <button id="run-c" data-variant="c">Run variant C (sqlite only)</button>
+    <button id="run-all">Run all variants</button>
+    <button id="clear">Clear log</button>
+  </div>
+
+  <div id="output"></div>
+  <div id="summary">Idle — pick a variant.</div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById("output");
+    const summary = document.getElementById("summary");
+    const buttons = [...document.querySelectorAll("button[data-variant]"), document.getElementById("run-all")];
+
+    function log(text, cls = "stdout") {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = text + "\n";
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    function clearLog() {
+      out.textContent = "";
+      summary.textContent = "Idle — pick a variant.";
+    }
+
+    document.getElementById("clear").addEventListener("click", clearLog);
+
+    const basePackage = {
+      name: "virtual-app",
+      private: true,
+      type: "module",
+      scripts: {
+        dev: "vite --port 5173 --strictPort --host",
+      },
+      dependencies: {
+        react: "^18.3.1",
+        "react-dom": "^18.3.1",
+      },
+      devDependencies: {
+        "@vitejs/plugin-react": "^4.3.4",
+        vite: "^5.4.11",
+      },
+    };
+
+    const sharedFiles = {
+      "/index.html": `<!doctype html>
+<html><body><div id="root"></div>
+<script type="module" src="/src/main.tsx"><\/script></body></html>`,
+      "/src/main.tsx": `import { createRoot } from "react-dom/client";
+createRoot(document.getElementById("root")!).render(<h1>ok</h1>);`,
+    };
+
+    const variantA = {
+      label: "A — auth + sqlite in vite.config.ts",
+      package: {
+        ...basePackage,
+        dependencies: {
+          ...basePackage.dependencies,
+          "better-auth": "^1.6.23",
+        },
+      },
+      files: {
+        ...sharedFiles,
+        "/vite.config.ts": `import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+import { auth } from "./server/auth";
+import { toNodeHandler } from "better-auth/node";
+function authServerPlugin(): Plugin {
+  return {
+    name: "better-auth",
+    configureServer(server) {
+      server.middlewares.use("/api/auth", toNodeHandler(auth));
+    },
+  };
+}
+export default defineConfig({
+  plugins: [react(), authServerPlugin()],
+});`,
+        "/server/db.ts": `import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+const DB_PATH = "/.data/app.sqlite";
+export function getDb(): DatabaseSync {
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  const db = new DatabaseSync(DB_PATH);
+  db.exec("PRAGMA journal_mode = WAL;");
+  return db;
+}`,
+        "/server/auth.ts": `import { betterAuth } from "better-auth";
+import { getDb } from "./db";
+export const auth = betterAuth({
+  database: getDb(),
+  emailAndPassword: { enabled: true },
+  secret: "dev-secret",
+  baseURL: "http://localhost:5173",
+  trustedOrigins: ["http://localhost:5173"],
+});`,
+      },
+    };
+
+    const variantB = {
+      label: "B — react only (control)",
+      package: basePackage,
+      files: {
+        ...sharedFiles,
+        "/vite.config.ts": `import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({
+  plugins: [react()],
+});`,
+      },
+    };
+
+    const variantC = {
+      label: "C — sqlite at vite.config load",
+      package: basePackage,
+      files: {
+        ...sharedFiles,
+        "/server/db.ts": variantA.files["/server/db.ts"],
+        "/vite.config.ts": `import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { getDb } from "./server/db";
+getDb();
+export default defineConfig({
+  plugins: [react()],
+});`,
+      },
+    };
+
+    const variants = { a: variantA, b: variantB, c: variantC };
+
+    async function runVariant(key) {
+      const variant = variants[key];
+      log(`\n=== ${variant.label} ===`, "info");
+
+      let stderr = "";
+      let exitCode = null;
+      let threw = null;
+      let resolveViteReady;
+      const viteReady = new Promise((resolve) => {
+        resolveViteReady = resolve;
+      });
+
+      const pod = await Nodepod.boot({
+        workdir: "/",
+        files: {
+          "/package.json": JSON.stringify(variant.package, null, 2),
+          ...variant.files,
+        },
+        onServerReady: (port, url) => {
+          if (port === 5173) {
+            log(`server ready: ${port} ${url}`, "info");
+            resolveViteReady(url);
+          }
+        },
+      });
+
+      log("installing deps...", "info");
+      await pod.packages.installFromManifest("/package.json", { withDevDeps: true });
+      log("starting dev server...", "info");
+
+      const proc = await pod.spawn("npm", ["run", "dev"]);
+      proc.on("output", (c) => log("[stdout] " + c.trimEnd()));
+      proc.on("error", (c) => {
+        stderr += c;
+        log("[stderr] " + c.trimEnd(), "stderr");
+      });
+
+      try {
+        const result = await Promise.race([
+          proc.completion.then((res) => ({ kind: "exit", res })),
+          viteReady.then((url) => ({ kind: "ready", url })),
+          new Promise((resolve) =>
+            setTimeout(() => resolve({ kind: "timeout" }), 30000),
+          ),
+        ]);
+
+        if (result.kind === "exit") {
+          exitCode = result.res.exitCode;
+          log(`proc.completion: exit code ${exitCode}`, exitCode === 0 ? "pass" : "fail");
+        } else if (result.kind === "ready") {
+          log(`Vite ready at ${result.url} — treating as success`, "pass");
+          exitCode = 0;
+          proc.kill();
+        } else {
+          log("Timed out waiting for Vite or exit", "fail");
+          exitCode = -1;
+          proc.kill();
+        }
+      } catch (err) {
+        threw = err;
+        log(String(err?.stack || err), "fail");
+      }
+
+      const failed = threw != null || (exitCode != null && exitCode !== 0);
+      return { key, label: variant.label, failed, exitCode, stderr, threw };
+    }
+
+    async function runSelected(key) {
+      buttons.forEach((b) => (b.disabled = true));
+      try {
+        const result = await runVariant(key);
+        summary.textContent = result.failed
+          ? `FAIL — ${result.label} (exit=${result.exitCode ?? "sentinel"})`
+          : `PASS — ${result.label}`;
+        summary.style.color = result.failed ? "#e68a8a" : "#a8e6a3";
+        return result;
+      } finally {
+        buttons.forEach((b) => (b.disabled = false));
+      }
+    }
+
+    for (const btn of document.querySelectorAll("button[data-variant]")) {
+      btn.addEventListener("click", () => runSelected(btn.dataset.variant));
+    }
+
+    document.getElementById("run-all").addEventListener("click", async () => {
+      clearLog();
+      buttons.forEach((b) => (b.disabled = true));
+      const results = [];
+      try {
+        for (const key of ["a", "b", "c"]) {
+          results.push(await runVariant(key));
+        }
+        const lines = results.map((r) =>
+          `${r.failed ? "FAIL" : "PASS"}  ${r.label}  exit=${r.exitCode ?? "sentinel"}`,
+        );
+        summary.textContent = lines.join(" · ");
+        summary.style.color = results.some((r) => r.failed) ? "#e68a8a" : "#a8e6a3";
+        log("\n--- summary ---", "dim");
+        for (const line of lines) log(line, line.startsWith("FAIL") ? "fail" : "pass");
+      } finally {
+        buttons.forEach((b) => (b.disabled = false));
+      }
+    });
+  </script>
+</body>
+</html>

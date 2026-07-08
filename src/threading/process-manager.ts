@@ -3,6 +3,9 @@
 
 import { EventEmitter } from "../polyfills/events";
 import type { MemoryVolume } from "../memory-volume";
+import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
+import { precompileWasm } from "../helpers/wasm-cache";
+import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
 import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
@@ -17,6 +20,7 @@ import type {
   WorkerToMain_SpawnSync,
   WorkerToMain_HttpResponse,
   WorkerToMain_HttpClientRequest,
+  WorkerToMain_SqlitePreload,
 } from "./worker-protocol";
 import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
@@ -919,6 +923,13 @@ export class ProcessManager extends EventEmitter {
       }
     });
 
+    handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {
+      handle.holdSync();
+      void this._handleSqlitePreload(handle, msg.sab).finally(() => {
+        handle.releaseSync();
+      });
+    });
+
     handle.on("spawn-sync", (msg: WorkerToMain_SpawnSync) => {
       if (!this._syncBuffer) {
         return;
@@ -1081,6 +1092,67 @@ export class ProcessManager extends EventEmitter {
     handle.on("worker-error", (message: string, stack?: string) => {
       this.emit("error", handle.pid, message, stack);
     });
+  }
+
+  private static readonly SAB_STATUS_PENDING = 0;
+  private static readonly SAB_STATUS_OK = 1;
+  private static readonly SAB_STATUS_FAIL = 2;
+
+  private async _handleSqlitePreload(
+    handle: ProcessHandle,
+    sab: Int32Array,
+  ): Promise<void> {
+    const notify = (status: number, byteLength = 0): void => {
+      Atomics.store(sab, 1, byteLength);
+      Atomics.store(sab, 0, status);
+      Atomics.notify(sab, 0);
+    };
+
+    try {
+      const payloadView = new Uint8Array(
+        sab.buffer,
+        WASM_SAB_HEADER_BYTES,
+        WASM_SAB_MAX_BYTES,
+      );
+
+      let bytes: Uint8Array;
+      if (this._volume.existsSync(WASM_CACHE_PATH)) {
+        bytes = new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
+      } else {
+        const resp = await fetch(CDN_WA_SQLITE_WASM);
+        if (!resp.ok) {
+          throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
+        }
+        bytes = new Uint8Array(await resp.arrayBuffer());
+        if (this._vfsBridge) {
+          this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
+        } else {
+          const parent = WASM_CACHE_PATH.substring(
+            0,
+            WASM_CACHE_PATH.lastIndexOf("/"),
+          );
+          if (parent && !this._volume.existsSync(parent)) {
+            this._volume.mkdirSync(parent, { recursive: true });
+          }
+          this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
+        }
+        precompileWasm(bytes);
+      }
+
+      if (bytes.byteLength > payloadView.byteLength) {
+        throw new Error(
+          `wa-sqlite.wasm too large for preload SAB (${bytes.byteLength} > ${payloadView.byteLength})`,
+        );
+      }
+
+      payloadView.set(bytes);
+      notify(ProcessManager.SAB_STATUS_OK, bytes.byteLength);
+    } catch (err) {
+      if (typeof console !== "undefined") {
+        console.warn("[node:sqlite] host preload failed:", err);
+      }
+      notify(ProcessManager.SAB_STATUS_FAIL);
+    }
   }
 
   private _createEmptySnapshot(): VFSBinarySnapshot {

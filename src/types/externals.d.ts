@@ -55,6 +55,10 @@ declare module 'wa-sqlite/src/sqlite-constants.js' {
 }
 
 declare module 'wa-sqlite/dist/wa-sqlite.mjs' {
-  const factory: (opts: { wasmBinary: Uint8Array }) => Promise<Record<string, unknown>>;
+  const factory: (opts: {
+    wasmBinary: Uint8Array;
+    wasmModule?: WebAssembly.Module;
+    noInitialRun?: boolean;
+  }) => Promise<Record<string, unknown>>;
   export default factory;
 }

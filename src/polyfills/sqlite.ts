@@ -7,11 +7,12 @@ import {
   cdnImport,
 } from "../constants/cdn-urls";
 import { getRegistry } from "../helpers/event-loop";
-import { precompileWasm } from "../helpers/wasm-cache";
+import { getCachedModule, precompileWasm } from "../helpers/wasm-cache";
 import { Buffer } from "./buffer";
 import { setSharedVolume, getSharedVolume } from "./volume-registry";
 import { Factory, SQLiteError } from "wa-sqlite/src/sqlite-api.js";
 import * as SQLite from "wa-sqlite/src/sqlite-constants.js";
+import waSqliteFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 
 export const constants = {
   SQLITE_CHANGESET_DATA: 1,
@@ -645,11 +646,69 @@ class NodepodVFS {
   }
 }
 
+export const WASM_CACHE_PATH = "/.nodepod/wa-sqlite.wasm";
+export const WASM_SAB_HEADER_BYTES = 16;
+export const WASM_SAB_MAX_BYTES = 1024 * 1024;
+
+const ENGINE_LOAD_TIMEOUT_MS = 30_000;
+const SAB_STATUS_PENDING = 0;
+const SAB_STATUS_OK = 1;
+const SAB_STATUS_FAIL = 2;
+
 let engineInstance: SqliteEngine | null = null;
 let engineLoading: Promise<SqliteEngine | null> | null = null;
+let engineLoadFailed = false;
 let nodepodVfs: NodepodVFS | null = null;
 
+// Injected in process workers — blocks until wa-sqlite.wasm bytes are in the pod VFS.
+export interface SqliteHostBridge {
+  ensureWasmCached(): void;
+}
+
+let hostBridge: SqliteHostBridge | null = null;
+
+export function setSqliteHostBridge(bridge: SqliteHostBridge | null): void {
+  hostBridge = bridge;
+}
+
+/** @internal test helper */
+export function __resetSqliteEngineForTesting(): void {
+  engineInstance = null;
+  engineLoading = null;
+  engineLoadFailed = false;
+  nodepodVfs = null;
+}
+
+function syncAwait(val: unknown): unknown {
+  if (val && typeof (val as { then?: unknown }).then === "function") {
+    let resolved: unknown;
+    let gotSync = false;
+    (val as Promise<unknown>).then((v) => {
+      resolved = v;
+      gotSync = true;
+    });
+    if (gotSync) return resolved;
+    return undefined;
+  }
+  return val;
+}
+
+function ensureLoadStarted(): void {
+  if (engineInstance || engineLoading) return;
+  const loadHandle = getRegistry().register("WASMWork");
+  engineLoading = loadEngine().finally(() => loadHandle.close());
+}
+
 async function loadWasmBinary(): Promise<Uint8Array> {
+  try {
+    const v = vol();
+    if (v.existsSync(WASM_CACHE_PATH)) {
+      return new Uint8Array(v.readFileSync(WASM_CACHE_PATH));
+    }
+  } catch {
+    /* volume unavailable */
+  }
+
   try {
     const resp = await fetch(CDN_WA_SQLITE_WASM);
     if (resp.ok) return new Uint8Array(await resp.arrayBuffer());
@@ -681,35 +740,170 @@ async function loadEngine(): Promise<SqliteEngine | null> {
         .default as typeof factory;
     }
     const module = (await factory({ wasmBinary })) as WaModule;
-    const api = Factory(module) as WaApi;
-    nodepodVfs = new NodepodVFS();
-    api.vfs_register(nodepodVfs, false);
-    return { module, api, sync: new SyncOps(module, api) };
+    return buildEngineFromWaModule(module);
   } catch (err) {
     if (typeof console !== "undefined") console.warn("[node:sqlite] load failed:", err);
     return null;
   }
 }
 
-function getEngine(): SqliteEngine {
-  if (!engineInstance) {
-    throw new Error(
-      "[node:sqlite] WASM engine not ready. Await preloadSqlite() before using DatabaseSync.",
-    );
+function buildEngineFromWaModule(waModule: WaModule): SqliteEngine {
+  const api = Factory(waModule) as WaApi;
+  nodepodVfs = new NodepodVFS();
+  api.vfs_register(nodepodVfs, false);
+  return { module: waModule, api, sync: new SyncOps(waModule, api) };
+}
+
+// sync fast path: load from pod VFS after host preload (or warm cache).
+function loadEngineSync(): SqliteEngine | null {
+  try {
+    const v = vol();
+    if (!v.existsSync(WASM_CACHE_PATH)) return null;
+
+    const wasmBinary = new Uint8Array(v.readFileSync(WASM_CACHE_PATH));
+    precompileWasm(wasmBinary);
+
+    let compiled = getCachedModule(wasmBinary);
+    if (!compiled) {
+      compiled = new WebAssembly.Module(wasmBinary);
+    }
+
+    const ready = waSqliteFactory({
+      wasmBinary,
+      wasmModule: compiled,
+      noInitialRun: true,
+    });
+
+    const waModule = syncAwait(ready);
+    if (!waModule || typeof waModule !== "object") return null;
+    return buildEngineFromWaModule(waModule as WaModule);
+  } catch (err) {
+    if (typeof console !== "undefined") {
+      console.warn("[node:sqlite] sync load failed:", err);
+    }
+    return null;
   }
-  return engineInstance;
+}
+
+function waitForEngineLoading(): SqliteEngine | null {
+  ensureLoadStarted();
+  if (engineInstance) return engineInstance;
+  if (!engineLoading) return null;
+
+  const warm = syncAwait(engineLoading);
+  if (warm && typeof warm === "object") return warm as SqliteEngine;
+
+  if (typeof SharedArrayBuffer === "undefined" || typeof Atomics === "undefined") {
+    return null;
+  }
+
+  let result: SqliteEngine | null = null;
+  let failed = false;
+  const sab = new SharedArrayBuffer(4);
+  const ctrl = new Int32Array(sab);
+  engineLoading.then(
+    (r) => {
+      result = r;
+    },
+    () => {
+      failed = true;
+    },
+  ).finally(() => {
+    Atomics.store(ctrl, 0, 1);
+    Atomics.notify(ctrl, 0);
+  });
+
+  const deadline = Date.now() + ENGINE_LOAD_TIMEOUT_MS;
+  while (result === null && !failed) {
+    if (Date.now() > deadline) break;
+    Atomics.wait(ctrl, 0, 0, 10);
+  }
+  return result;
+}
+
+function blockForEngineViaHost(): void {
+  if (!hostBridge) return;
+  try {
+    hostBridge.ensureWasmCached();
+  } catch (err) {
+    engineLoadFailed = true;
+    throw err;
+  }
+  const eng = loadEngineSync();
+  if (eng) {
+    engineInstance = eng;
+    return;
+  }
+  engineLoadFailed = true;
+}
+
+function getEngine(): SqliteEngine {
+  if (engineInstance) return engineInstance;
+  if (engineLoadFailed) {
+    throw new Error("[node:sqlite] WASM engine failed to load.");
+  }
+
+  ensureLoadStarted();
+  if (engineLoading) {
+    const eng = syncAwait(engineLoading);
+    if (eng && typeof eng === "object") {
+      engineInstance = eng as SqliteEngine;
+      return engineInstance;
+    }
+  }
+
+  try {
+    const syncEng = loadEngineSync();
+    if (syncEng) {
+      engineInstance = syncEng;
+      return engineInstance;
+    }
+  } catch {
+    /* volume unavailable */
+  }
+
+  blockForEngineViaHost();
+  if (engineInstance) return engineInstance;
+
+  try {
+    const syncEng = loadEngineSync();
+    if (syncEng) {
+      engineInstance = syncEng;
+      return engineInstance;
+    }
+  } catch {
+    /* volume unavailable */
+  }
+
+  throw new Error(
+    "[node:sqlite] WASM engine not ready. Await preloadSqlite() before using DatabaseSync.",
+  );
 }
 
 export async function preloadSqlite(): Promise<boolean> {
   if (engineInstance) return true;
-  if (!engineLoading) {
-    const loadHandle = getRegistry().register("WASMWork");
-    engineLoading = loadEngine().finally(() => loadHandle.close());
+  ensureLoadStarted();
+  const eng = await engineLoading!;
+  if (!eng) {
+    engineLoadFailed = true;
+    return false;
   }
-  const eng = await engineLoading;
-  if (!eng) return false;
   engineInstance = eng;
   return true;
+}
+
+// worker init: host-fetch WASM bytes, then async engine load before posting ready.
+export async function warmSqliteEngine(): Promise<boolean> {
+  if (engineInstance) return true;
+  if (hostBridge) {
+    try {
+      hostBridge.ensureWasmCached();
+    } catch {
+      engineLoadFailed = true;
+      return false;
+    }
+  }
+  return preloadSqlite();
 }
 
 interface DbOptions {
@@ -1364,4 +1558,6 @@ export default {
   preloadSqlite,
   setVolume,
   setSqliteCwd,
+  setSqliteHostBridge,
+  WASM_CACHE_PATH,
 };

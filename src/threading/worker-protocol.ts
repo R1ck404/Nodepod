@@ -334,6 +334,17 @@ export interface WorkerToMain_Error {
   stack?: string;
 }
 
+export interface WorkerToMain_SqlitePreload {
+  type: "sqlite-preload";
+  /**
+   * SharedArrayBuffer layout:
+   *   [0] status (0 pending, 1 ok, 2 fail)
+   *   [1] wasm byte length (set by main on success)
+   *   bytes [16..] wasm payload (main writes, worker reads after notify)
+   */
+  sab: Int32Array;
+}
+
 export interface WorkerToMain_WsFrame {
   type: "ws-frame";
   uid: string;
@@ -366,6 +377,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_IPC
   | WorkerToMain_ShellDone
   | WorkerToMain_Error
+  | WorkerToMain_SqlitePreload
   | WorkerToMain_WsFrame;
 
 // --- Spawn config ---

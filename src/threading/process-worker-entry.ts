@@ -8,6 +8,13 @@ import {
   installNodeFetchClassParity,
 } from "../polyfills/fetch-response";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
+import {
+  setSqliteHostBridge,
+  warmSqliteEngine,
+  WASM_CACHE_PATH,
+  WASM_SAB_HEADER_BYTES,
+  WASM_SAB_MAX_BYTES,
+} from "../polyfills/sqlite";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
@@ -44,6 +51,55 @@ const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, s
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
 let _nextRequestId = 1;
 let _nextHttpClientId = 1;
+
+const SQLITE_SAB_PENDING = 0;
+const SQLITE_SAB_OK = 1;
+const SQLITE_SAB_FAIL = 2;
+const SQLITE_LOAD_TIMEOUT_MS = 30_000;
+
+function installSqliteHostBridge(): void {
+  if (typeof SharedArrayBuffer === "undefined" || !_volume) {
+    setSqliteHostBridge(null);
+    return;
+  }
+  setSqliteHostBridge({
+    ensureWasmCached() {
+      const sab = new SharedArrayBuffer(WASM_SAB_HEADER_BYTES + WASM_SAB_MAX_BYTES);
+      const ctrl = new Int32Array(sab, 0, 4);
+      Atomics.store(ctrl, 0, SQLITE_SAB_PENDING);
+      Atomics.store(ctrl, 1, 0);
+      post({ type: "sqlite-preload", sab: ctrl });
+      const waited = Atomics.wait(
+        ctrl,
+        0,
+        SQLITE_SAB_PENDING,
+        SQLITE_LOAD_TIMEOUT_MS,
+      );
+      if (waited === "timed-out") {
+        throw new Error(
+          `[node:sqlite] timed out waiting for ${WASM_CACHE_PATH} preload`,
+        );
+      }
+      const status = Atomics.load(ctrl, 0);
+      if (status !== SQLITE_SAB_OK) {
+        throw new Error("[node:sqlite] host WASM preload failed");
+      }
+      const byteLength = Atomics.load(ctrl, 1);
+      if (byteLength > 0) {
+        const bytes = new Uint8Array(sab, WASM_SAB_HEADER_BYTES, byteLength);
+        const parent = WASM_CACHE_PATH.substring(
+          0,
+          WASM_CACHE_PATH.lastIndexOf("/"),
+        );
+        if (parent && parent !== "/" && !_volume!.existsSync(parent)) {
+          _volume!.mkdirSync(parent, { recursive: true });
+        }
+        _volume!.writeFileSync(WASM_CACHE_PATH, bytes.slice());
+      }
+    },
+  });
+}
+
 const _httpClientCallbacks = new Map<
   number,
   {
@@ -87,7 +143,7 @@ self.addEventListener("message", (ev: MessageEvent) => {
 
   switch (msg.type) {
     case "init":
-      handleInit(msg);
+      void handleInit(msg);
       break;
     case "exec":
       handleExec(msg);
@@ -178,7 +234,7 @@ self.addEventListener("message", (ev: MessageEvent) => {
   }
 });
 
-function handleInit(msg: MainToWorker_Init): void {
+async function handleInit(msg: MainToWorker_Init): Promise<void> {
   _pid = msg.pid;
   _cwd = msg.cwd || "/";
   _env = msg.env || {};
@@ -241,6 +297,16 @@ function handleInit(msg: MainToWorker_Init): void {
     import("../helpers/napi-wasm-worker").then((m) => {
       m.setWasiFsPortPool(msg.wasiFsPorts!);
     }).catch(() => {});
+  }
+
+  installSqliteHostBridge();
+
+  try {
+    await warmSqliteEngine();
+  } catch (err) {
+    if (typeof console !== "undefined") {
+      console.warn("[node:sqlite] worker init preload failed:", err);
+    }
   }
 
   _initialized = true;
