@@ -46,38 +46,6 @@ function adoptPreviewClient(clientId, pod) {
   if (clientId) previewClients.set(clientId, pod);
 }
 
-function lookupPodFromReferer(referer) {
-  if (!referer) return null;
-  try {
-    const refUrl = new URL(referer);
-    if (refUrl.origin !== self.location.origin) return null;
-    const refHit =
-      matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
-      matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
-    if (refHit) {
-      return { instanceId: refHit.instanceId, serverPort: refHit.port };
-    }
-    return pathToPodMap.get(refUrl.pathname) || null;
-  } catch {
-    return null;
-  }
-}
-
-// Resolve which preview pod should serve /api/auth/* when the host dev server
-// shares the same origin port as the virtual app (common with Vite on :5173).
-function resolveAuthApiPod(clientId, referer) {
-  if (clientId && previewClients.has(clientId)) {
-    return previewClients.get(clientId);
-  }
-  const fromReferer = lookupPodFromReferer(referer);
-  if (fromReferer) return fromReferer;
-  if (pathToPodMap.size === 0) return null;
-  // Map preserves insertion order; path-claim re-inserts on each navigation.
-  let last = null;
-  for (const pod of pathToPodMap.values()) last = pod;
-  return last;
-}
-
 // per-instance script injected into preview iframe HTML
 const previewScripts = new Map();
 
@@ -730,26 +698,6 @@ self.addEventListener("fetch", (event) => {
         );
         return;
       }
-    }
-  }
-
-  // 6. Better Auth /api/auth/* on the same origin as the host. When the host
-  //    dev server shares a port with the virtual app (e.g. both on :5173), a
-  //    pass-through fetch hits the host which has no auth routes and returns an
-  //    empty 404. Resolve the pod from the preview client, referer claim, or
-  //    the most recently claimed stripped path.
-  if (sameOriginHost && url.pathname.startsWith("/api/auth")) {
-    const pod = resolveAuthApiPod(clientId, referer);
-    if (pod) {
-      const { instanceId, serverPort } = pod;
-      const path = stripPreviewPrefix(url.pathname) + url.search;
-      adoptPreviewClient(clientId, { instanceId, serverPort });
-      event.respondWith(
-        proxyToVirtualServer(
-          event.request, instanceId, serverPort, path, event.request,
-        ),
-      );
-      return;
     }
   }
 
