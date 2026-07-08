@@ -46,6 +46,40 @@ function adoptPreviewClient(clientId, pod) {
   if (clientId) previewClients.set(clientId, pod);
 }
 
+function normalizeClaimPath(pathname) {
+  if (!pathname || pathname === "") return "/";
+  return pathname;
+}
+
+function rememberPreviewPath(pathname, pod) {
+  const path = normalizeClaimPath(pathname);
+  if (pathToPodMap.size >= PATH_MAP_MAX) {
+    const oldest = pathToPodMap.keys().next().value;
+    if (oldest !== undefined) pathToPodMap.delete(oldest);
+  }
+  pathToPodMap.delete(path);
+  pathToPodMap.set(path, pod);
+}
+
+// Walk up from /signup/nested to /signup, then /, so fetch() calls with an
+// empty clientId still route when only the app root was claimed.
+function lookupPodForClaimedPath(pathname) {
+  let path = normalizeClaimPath(pathname);
+  while (true) {
+    const pod = pathToPodMap.get(path);
+    if (pod) return pod;
+    if (path === "/") return null;
+    const idx = path.lastIndexOf("/");
+    path = idx <= 0 ? "/" : path.slice(0, idx);
+  }
+}
+
+function registerPreviewNavigation(clientId, resultingClientId, pod, strippedPath) {
+  rememberPreviewPath(strippedPath, pod);
+  adoptPreviewClient(resultingClientId, pod);
+  adoptPreviewClient(clientId, pod);
+}
+
 // per-instance script injected into preview iframe HTML
 const previewScripts = new Map();
 
@@ -455,7 +489,7 @@ self.addEventListener("message", (event) => {
     // injected location patch, which only pod-served HTML carries, so when
     // its path already maps to a pod we adopt the new client for that pod.
     if (!pod && clientId) {
-      pod = pathToPodMap.get(data.path) || null;
+      pod = lookupPodForClaimedPath(data.path) || null;
       if (pod) previewClients.set(clientId, pod);
     }
     if (pod) {
@@ -562,9 +596,14 @@ self.addEventListener("fetch", (event) => {
     if (event.request.mode === "navigate") {
       event.respondWith(
         (async () => {
-          if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, { instanceId, serverPort });
-          }
+          const pod = { instanceId, serverPort };
+          const strippedPath = normalizeClaimPath((rest || "/").split("?")[0]);
+          registerPreviewNavigation(
+            event.clientId,
+            event.resultingClientId,
+            pod,
+            strippedPath,
+          );
           return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
       );
@@ -585,9 +624,14 @@ self.addEventListener("fetch", (event) => {
     if (event.request.mode === "navigate") {
       event.respondWith(
         (async () => {
-          if (event.resultingClientId) {
-            previewClients.set(event.resultingClientId, { instanceId, serverPort });
-          }
+          const pod = { instanceId, serverPort };
+          const strippedPath = normalizeClaimPath((rest || "/").split("?")[0]);
+          registerPreviewNavigation(
+            event.clientId,
+            event.resultingClientId,
+            pod,
+            strippedPath,
+          );
           return proxyToVirtualServer(event.request, instanceId, serverPort, path);
         })(),
       );
@@ -658,7 +702,7 @@ self.addEventListener("fetch", (event) => {
       //     on the same pathname without a prior claim do not appear here.
       const pathPod =
         refUrl.origin === self.location.origin
-          ? pathToPodMap.get(refUrl.pathname)
+          ? lookupPodForClaimedPath(refUrl.pathname)
           : null;
       if (pathPod) {
         const { instanceId, serverPort } = pathPod;
