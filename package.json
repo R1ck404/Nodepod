@@ -1,6 +1,6 @@
 {
   "name": "@scelar/nodepod",
-  "version": "1.9.4",
+  "version": "1.9.5",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
