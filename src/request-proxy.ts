@@ -116,6 +116,8 @@ export class RequestProxy extends EventEmitter {
   private _watermarkEnabled = true;
   /** guards pagehide/beforeunload listener registration so reinit doesn't stack them */
   private _farewellInstalled = false;
+  /** server-registered etc. that fire before swReady; flushed once the port is up */
+  private _pendingSwMessages: Array<{ type: string; data: unknown }> = [];
 
   // ── Per-instance state, keyed by instanceId ──
   private _instances = new Map<string, InstanceState>();
@@ -639,6 +641,8 @@ export class RequestProxy extends EventEmitter {
         enabled: this._watermarkEnabled,
         token: this._swAuthToken,
       });
+      this._flushPendingSwMessages();
+      this._replayServerRegistrationsToSW();
     };
     navigator.serviceWorker.addEventListener("controllerchange", reinit);
     navigator.serviceWorker.addEventListener("message", (ev) => {
@@ -670,6 +674,12 @@ export class RequestProxy extends EventEmitter {
     this.emit("sw-ready");
 
     this._startWsBridge();
+
+    // servers often register during boot before initServiceWorker() finishes.
+    // notifySW() queues those while !swReady; replay the registry now so the
+    // SW instanceServers map is warm before stripped-path subresources arrive.
+    this._flushPendingSwMessages();
+    this._replayServerRegistrationsToSW();
 
     // mint a ws token for every instance that attached before the SW was
     // ready. common case: Nodepod constructor runs before initServiceWorker
@@ -1210,8 +1220,33 @@ export class RequestProxy extends EventEmitter {
   }
 
   private notifySW(type: string, data: unknown): void {
-    if (this.swReady && this.channel)
-      this.channel.port1.postMessage({ type, data });
+    const msg = { type, data };
+    if (this.swReady && this.channel) {
+      this.channel.port1.postMessage(msg);
+      return;
+    }
+    this._pendingSwMessages.push(msg);
+  }
+
+  private _flushPendingSwMessages(): void {
+    if (!this.swReady || !this.channel) return;
+    for (const msg of this._pendingSwMessages) {
+      this.channel.port1.postMessage(msg);
+    }
+    this._pendingSwMessages.length = 0;
+  }
+
+  /** replay live server-registered messages after sw-ready or controllerchange reinit. */
+  private _replayServerRegistrationsToSW(): void {
+    if (!this.swReady || !this.channel) return;
+    for (const [instanceId, inst] of this._instances) {
+      for (const [port, entry] of inst.registry) {
+        this.channel.port1.postMessage({
+          type: "server-registered",
+          data: { instanceId, port, hostname: entry.hostname },
+        });
+      }
+    }
   }
 
   createFetchHandler(): (req: Request) => Promise<Response> {

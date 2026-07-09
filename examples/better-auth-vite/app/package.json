@@ -4,7 +4,6 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "auth": "node server/auth-server.mjs",
     "dev": "vite"
   },
   "dependencies": {

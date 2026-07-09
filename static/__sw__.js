@@ -1,18 +1,20 @@
 /**
  * Nodepod Service Worker - proxies requests to virtual servers.
- * Version: 8 (multi-tab)
  *
  * Intercepts:
  *   /__virtual__/{instanceId}/{port}/{path}  virtual server API (new)
  *   /__preview__/{instanceId}/{port}/{path}  preview iframe navigation (new)
  *   /__virtual__/{port}/{path}               legacy, routes to DEFAULT_INSTANCE
  *   /__preview__/{port}/{path}               legacy, routes to DEFAULT_INSTANCE
- *   Any request from a client loaded via /__preview__/ (module imports etc)
+ *   Any request from a preview document the SW can positively attribute
+ *   (module imports, fetch()/XHR after the location patch stripped the
+ *   prefix, etc)
  *
- * When an iframe navigates to /__preview__/{instanceId}/{port}/, the SW records
- * the resulting clientId with its (instanceId, port). All subsequent requests
- * from that client (including ES module imports like /@react-refresh) are
- * intercepted and routed through the right instance's virtual server.
+ * Preview HTML includes an injected script with the pod identity (instanceId +
+ * serverPort). It posts nodepod-preview-claim at document start,
+ * controllerchange and history navigations so stripped-path requests still
+ * route to the right pod. Unattributed same-origin requests pass through to
+ * the host — the SW never guesses and never fabricates errors for them.
  *
  * Multi-tab: one SW serves every tab at this scope, but each tab has its own
  * RequestProxy and its own MessageChannel. we hold a map of MessagePorts
@@ -21,7 +23,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 11;
+const SW_VERSION = 13;
 const DEFAULT_INSTANCE = "default";
 
 let nextId = 1;
@@ -37,10 +39,21 @@ const instancePorts = new Map();
 // clientId -> { instanceId, serverPort } for preview iframes
 const previewClients = new Map();
 
-// stripped path -> pod. iframes claim their path so a reload that lands on
-// the stripped url (no prefix, new clientId) can still be routed. bounded.
-const pathToPodMap = new Map();
-const PATH_MAP_MAX = 512;
+// stripped path -> pod. preview documents claim their path (via the injected
+// self-identifying script) so reloads / empty-clientId requests still route.
+// bounded LRU.
+const pathClaims = new Map();
+const PATH_CLAIMS_MAX = 512;
+
+// instanceId -> Set<serverPort>. mirrors live virtual servers from
+// server-registered / server-unregistered messages. only consulted as a
+// last-resort recovery for iframe document navigations (e.g. hard reload at a
+// stripped URL right after the SW restarted with empty state).
+const instanceServers = new Map();
+
+// most recent pod a preview document navigated to or claimed. tie-breaker
+// when path claims from multiple servers of the same app overlap.
+let lastActivePod = null;
 
 function adoptPreviewClient(clientId, pod) {
   if (clientId) previewClients.set(clientId, pod);
@@ -51,22 +64,27 @@ function normalizeClaimPath(pathname) {
   return pathname;
 }
 
-function rememberPreviewPath(pathname, pod) {
+function claimPreviewPath(pathname, pod) {
   const path = normalizeClaimPath(pathname);
-  if (pathToPodMap.size >= PATH_MAP_MAX) {
-    const oldest = pathToPodMap.keys().next().value;
-    if (oldest !== undefined) pathToPodMap.delete(oldest);
+  if (pathClaims.size >= PATH_CLAIMS_MAX) {
+    const oldest = pathClaims.keys().next().value;
+    if (oldest !== undefined) pathClaims.delete(oldest);
   }
-  pathToPodMap.delete(path);
-  pathToPodMap.set(path, pod);
+  // re-insert to bump recency
+  pathClaims.delete(path);
+  pathClaims.set(path, pod);
+  lastActivePod = pod;
 }
 
-// Walk up from /signup/nested to /signup, then /, so fetch() calls with an
-// empty clientId still route when only the app root was claimed.
+// Walk up from /signup/nested to /signup, then /, so requests still route
+// when only an ancestor path was claimed. Non-absolute paths (blob: referers
+// from workers etc) never match — walking them up would collapse into the
+// root claim and misroute host worker traffic.
 function lookupPodForClaimedPath(pathname) {
   let path = normalizeClaimPath(pathname);
+  if (path.charAt(0) !== "/") return null;
   while (true) {
-    const pod = pathToPodMap.get(path);
+    const pod = pathClaims.get(path);
     if (pod) return pod;
     if (path === "/") return null;
     const idx = path.lastIndexOf("/");
@@ -74,10 +92,47 @@ function lookupPodForClaimedPath(pathname) {
   }
 }
 
-function registerPreviewNavigation(clientId, resultingClientId, pod, strippedPath) {
-  rememberPreviewPath(strippedPath, pod);
+// A preview document navigated via an explicit /__virtual__/ or /__preview__/
+// URL. Only adopt resultingClientId (the committing document) — event.clientId
+// on iframe loads is the embedder (host app) and adopting it hijacks the host.
+function registerPreviewNavigation(resultingClientId, pod, strippedPath) {
+  claimPreviewPath(strippedPath, pod);
   adoptPreviewClient(resultingClientId, pod);
-  adoptPreviewClient(clientId, pod);
+}
+
+function trackInstanceServer(instanceId, serverPort) {
+  if (!instanceId || serverPort == null) return;
+  let set = instanceServers.get(instanceId);
+  if (!set) {
+    set = new Set();
+    instanceServers.set(instanceId, set);
+  }
+  set.add(serverPort);
+}
+
+function untrackInstanceServer(instanceId, serverPort) {
+  const set = instanceServers.get(instanceId);
+  if (!set) return;
+  set.delete(serverPort);
+  if (set.size === 0) instanceServers.delete(instanceId);
+}
+
+// Last-resort pod for iframe document navigations when the SW has no claims
+// (fresh SW state after an update). Only unambiguous cases resolve: a single
+// live server, or the last pod a preview actually used.
+function resolvePodFromLiveInstances() {
+  if (lastActivePod) {
+    const set = instanceServers.get(lastActivePod.instanceId);
+    if (set && set.has(lastActivePod.serverPort)) return lastActivePod;
+  }
+  const candidates = [];
+  for (const [instanceId, set] of instanceServers.entries()) {
+    if (!getPortForInstance(instanceId)) continue;
+    for (const serverPort of set) candidates.push({ instanceId, serverPort });
+  }
+  if (candidates.length === 1) return candidates[0];
+  if (lastActivePod) return lastActivePod;
+  return null;
 }
 
 // per-instance script injected into preview iframe HTML
@@ -478,28 +533,37 @@ self.addEventListener("message", (event) => {
     return;
   }
 
-  // iframe claims its stripped path. we look up the pod from the sender's
-  // clientId so a page can't claim for a pod it isn't already tied to.
+  // self-claim from the injected location-patch script. pod identity was baked
+  // in when the SW served the HTML; adopt clientId + stripped path for routing.
+  if (
+    data.type === "nodepod-preview-claim" &&
+    data.pod &&
+    typeof data.pod.instanceId === "string" &&
+    Number.isFinite(data.pod.serverPort) &&
+    typeof data.path === "string"
+  ) {
+    const pod = {
+      instanceId: data.pod.instanceId,
+      serverPort: data.pod.serverPort,
+    };
+    const clientId = event.source && event.source.id;
+    adoptPreviewClient(clientId, pod);
+    claimPreviewPath(data.path, pod);
+    return;
+  }
+
+  // legacy path-claim from an older SW still alive across the update. only
+  // pod-served HTML has the sender script; fall back to pathClaims or
+  // resolvePodFromLiveInstances when the sender isn't registered yet.
   if (data.type === "nodepod-path-claim" && typeof data.path === "string") {
     const clientId = event.source && event.source.id;
-    let pod = clientId ? previewClients.get(clientId) : null;
-    // reloaded preview documents can commit under a clientId the SW never
-    // registered (the resultingClientId recorded at navigation time doesn't
-    // always match the committed client). the document still runs the
-    // injected location patch, which only pod-served HTML carries, so when
-    // its path already maps to a pod we adopt the new client for that pod.
-    if (!pod && clientId) {
-      pod = lookupPodForClaimedPath(data.path) || null;
-      if (pod) previewClients.set(clientId, pod);
-    }
+    const pod =
+      (clientId ? previewClients.get(clientId) : null) ||
+      lookupPodForClaimedPath(data.path) ||
+      resolvePodFromLiveInstances();
     if (pod) {
-      if (pathToPodMap.size >= PATH_MAP_MAX) {
-        const oldest = pathToPodMap.keys().next().value;
-        if (oldest !== undefined) pathToPodMap.delete(oldest);
-      }
-      // re-insert to bump recency
-      pathToPodMap.delete(data.path);
-      pathToPodMap.set(data.path, pod);
+      adoptPreviewClient(clientId, pod);
+      claimPreviewPath(data.path, pod);
     }
     return;
   }
@@ -575,177 +639,184 @@ function onPortMessage(event, mp) {
   // never sent claim-instance still route correctly
   if (msg.type === "server-registered" && msg.data && msg.data.instanceId) {
     claimInstance(mp, msg.data.instanceId);
+    const port = msg.data.port;
+    if (port != null) {
+      trackInstanceServer(msg.data.instanceId, port);
+    }
     return;
   }
-  // note: server-unregistered does NOT release. a tab may register multiple
-  // servers for one instance and we only want to unclaim on explicit release
+  if (msg.type === "server-unregistered" && msg.data && msg.data.instanceId) {
+    const port = msg.data.port;
+    if (port != null) {
+      untrackInstanceServer(msg.data.instanceId, port);
+    }
+    return;
+  }
+  // note: server-unregistered does NOT release instance claims. a tab may
+  // register multiple servers for one instance and we only unclaim on release
 
   if (msg.type === "keepalive") return;
 }
 
 // ── Fetch interception ──
+//
+// only proxy when we can positively attribute a request to a pod:
+//   1. explicit /__virtual__/ or /__preview__/ prefix
+//   2. known preview client (nodepod-preview-claim)
+//   3. referer with explicit preview prefix
+//   4. subresource whose referer/path resolves via pathClaims (not host tab)
+//   5. iframe navigation via pathClaims, or recovery after SW update wiped state
+// everything else passes through untouched — no synthetic errors on misses.
 
 self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-
-  // 1. explicit /__virtual__/{instanceId}/{port}/{path} or legacy /__virtual__/{port}/{path}
-  const virtualHit = matchPreviewOrVirtualPath(url.pathname, "virtual");
-  if (virtualHit) {
-    const { instanceId, port: serverPort, rest } = virtualHit;
-    const path = rest + url.search;
-    if (event.request.mode === "navigate") {
-      event.respondWith(
-        (async () => {
-          const pod = { instanceId, serverPort };
-          const strippedPath = normalizeClaimPath((rest || "/").split("?")[0]);
-          registerPreviewNavigation(
-            event.clientId,
-            event.resultingClientId,
-            pod,
-            strippedPath,
-          );
-          return proxyToVirtualServer(event.request, instanceId, serverPort, path);
-        })(),
-      );
-    } else {
-      event.respondWith(
-        proxyToVirtualServer(event.request, instanceId, serverPort, path),
-      );
-    }
-    return;
-  }
-
-  // 2. Explicit /__preview__/{instanceId}/{port}/{path} or legacy /__preview__/{port}/{path}
-  const previewHit = matchPreviewOrVirtualPath(url.pathname, "preview");
-  if (previewHit) {
-    const { instanceId, port: serverPort, rest } = previewHit;
-    const path = rest + url.search;
-
-    if (event.request.mode === "navigate") {
-      event.respondWith(
-        (async () => {
-          const pod = { instanceId, serverPort };
-          const strippedPath = normalizeClaimPath((rest || "/").split("?")[0]);
-          registerPreviewNavigation(
-            event.clientId,
-            event.resultingClientId,
-            pod,
-            strippedPath,
-          );
-          return proxyToVirtualServer(event.request, instanceId, serverPort, path);
-        })(),
-      );
-    } else {
-      event.respondWith(
-        proxyToVirtualServer(event.request, instanceId, serverPort, path),
-      );
-    }
-    return;
-  }
-
-  // 3. request from a tracked preview client, route through that instance's
-  //    virtual server. catches module imports like /@react-refresh etc.
-  //    only same-origin, let cross-origin (google fonts, CDNs) pass through
+  const request = event.request;
+  const url = new URL(request.url);
+  // resultingClientId is only valid during the synchronous handler turn.
+  const resultingClientId = event.resultingClientId;
   const clientId = event.clientId;
-  const sameOriginHost =
+
+  // 1. explicit prefix
+  const explicitHit =
+    matchPreviewOrVirtualPath(url.pathname, "virtual") ||
+    matchPreviewOrVirtualPath(url.pathname, "preview");
+  if (explicitHit) {
+    const { instanceId, port: serverPort, rest } = explicitHit;
+    const path = rest + url.search;
+    if (request.mode === "navigate") {
+      const pod = { instanceId, serverPort };
+      const strippedPath = normalizeClaimPath((rest || "/").split("?")[0]);
+      registerPreviewNavigation(resultingClientId, pod, strippedPath);
+    }
+    event.respondWith(
+      proxyToVirtualServer(request, instanceId, serverPort, path),
+    );
+    return;
+  }
+
+  // 2. only same-origin (and localhost-alias) URLs can belong to a pod;
+  //    cross-origin (fonts, CDNs) always passes through
+  const sameOrigin =
     url.hostname === "localhost" ||
     url.hostname === "127.0.0.1" ||
     url.hostname === "0.0.0.0" ||
     url.hostname === self.location.hostname;
+  if (!sameOrigin) return;
+
+  // 3. known preview client — self-claim registered clientId before page code ran
   if (clientId && previewClients.has(clientId)) {
-    if (sameOriginHost) {
-      const { instanceId, serverPort } = previewClients.get(clientId);
-      // strip /__preview__/{instanceId}/{port} or /__virtual__/{instanceId}/{port}
-      // (or legacy forms) if the browser resolved a relative URL against the
-      // preview page's location.
-      let path = stripPreviewPrefix(url.pathname);
-      path += url.search;
+    const pod = previewClients.get(clientId);
+    // strip a leftover prefix in case the browser resolved a relative URL
+    // against a still-prefixed document location
+    const strippedPath = stripPreviewPrefix(url.pathname);
+    // full-page navigation from a preview document (location.href = ...):
+    // the committing document is a new client — register it and its path
+    if (request.mode === "navigate") {
+      registerPreviewNavigation(
+        resultingClientId,
+        pod,
+        normalizeClaimPath(strippedPath),
+      );
+    }
+    const path = strippedPath + url.search;
+    event.respondWith(
+      proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request),
+    );
+    return;
+  }
+
+  const refUrl = (() => {
+    if (!request.referrer) return null;
+    try {
+      const u = new URL(request.referrer);
+      return u.origin === self.location.origin ? u : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  // 4. referer carries an explicit preview prefix — first subresources after a
+  //    prefixed navigation, which can arrive before the claim (or empty clientId)
+  if (refUrl) {
+    const refHit =
+      matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
+      matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
+    if (refHit) {
+      const pod = { instanceId: refHit.instanceId, serverPort: refHit.port };
+      adoptPreviewClient(clientId, pod);
+      const path = stripPreviewPrefix(url.pathname) + url.search;
       event.respondWith(
-        proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
+        proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request),
       );
       return;
     }
   }
 
-  // 4. fallback: check Referer header. Handles the Firefox race where the first
-  //    subresource after a navigation arrives with event.clientId === "".
-  const referer = event.request.referrer;
-  if (referer && sameOriginHost) {
-    try {
-      const refUrl = new URL(referer);
-      // Try new then legacy shape in the referer path
-      const refHit =
-        matchPreviewOrVirtualPath(refUrl.pathname, "preview") ||
-        matchPreviewOrVirtualPath(refUrl.pathname, "virtual");
-      if (refHit) {
-        const { instanceId, port: serverPort } = refHit;
-        let path = stripPreviewPrefix(url.pathname);
-        path += url.search;
-        if (clientId) {
-          previewClients.set(clientId, { instanceId, serverPort });
-        }
-        event.respondWith(
-          proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
-        );
-        return;
-      }
+  const isNavigation = request.mode === "navigate";
 
-      // 4b. referer is a STRIPPED path a preview iframe claimed. This is a
-      //     subresource of an iframe document that reloaded at its stripped
-      //     URL: the reload commits under a clientId the SW never registered
-      //     (previewClients only knows resultingClientId from the original
-      //     prefixed navigation), and the referer carries no /__virtual__/
-      //     prefix, so routes 3 and 4 both miss and every asset would fall
-      //     through to the host server and 404. Resolve the pod through the
-      //     path-claim map and adopt the client — do not pass through to the
-      //     host when the referer is a claimed preview path. Top-level tabs
-      //     on the same pathname without a prior claim do not appear here.
-      const pathPod =
-        refUrl.origin === self.location.origin
-          ? lookupPodForClaimedPath(refUrl.pathname)
-          : null;
-      if (pathPod) {
-        const { instanceId, serverPort } = pathPod;
-        const path = stripPreviewPrefix(url.pathname) + url.search;
-        adoptPreviewClient(clientId, { instanceId, serverPort });
-        event.respondWith(
-          proxyToVirtualServer(
-            event.request, instanceId, serverPort, path, event.request,
-          ),
-        );
-        return;
-      }
-    } catch {
-      // Invalid referer URL, ignore
+  // 5. subresource whose referer (or client URL) resolves via pathClaims.
+  //    top-level host clients pass through; any miss falls through to the host.
+  if (!isNavigation) {
+    const refererPod = refUrl ? lookupPodForClaimedPath(refUrl.pathname) : null;
+    const mayResolveViaClient = !refUrl && clientId && pathClaims.size > 0;
+    if (refererPod || mayResolveViaClient) {
+      event.respondWith(
+        (async () => {
+          let pod = refererPod;
+          let client = null;
+          if (clientId) {
+            try {
+              client = await self.clients.get(clientId);
+            } catch {
+              client = null;
+            }
+          }
+          if (client && client.frameType === "top-level") {
+            return fetch(request);
+          }
+          if (!pod && client && client.url) {
+            try {
+              const clientPath = stripPreviewPrefix(new URL(client.url).pathname);
+              pod = lookupPodForClaimedPath(clientPath);
+            } catch {
+              pod = null;
+            }
+          }
+          if (!pod) return fetch(request);
+          adoptPreviewClient(clientId, pod);
+          const path = stripPreviewPrefix(url.pathname) + url.search;
+          return proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request);
+        })(),
+      );
+      return;
+    }
+    return; // unattributed → host
+  }
+
+  // 6. iframe/frame document navigation at a stripped URL. top-level host
+  //    navigations never match. when pathClaims is empty (SW update wiped
+  //    state), fall back to resolvePodFromLiveInstances for preview reloads.
+  const dest = request.destination;
+  if (dest === "iframe" || dest === "frame") {
+    // live-instance recovery only when pathClaims is empty; if claims exist
+    // and none match, the frame isn't a preview — let the host serve it.
+    const pod =
+      lookupPodForClaimedPath(url.pathname) ||
+      (pathClaims.size === 0 ? resolvePodFromLiveInstances() : null);
+    if (pod) {
+      registerPreviewNavigation(
+        resultingClientId,
+        pod,
+        normalizeClaimPath(url.pathname),
+      );
+      const path = url.pathname + url.search;
+      event.respondWith(
+        proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request),
+      );
+      return;
     }
   }
 
-  // 5. fallback: path-claim map. catches iframe reloads where the URL was
-  //    stripped by the location patch, so clientId and referer are no help.
-  //    gated to iframe/frame navigations so outer-page top-level nav to a
-  //    path that happens to be claimed doesn't get misrouted to a pod.
-  {
-    const dest = event.request.destination;
-    const isIframeNav = event.request.mode === "navigate" && (dest === "iframe" || dest === "frame");
-    const host = url.hostname;
-    const sameOrigin = host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === self.location.hostname;
-    if (isIframeNav && sameOrigin) {
-      const pathHit = pathToPodMap.get(url.pathname);
-      if (pathHit) {
-        const { instanceId, serverPort } = pathHit;
-        const path = url.pathname + url.search;
-        if (event.resultingClientId) {
-          previewClients.set(event.resultingClientId, { instanceId, serverPort });
-        }
-        event.respondWith(
-          proxyToVirtualServer(event.request, instanceId, serverPort, path, event.request),
-        );
-        return;
-      }
-    }
-  }
-
-  // If nothing matched, let the browser handle it normally
+  // unattributed → host handles it
 });
 
 // ── WebSocket shim for preview iframes ──
@@ -978,28 +1049,37 @@ function getNavTimingPatchScript(bodyBytes) {
 </script>`;
 }
 
-// ── Virtual-prefix URL patch ──
+// ── Virtual-prefix URL patch + self-identifying claim ──
 //
 // iframes live at /__virtual__/{id}/{port}/ but client-side routers read
 // location.pathname and want the app's real path. Location is
 // [LegacyUnforgeable] so we can't override its getters. instead we strip
 // the prefix from the real URL via history.replaceState before any user
-// script runs. SW routes later requests via clientId, with the path-claim
-// map as a fallback for force-reloads.
-const LOCATION_PATCH_SCRIPT = `<script>
+// script runs.
+//
+// pod identity is baked into the script when the SW serves the HTML. the script
+// posts nodepod-preview-claim at document start, controllerchange and history
+// navigations so stripped-path requests route without guessing.
+function getLocationPatchScript(instanceId, serverPort) {
+  const podLiteral = JSON.stringify({
+    instanceId: String(instanceId),
+    serverPort: Number(serverPort) || 0,
+  });
+  return `<script>
 (function() {
   if (window.__nodepodLocPatch) return;
   window.__nodepodLocPatch = true;
+
+  var POD = ${podLiteral};
 
   // /__virtual__/{id}/{port} (|\\d+ branch is the legacy id-less form)
   var PREFIX_RE = /^\\/__(?:preview|virtual)__\\/(?:[A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*\\/\\d+|\\d+)/;
 
   var m = location.pathname.match(PREFIX_RE);
-  if (!m) return;
-  var PREFIX = m[0];
+  var PREFIX = m ? m[0] : null;
 
   function strip(u) {
-    if (typeof u !== 'string') return u;
+    if (!PREFIX || typeof u !== 'string') return u;
     if (u === PREFIX) return '/';
     if (u.indexOf(PREFIX + '/') === 0) return u.slice(PREFIX.length);
     if (u.indexOf(PREFIX + '?') === 0) return '/' + u.slice(PREFIX.length);
@@ -1007,12 +1087,28 @@ const LOCATION_PATCH_SCRIPT = `<script>
     return u;
   }
 
-  // let the SW know our path so a force-reload without the prefix still routes
+  // tell the SW which pod this document belongs to and which stripped path
+  // it currently shows, so later requests from this client route correctly
+  // (including after force-reloads and SW updates)
   function claimPath() {
     try {
+      var msg = { type: 'nodepod-preview-claim', pod: POD, path: strip(location.pathname) };
       var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
-      if (sw) sw.postMessage({ type: 'nodepod-path-claim', path: location.pathname });
+      if (sw) {
+        sw.postMessage(msg);
+        return;
+      }
+      if (navigator.serviceWorker && navigator.serviceWorker.ready) {
+        navigator.serviceWorker.ready.then(function() {
+          var readySw = navigator.serviceWorker.controller;
+          if (readySw) readySw.postMessage(msg);
+        });
+      }
     } catch (e) {}
+  }
+
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('controllerchange', claimPath);
   }
 
   // swap the visible URL to the stripped form. same document, just history.
@@ -1076,6 +1172,7 @@ const LOCATION_PATCH_SCRIPT = `<script>
   }, true);
 })();
 </script>`;
+}
 
 // Small "nodepod" badge in the bottom-right corner of preview iframes.
 const WATERMARK_SCRIPT = `<script>
@@ -1116,9 +1213,9 @@ function rewriteCookieForPreviewHost(cookie) {
   c = c.replace(/;\s*Domain=[^;]*/gi, "");
   if (!/;\s*SameSite=/i.test(c)) c += "; SameSite=Lax";
   // Preview iframes strip /__virtual__/{instance}/{port} from location via
-  // history.replaceState (LOCATION_PATCH_SCRIPT). Subsequent fetches use paths
-  // like /api/... on the host origin, so cookies scoped to the virtual prefix
-  // would never be sent. Path=/ matches native dev-server behaviour.
+  // history.replaceState (see getLocationPatchScript). Subsequent fetches use
+  // paths like /api/... on the host origin, so cookies scoped to the virtual
+  // prefix would never be sent. Path=/ matches native dev-server behaviour.
   return c + "; Path=/";
 }
 
@@ -1345,7 +1442,7 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
       // location patch runs first so user scripts see the stripped URL
       let injection =
         getNavTimingPatchScript(responseBody.byteLength) +
-        LOCATION_PATCH_SCRIPT +
+        getLocationPatchScript(instanceId, serverPort) +
         getWsShimScript(instanceId, serverPort);
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {

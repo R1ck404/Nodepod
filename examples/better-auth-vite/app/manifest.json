@@ -2,7 +2,7 @@
   "package.json",
   "vite.config.js",
   "index.html",
-  "server/auth-server.mjs",
+  "server/auth.mjs",
   "src/main.jsx",
   "src/App.jsx",
   "src/index.css",

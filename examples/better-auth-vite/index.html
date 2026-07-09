@@ -105,8 +105,8 @@
     <h1>Better Auth + Vite + React Router</h1>
     <p>
       Loads the real project from <code>examples/better-auth-vite/app/</code> into Nodepod.
-      Auth API on <code>:3000</code> (Better Auth + <code>node:sqlite</code>), Vite on
-      <code>:5173</code> proxies <code>/api/auth</code>. Use Sign up or Log in, then open Dashboard.
+      Better Auth runs as Vite dev middleware on <code>:5173</code> at <code>/api/auth</code>
+      (same pattern as Scelar). Use Sign up or Log in, then open Dashboard.
     </p>
   </header>
 
@@ -132,7 +132,7 @@
   </div>
 
   <script type="module">
-    import { Nodepod } from '/dist/index.mjs';
+    import { Nodepod, getProxyInstance } from '/dist/index.mjs';
 
     const APP_ROOT = '/examples/better-auth-vite/app';
     const VFS_ROOT = '/project';
@@ -188,32 +188,26 @@
       preview.removeAttribute('src');
       setStatus('Booting…');
 
+      let onServerReady = null;
       try {
-        let authReady = false;
         let viteUrl = null;
-        let resolveAuth;
         let resolveVite;
-        const authReadyPromise = new Promise((r) => {
-          resolveAuth = r;
-        });
         const viteReady = new Promise((r) => {
           resolveVite = r;
         });
 
+        onServerReady = (port, url) => {
+          log(`Server ready: port=${port} ${url}`, 'info');
+          if (port === 5173 && !viteUrl) {
+            viteUrl = url;
+            resolveVite(url);
+          }
+        };
+        getProxyInstance().on('server-ready', onServerReady);
+
         log('Booting Nodepod (workdir=/project)…', 'info');
         const pod = await Nodepod.boot({
           workdir: VFS_ROOT,
-          onServerReady: (port, url) => {
-            log(`Server ready: port=${port} ${url}`, 'info');
-            if (port === 3000 && !authReady) {
-              authReady = true;
-              resolveAuth(url);
-            }
-            if (port === 5173) {
-              viteUrl = url;
-              resolveVite(url);
-            }
-          },
         });
         log('Booted.\n', 'pass');
 
@@ -235,30 +229,7 @@
         }
         log('npm install done.\n', 'pass');
 
-        log('--- Auth server (port 3000) ---', 'dim');
-        setStatus('Starting auth server…');
-        const authProc = await runCommand(pod, 'npm', ['run', 'auth']);
-
-        const authRaced = await Promise.race([
-          authReadyPromise,
-          authProc.completion.then((res) => ({ __exit: res.exitCode })),
-          new Promise((r) => setTimeout(() => r({ __timeout: true }), 120000)),
-        ]);
-
-        if (authRaced?.__exit != null) {
-          log(`Auth server exited early (code=${authRaced.__exit})`, 'fail');
-          setStatus('Auth server failed');
-          return;
-        }
-        if (authRaced?.__timeout) {
-          log('Timed out waiting for auth server on port 3000', 'fail');
-          setStatus('Auth timeout');
-          authProc.kill();
-          return;
-        }
-        log('Auth server ready.\n', 'pass');
-
-        log('--- Vite dev (proxy /api/auth → :3000) ---', 'dim');
+        log('--- Vite dev (Better Auth middleware on /api/auth) ---', 'dim');
         setStatus('Starting Vite…');
         const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
 
@@ -288,6 +259,9 @@
         log(String(err?.stack || err), 'fail');
         setStatus('Error — see log');
       } finally {
+        if (onServerReady) {
+          getProxyInstance().off('server-ready', onServerReady);
+        }
         runBtn.disabled = false;
       }
     });
