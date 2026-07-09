@@ -196,7 +196,14 @@ describe("pickBestMatch", () => {
 
 // Minimal registry fixture: each entry is "name@version" with its dependencies.
 function makeMockRegistry(
-  packages: Record<string, { version: string; dependencies?: Record<string, string> }[]>,
+  packages: Record<
+    string,
+    {
+      version: string;
+      dependencies?: Record<string, string>;
+      peerDependencies?: Record<string, string>;
+    }[]
+  >,
 ): RegistryClient {
   const cache = new Map<string, PackageMetadata>();
   for (const [name, releases] of Object.entries(packages)) {
@@ -206,6 +213,7 @@ function makeMockRegistry(
         name,
         version: rel.version,
         dependencies: rel.dependencies ?? {},
+        peerDependencies: rel.peerDependencies,
         dist: {
           tarball: `https://registry.example/${name}/-/${name}-${rel.version}.tgz`,
           shasum: `sha-${name}-${rel.version}`,
