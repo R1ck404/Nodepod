@@ -136,12 +136,12 @@ createRoot(document.getElementById("root")!).render(<h1>ok</h1>);`,
         ...sharedFiles,
         "/vite.config.ts": `import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import { auth } from "./server/auth";
-import { toNodeHandler } from "better-auth/node";
 function authServerPlugin(): Plugin {
   return {
     name: "better-auth",
-    configureServer(server) {
+    async configureServer(server) {
+      const { auth } = await import("./server/auth");
+      const { toNodeHandler } = await import("better-auth/node");
       server.middlewares.use("/api/auth", toNodeHandler(auth));
     },
   };

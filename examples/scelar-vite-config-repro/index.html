@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nodepod — scelar vite.config repro</title>
+  <style>
+    body { font-family: ui-monospace, monospace; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    #output { white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+    .pass { color: #a8e6a3; font-weight: 700; }
+    .fail { color: #e68a8a; font-weight: 700; }
+    .info { color: #8ac4e6; }
+  </style>
+</head>
+<body>
+  <h1>Scelar auth-template vite.config.ts repro</h1>
+  <p>Boots the exact sandbox layout: tailwind + react + auth plugin, no top-level better-auth imports.</p>
+  <div id="output"></div>
+  <script type="module">
+    const buildTag = new URL(import.meta.url).searchParams.get("build") || Date.now();
+    const { Nodepod } = await import(`/dist/index.mjs?b=${buildTag}`);
+
+    const out = document.getElementById("output");
+    const log = (text, cls = "") => {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = text + "\n";
+      out.appendChild(span);
+    };
+    const variant = new URL(import.meta.url).searchParams.get("variant") || "scelar";
+    const CONFIGS = {
+      scelar: `import path from "node:path";
+import { fileURLToPath } from "node:url";
+import tailwindcss from "@tailwindcss/vite";
+import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function authServerPlugin() {
+  return {
+    name: "scelar-better-auth",
+    async configureServer(server) {
+      const { ensureAuthReady } = await import("./server/auth");
+      const auth = ensureAuthReady();
+      const { getMigrations } = await import("better-auth/db/migration");
+      const { runMigrations } = await getMigrations(auth.options);
+      await runMigrations();
+      const { toNodeHandler } = await import("better-auth/node");
+      const handler = toNodeHandler(auth);
+      server.middlewares.use((req, res, next) => {
+        const url = req.url || "";
+        if (url === "/api/auth" || url.startsWith("/api/auth/")) {
+          return handler(req, res);
+        }
+        next();
+      });
+    },
+  };
+}
+
+export default defineConfig({
+  plugins: [react(), tailwindcss(), authServerPlugin()],
+  resolve: {
+    alias: {
+      "~": path.resolve(__dirname, "src"),
+    },
+  },
+});`,
+      tailwind: `import tailwindcss from "@tailwindcss/vite";
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({ plugins: [react(), tailwindcss()] });`,
+      react: `import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({ plugins: [react()] });`,
+    };
+
+    const VITE_CONFIG = CONFIGS[variant] || CONFIGS.scelar;
+    log(`Variant: ${variant}`, "info");
+
+    const viteRange = new URL(import.meta.url).searchParams.get("vite") || "^5.4.11";
+    const brokenOrder = new URL(import.meta.url).searchParams.get("order") === "broken";
+    const devDeps = brokenOrder
+      ? {
+          "@tailwindcss/vite": "^4.2.2",
+          "@vitejs/plugin-react": "^4.3.4",
+          tailwindcss: "^4.2.2",
+          vite: viteRange,
+        }
+      : {
+          vite: viteRange,
+          "@tailwindcss/vite": "^4.2.2",
+          "@vitejs/plugin-react": "^4.3.4",
+          tailwindcss: "^4.2.2",
+        };
+    log(`package.json devDeps order: ${brokenOrder ? "broken (tailwind before vite)" : "fixed (vite first)"}`, "info");
+
+    const pkg = {
+      name: "scelar-app",
+      private: true,
+      type: "module",
+      scripts: { dev: "vite --port 5173 --strictPort --host" },
+      dependencies: {
+        react: "^18.3.1",
+        "react-dom": "^18.3.1",
+        "react-router": "^7.6.0",
+        "better-auth": "^1.6.23",
+      },
+      devDependencies: devDeps,
+    };
+
+    let stderr = "";
+    let ready = false;
+
+    log("Booting Nodepod…", "info");
+    const pod = await Nodepod.boot({
+      workdir: "/",
+      enableSnapshotCache: false,
+      files: {
+        "/package.json": JSON.stringify(pkg, null, 2),
+        "/vite.config.ts": VITE_CONFIG,
+        "/index.html": `<!doctype html><html><body><div id="root"></div><script type="module" src="/src/main.tsx"><\/script></body></html>`,
+        "/src/main.tsx": `import { createRoot } from "react-dom/client"; createRoot(document.getElementById("root")).render("ok");`,
+      },
+      onServerReady: (port) => {
+        if (port === 5173) ready = true;
+      },
+    });
+
+    log("Installing deps…", "info");
+    await pod.packages.installFromManifest("/package.json", { withDevDeps: true });
+    try {
+      const vitePkg = JSON.parse(await pod.fs.readFile("/node_modules/vite/package.json", "utf-8"));
+      log(`Installed vite@${vitePkg.version}`, "info");
+    } catch (e) {
+      log(`Could not read vite version: ${e}`, "info");
+    }
+
+    log("Starting vite…", "info");
+    const proc = await pod.spawn("npm", ["run", "dev"], { cwd: "/" });
+    proc.on("error", (c) => { stderr += c; log(c.trimEnd(), "fail"); });
+    proc.on("output", (c) => log(c.trimEnd()));
+
+    const result = await Promise.race([
+      proc.completion.then((res) => ({ kind: "exit", res })),
+      new Promise((resolve) => {
+        const iv = setInterval(() => {
+          if (ready) {
+            clearInterval(iv);
+            resolve({ kind: "ready" });
+          }
+        }, 250);
+        setTimeout(() => {
+          clearInterval(iv);
+          resolve({ kind: "timeout" });
+        }, 120000);
+      }),
+    ]);
+
+    const configLoadFailed = /failed to load config|returned `object`, but expected `object`/i.test(stderr);
+    if (result.kind === "ready" && !configLoadFailed) {
+      log("\nPASS — vite loaded config and dev server is ready on :5173", "pass");
+      proc.kill();
+    } else if (configLoadFailed) {
+      log("\nFAIL — reproduced config load error (see stderr above)", "fail");
+    } else if (result.kind === "exit") {
+      log(`\nFAIL — vite exited with code ${result.res.exitCode}`, "fail");
+    } else {
+      log("\nFAIL — timed out waiting for vite", "fail");
+    }
+
+    pod.teardown();
+  </script>
+</body>
+</html>

@@ -325,8 +325,19 @@ export async function resolveFromManifest(
     Object.assign(allDeps, manifest.devDependencies);
   }
 
-  for (const [depName, depRange] of Object.entries(allDeps)) {
-    await walkDependency(depName, depRange, state);
+  const entries = Object.entries(allDeps);
+
+  // Claim root slots for every direct manifest dep before walking transitive
+  // edges or auto-installed peers. Otherwise a plugin's peer range (e.g.
+  // @tailwindcss/vite wanting vite@^5||^8) can hoist a newer major before
+  // the project's own vite@^5 devDependency is seen.
+  for (const [depName, depRange] of entries) {
+    await walkDependency(depName, depRange, state, "", { walkEdges: false });
+  }
+
+  // Walk transitive and peer edges for each direct manifest dependency.
+  for (const [depName] of entries) {
+    await walkDependencyEdges(depName, state);
   }
 
   return state.completed;
@@ -350,7 +361,9 @@ async function walkDependency(
   versionConstraint: string,
   state: TreeWalkState,
   parentPath: string = "",
+  options: { walkEdges?: boolean } = {},
 ): Promise<void> {
+  const walkEdges = options.walkEdges !== false;
   const { rootPromises, placementPromises, completed } = state;
 
   // npm aliases: fetch the real package but install under the alias name
@@ -377,6 +390,7 @@ async function walkDependency(
         installName,
         versionConstraint,
         state,
+        walkEdges,
       );
       deferred.resolve(resolved);
     } catch (err) {
@@ -455,13 +469,14 @@ function createDeferred<T>(): Deferred<T> {
 }
 
 // Fetch the manifest for fetchName, choose a version, record the entry at
-// placementKey, and recursively walk its edges.
+// placementKey, and optionally walk transitive/peer edges.
 async function installPackageAt(
   placementKey: string,
   fetchName: string,
   installName: string,
   versionConstraint: string,
   state: TreeWalkState,
+  walkEdges: boolean = true,
 ): Promise<ResolvedDependency> {
   const { registry, completed, config } = state;
 
@@ -499,6 +514,38 @@ async function installPackageAt(
   };
   completed.set(placementKey, resolved);
 
+  if (walkEdges) {
+    await walkEdgesForPackage(placementKey, installName, versionInfo, state);
+  }
+
+  return resolved;
+}
+
+async function walkDependencyEdges(
+  placementKey: string,
+  state: TreeWalkState,
+): Promise<void> {
+  const resolved = state.completed.get(placementKey);
+  if (!resolved) return;
+
+  const metadata = await state.registry.fetchManifest(resolved.name);
+  const versionInfo = metadata.versions[resolved.version];
+  if (!versionInfo) return;
+
+  await walkEdgesForPackage(
+    placementKey,
+    resolved.name,
+    versionInfo,
+    state,
+  );
+}
+
+async function walkEdgesForPackage(
+  placementKey: string,
+  installName: string,
+  versionInfo: VersionDetail,
+  state: TreeWalkState,
+): Promise<void> {
   // non-optional peers are included (npm v7+ behaviour)
   const edges: Record<string, string> = {};
 
@@ -566,8 +613,6 @@ async function installPackageAt(
       ),
     );
   }
-
-  return resolved;
 }
 
 // ---------------------------------------------------------------------------

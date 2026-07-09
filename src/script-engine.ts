@@ -847,33 +847,37 @@ function createSyncPromise(): typeof Promise {
 
 const SyncPromiseClass = createSyncPromise();
 
+function toImportNamespace(loaded: unknown): Record<string, unknown> {
+  if (loaded == null || (typeof loaded !== "object" && typeof loaded !== "function")) {
+    return { default: loaded };
+  }
+
+  const mod = loaded as Record<string, unknown>;
+  const ns: Record<string, unknown> = {};
+  for (const key of Object.getOwnPropertyNames(mod)) {
+    ns[key] = mod[key];
+  }
+
+  // import() should yield a module namespace like Node. Hoist named exports
+  // off default when the CJS interop layer only put them there.
+  const def = mod.default;
+  if (def && (typeof def === "object" || typeof def === "function")) {
+    for (const key of Object.getOwnPropertyNames(def)) {
+      if (key === "default") continue;
+      if (ns[key] === undefined) ns[key] = (def as Record<string, unknown>)[key];
+    }
+    if (ns.default === undefined) ns.default = def;
+  }
+
+  return ns;
+}
+
 function makeDynamicLoader(
   resolver: ResolverFn,
 ): (specifier: string) => SyncThenable<unknown> {
   return (specifier: string): SyncThenable<unknown> => {
     const loaded = resolver(specifier);
-    // Functions can have named exports as properties (e.g. Module.createRequire)
-    if (
-      loaded &&
-      (typeof loaded === "object" || typeof loaded === "function") &&
-      ("default" in (loaded as object) || "__esModule" in (loaded as object))
-    ) {
-      return new SyncThenable(loaded);
-    }
-    const spread =
-      loaded && (typeof loaded === "object" || typeof loaded === "function")
-        ? Object.getOwnPropertyNames(loaded as object).reduce(
-            (acc, key) => {
-              acc[key] = (loaded as any)[key];
-              return acc;
-            },
-            {} as Record<string, unknown>,
-          )
-        : {};
-    return new SyncThenable({
-      default: loaded,
-      ...spread,
-    });
+    return new SyncThenable(toImportNamespace(loaded));
   };
 }
 

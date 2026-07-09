@@ -355,6 +355,35 @@ describe("resolveDependencyTree — nested placement", () => {
     );
   });
 
+  it("honors direct manifest vite range regardless of devDependencies key order", async () => {
+    const registry = makeMockRegistry({
+      vite: [
+        { version: "5.4.21" },
+        { version: "8.1.4" },
+      ],
+      "@tailwindcss/vite": [
+        {
+          version: "4.2.2",
+          peerDependencies: { vite: "^5.2.0 || ^6 || ^7 || ^8" },
+        },
+      ],
+      "@vitejs/plugin-react": [{ version: "4.3.4", peerDependencies: { vite: "^5 || ^6 || ^7 || ^8" } }],
+      tailwindcss: [{ version: "4.2.2" }],
+    });
+    const tree = await resolveFromManifest(
+      {
+        devDependencies: {
+          "@tailwindcss/vite": "^4.2.2",
+          "@vitejs/plugin-react": "^4.3.4",
+          tailwindcss: "^4.2.2",
+          vite: "^5.4.11",
+        },
+      },
+      { registry, devDependencies: true },
+    );
+    expect(tree.get("vite")?.version).toBe("5.4.21");
+  });
+
   it("handles a package with no conflicts via resolveFromManifest", async () => {
     const registry = makeMockRegistry({
       a: [{ version: "1.0.0", dependencies: { b: "^1.0.0" } }],
