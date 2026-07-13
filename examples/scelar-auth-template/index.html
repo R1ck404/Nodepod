@@ -199,6 +199,8 @@
     }
 
     async function runPreview() {
+      const runStartedAt = performance.now();
+      const phaseTimings = {};
       runBtn.disabled = true;
       preview.removeAttribute('src');
       setStatus('Booting…');
@@ -229,7 +231,9 @@
         getProxyInstance().on('server-ready', onServerReady);
 
         log('Booting Nodepod (workdir=/project)…', 'info');
+        const bootStartedAt = performance.now();
         const pod = activePod ?? await Nodepod.boot({ workdir: VFS_ROOT });
+        phaseTimings.bootMs = performance.now() - bootStartedAt;
         if (!activePod) {
           activePod = pod;
           bootedHere = true;
@@ -248,8 +252,10 @@
 
         log('--- npm install ---', 'dim');
         setStatus('Installing dependencies…');
+        const installStartedAt = performance.now();
         const install = await runCommand(pod, 'npm', ['install']);
         const installRes = await install.completion;
+        phaseTimings.installMs = performance.now() - installStartedAt;
         if (installRes.exitCode !== 0) {
           throw new Error(`npm install failed (exit=${installRes.exitCode})`);
         }
@@ -258,6 +264,7 @@
 
         log('--- Vite dev (Better Auth middleware on /api/auth) ---', 'dim');
         setStatus('Starting Vite…');
+        const viteStartedAt = performance.now();
         const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
         activeDevProcess = devProc;
 
@@ -278,12 +285,30 @@
         }
 
         log(`\nVite ready: ${viteUrl}`, 'pass');
+        phaseTimings.viteReadyMs = performance.now() - viteStartedAt;
+        phaseTimings.totalMs = performance.now() - runStartedAt;
         setStatus(`Live — ${viteUrl}`);
+        window.__nodepodPerfResult = {
+          phases: phaseTimings,
+          runtime: pod.performanceStats(),
+          memory: pod.memoryStats(),
+          previewLoaded: false,
+        };
+        preview.addEventListener('load', () => {
+          phaseTimings.firstPreviewMs = performance.now() - viteStartedAt;
+          window.__nodepodPerfResult = {
+            phases: phaseTimings,
+            runtime: pod.performanceStats(),
+            memory: pod.memoryStats(),
+            previewLoaded: true,
+          };
+        }, { once: true });
         preview.src = viteUrl;
         measureMemory('steady state');
         log(`Runtime counters: ${JSON.stringify(pod.memoryStats())}`, 'dim');
         log('\nOpen the preview: Sign up or Log in, then visit protected routes.', 'info');
       } catch (err) {
+        window.__nodepodPerfError = String(err?.stack || err);
         log(String(err?.stack || err), 'fail');
         if (bootedHere && !activeDevProcess && activePod) {
           activePod.teardown();

@@ -37,3 +37,5 @@ coverage/
 
 # Local research / planning notes (Claude Code scratch)
 memory/
+test-results/
+playwright-report/

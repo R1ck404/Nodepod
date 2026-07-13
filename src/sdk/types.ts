@@ -1,5 +1,6 @@
 import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
+export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
 
 /* ---- Boot options ---- */
 
@@ -27,6 +28,9 @@ export interface NodepodOptions {
   memory?: MemoryHandlerOptions;
   /** Cache installed node_modules in IndexedDB for faster re-boots. Default: true. */
   enableSnapshotCache?: boolean;
+  /** Package snapshot backend. "auto" currently prefers IndexedDB; explicit
+   *  "opfs" canaries packfiles and falls back automatically. */
+  packageStore?: "auto" | "memory" | "opfs";
   /**
    * set to false to force SAB off even if the runtime has it.
    * useful for envs without COOP/COEP or for testing partial mode.

@@ -34,6 +34,7 @@ import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
+import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { getEsbuild } from "../helpers/esbuild-engine";
@@ -46,6 +47,10 @@ import {
 } from "../helpers/wasm-cache";
 import { getWorkerTransformCache } from "../threading/worker-transform-cache";
 import { invalidateBundleCache } from "../packages/browser-bundler";
+import {
+  PerformanceTracker,
+  type PerformanceStats,
+} from "../performance-tracker";
 
 let activeNodepodCount = 0;
 
@@ -115,6 +120,7 @@ export class Nodepod {
   private _sharedVFSBufferSize: number;
   private _disposed = false;
   private _unsubscribePressure: (() => void) | null = null;
+  private _performance: PerformanceTracker;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -128,6 +134,7 @@ export class Nodepod {
     sabEnabled: boolean,
     sharedVFSBufferSize: number | undefined,
     instanceId: string,
+    performanceTracker: PerformanceTracker,
   ) {
     this._volume = volume;
     this._packages = packages;
@@ -146,9 +153,10 @@ export class Nodepod {
     this._sharedVFSBufferSize =
       sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE;
     this.instanceId = instanceId;
+    this._performance = performanceTracker;
     this.fs = new NodepodFS(volume);
     activeNodepodCount++;
-    this._processManager = new ProcessManager(volume);
+    this._processManager = new ProcessManager(volume, performanceTracker);
     this._vfsBridge = new VFSBridge(volume);
 
     this._vfsBridge.setBroadcaster((path, content, excludePid) => {
@@ -231,6 +239,8 @@ export class Nodepod {
   /* ---- Static factory ---- */
 
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
+    const performanceTracker = new PerformanceTracker();
+    const stopBoot = performanceTracker.start("boot.total");
     if (typeof Worker === "undefined") {
       throw new Error(
         "[Nodepod] Web Workers are required. Nodepod cannot run without Web Worker support.",
@@ -283,14 +293,27 @@ export class Nodepod {
     // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
     let snapshotCache = null;
     if (opts.enableSnapshotCache !== false) {
+      const stopCacheOpen = performanceTracker.start("boot.snapshotCache");
       try {
-        snapshotCache = await openSnapshotCache();
+        if (opts.packageStore === "opfs") {
+          snapshotCache = await openOPFSSnapshotCache();
+          if (snapshotCache) performanceTracker.increment("storage.opfs");
+        }
+        if (!snapshotCache) {
+          snapshotCache = await openSnapshotCache();
+          if (snapshotCache) performanceTracker.increment("storage.indexedDb");
+        }
       } catch {
         /* IDB unavailable */
+      } finally {
+        stopCacheOpen();
       }
     }
 
-    const packages = new DependencyInstaller(volume, { snapshotCache });
+    const packages = new DependencyInstaller(volume, {
+      snapshotCache,
+      performanceTracker,
+    });
     const proxy = getProxyInstance({
       onServerReady: opts.onServerReady,
     });
@@ -312,6 +335,7 @@ export class Nodepod {
       sabEnabled,
       opts.sharedVFSBufferSize,
       makeInstanceId(),
+      performanceTracker,
     );
     nodepod._wasiFsChannel = wasiFsChannel;
 
@@ -360,6 +384,7 @@ export class Nodepod {
       "serviceWorker" in navigator;
 
     if (swEnabled) {
+      const stopServiceWorker = performanceTracker.start("boot.serviceWorker");
       try {
         await proxy.initServiceWorker({
           swUrl: opts.swUrl,
@@ -381,9 +406,12 @@ export class Nodepod {
             e,
           );
         }
+      } finally {
+        stopServiceWorker();
       }
     }
 
+    stopBoot();
     return nodepod;
   }
 
@@ -838,6 +866,10 @@ export class Nodepod {
   }
 
   /* ---- Performance stats ---- */
+
+  performanceStats(): PerformanceStats {
+    return this._performance.snapshot();
+  }
 
   memoryStats(): {
     vfs: {

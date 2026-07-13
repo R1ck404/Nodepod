@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "browser": "chromium",
+  "nodepodBuild": "1.9.8",
+  "fixture": "scelar-auth-template",
+  "fixtureDigest": "scelar-auth-template-v1",
+  "states": ["cold", "warm"],
+  "runs": 5,
+  "targets": {
+    "warmInstallP50Ms": 250,
+    "viteReadyImprovementPercent": 30,
+    "coldInstallImprovementPercent": 25,
+    "steadyHeapMB": 400,
+    "coldInstallPeakMB": 550
+  }
+}

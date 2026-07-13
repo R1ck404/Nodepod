@@ -87,6 +87,7 @@
     "type-check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser:perf": "playwright test --config playwright.perf.config.ts",
     "bench": "vitest bench",
     "bench:run": "vitest bench --run",
     "prepublishOnly": "pnpm run build:publish"
@@ -131,6 +132,7 @@
     }
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/node": "^25.0.10",
     "@types/pako": "^2.0.4",
     "better-auth": "^1.2.10",

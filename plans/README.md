@@ -49,7 +49,22 @@ Recommended order (memory-first): **012 → 011 → 013 → 014** (memory tier),
 then **015 → 016** (install tier), then **017 → 018 → 019**, then the **020**
 spike. 012 is the quick win; 011 is the big one.
 
-Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
+Status values: TODO | IN PROGRESS | EXPERIMENTAL | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
+
+## Batch 3 — end-to-end speed
+
+Plans 021–027 preserve automatic Node-compatible behavior while reducing boot,
+spawn, install, filesystem, and module-loading latency.
+
+| Plan | Title | Status |
+|------|-------|--------|
+| 021 | Browser runtime benchmarks | IN PROGRESS |
+| 022 | Process startup | IN PROGRESS |
+| 023 | Mounted package snapshots | IN PROGRESS |
+| 024 | Lazy filesystem buffers | IN PROGRESS |
+| 025 | Streaming package installation | IN PROGRESS |
+| 026 | Resolution and transform cache | IN PROGRESS |
+| 027 | OPFS package storage | EXPERIMENTAL |
 
 ## Recommended sequence
 

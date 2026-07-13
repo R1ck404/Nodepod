@@ -175,6 +175,8 @@ export type {
   StatResult,
   Snapshot,
   SpawnOptions,
+  PerformanceStats,
+  PerformanceTiming,
 } from "./sdk/types";
 export { MemoryHandler, LRUCache } from "./memory-handler";
 export type { MemoryHandlerOptions } from "./memory-handler";
