@@ -292,7 +292,7 @@ export class Nodepod {
 
     // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
     let snapshotCache = null;
-    if (opts.enableSnapshotCache !== false) {
+    if (opts.enableSnapshotCache !== false && opts.packageStore !== "memory") {
       const stopCacheOpen = performanceTracker.start("boot.snapshotCache");
       try {
         if (opts.packageStore === "opfs") {
