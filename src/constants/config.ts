@@ -201,7 +201,7 @@ export const TIMEOUTS = {
 export const LIMITS = {
   MAX_RESOLVE_DEPTH: 50,
   MODULE_CACHE_MAX: 2000,
-  MAX_WORKERS_CAP: 6,
+  MAX_WORKERS_CAP: 4,
 } as const;
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,14 @@ const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, s
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
 let _nextRequestId = 1;
 let _nextHttpClientId = 1;
+const MAX_CHILD_CAPTURE_CHARS = 4 * 1024 * 1024;
+
+function appendCaptured(current: string, chunk: string): string {
+  const next = current + chunk;
+  return next.length > MAX_CHILD_CAPTURE_CHARS
+    ? next.slice(-Math.floor(MAX_CHILD_CAPTURE_CHARS * 0.75))
+    : next;
+}
 
 const SQLITE_SAB_PENDING = 0;
 const SQLITE_SAB_OK = 1;
@@ -302,12 +310,12 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
 
   installSqliteHostBridge();
 
+  // DatabaseSync is synchronous; warm automatically before user code runs so
+  // callers get normal Node.js behavior without a preload API or an async gap.
   try {
     await warmSqliteEngine();
   } catch (err) {
-    if (typeof console !== "undefined") {
-      console.warn("[node:sqlite] worker init preload failed:", err);
-    }
+    console.warn("[node:sqlite] automatic initialization failed:", err);
   }
 
   _initialized = true;
@@ -997,10 +1005,10 @@ export function spawnChild(
 
       _childOutputCallbacks.set(requestId, (stream: string, data: string) => {
         if (stream === "stdout") {
-          stdout += data;
+          stdout = appendCaptured(stdout, data);
           opts?.onStdout?.(data);
         } else {
-          stderr += data;
+          stderr = appendCaptured(stderr, data);
           opts?.onStderr?.(data);
         }
       });

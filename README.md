@@ -160,6 +160,10 @@ await nodepod.restore(snapshot);
 | `watermark` | `boolean` | Show nodepod badge in previews (default `true`) |
 | `onServerReady` | `(port, url) => void` | Called when a virtual server starts |
 | `allowedFetchDomains` | `string[] \| null` | Extra CORS proxy domains. `null` = allow all |
+| `spawnSnapshot` | `"lean" \| "full"` | Worker filesystem snapshot mode. Defaults to memory-efficient `"lean"` with SharedArrayBuffer and transparently falls back to `"full"` without it |
+| `preloadEsbuild` | `boolean` | Warm esbuild during boot. Defaults to `false`; first use initializes it automatically |
+| `sharedVFSBufferSize` | `number` | Capacity of the optional SharedFS mirror, allocated only when `sharedFSBuffer` is first read |
+| `memory` | `MemoryHandlerOptions` | Advanced memory budget/cache overrides. The default soft budget is 400 MB |
 
 ### Instance methods
 
@@ -180,6 +184,13 @@ await nodepod.restore(snapshot);
 | `port(num)` | Get preview URL for a port |
 | `setPreviewScript(js)` | Inject JS into preview iframes |
 | `clearPreviewScript()` | Remove injected script |
+| `memoryStats()` | Current VFS, process, worker, port, cache, SharedFS, and heap counters |
+| `teardown()` | Terminal, idempotent cleanup of the pod and all owned resources |
+
+Keep one pod for each genuinely active preview and reuse it when project files
+change. Call `teardown()` when a preview is discarded; operational calls after
+teardown throw. Nodepod performs SQLite, esbuild, package extraction, and lazy
+filesystem preparation automatically, so application code needs no warm-up API.
 
 ### Process events
 

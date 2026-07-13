@@ -108,15 +108,11 @@ async function mainThreadExtract(
       relative = segments.slice(task.stripComponents).join("/");
     }
 
-    let data: string;
-    let isBinary = false;
-    try {
-      data = new TextDecoder("utf-8", { fatal: true }).decode(entry.payload);
-    } catch {
-      data = bytesToBase64(entry.payload);
-      isBinary = true;
-    }
-    files.push({ path: relative, data, isBinary });
+    files.push({
+      path: relative,
+      data: new Uint8Array(entry.payload),
+      isBinary: true,
+    });
   }
 
   const result: ExtractResult = { type: "extract", id: task.id, files };

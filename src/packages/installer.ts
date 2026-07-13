@@ -372,7 +372,9 @@ export class DependencyInstaller {
     }
 
     // Safe to batch aggressively since extract + transform are offloaded to workers
-    const WORKER_COUNT = 12;
+    // archive inflation is serialized separately; four fetch/transform lanes
+    // recover cold-install speed without recreating the old six-inflate peak.
+    const WORKER_COUNT = 4;
     onProgress?.(`Downloading ${pending.length} package(s)...`);
 
     for (let offset = 0; offset < pending.length; offset += WORKER_COUNT) {

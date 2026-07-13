@@ -4,7 +4,7 @@
 // lifetime of the worker.
 
 const DEFAULT_MAX_ENTRIES = 512;
-const DEFAULT_MAX_BYTES = 32 * 1024 * 1024; // UTF-16 estimate: value.length * 2
+const DEFAULT_MAX_BYTES = 24 * 1024 * 1024; // UTF-16 estimate: value.length * 2
 
 export class LruTransformCache {
   private _map = new Map<string, string>();

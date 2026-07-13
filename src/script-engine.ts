@@ -102,7 +102,7 @@ import * as seaPolyfill from "./polyfills/sea";
 import * as sqlitePolyfill from "./polyfills/sqlite";
 import * as quicPolyfill from "./polyfills/quic";
 import * as lightningcssPolyfill from "./polyfills/lightningcss";
-import { createNapiWorkerFactory, isNapiWasiWorkerScript, prewarmWasiPool } from "./helpers/napi-wasm-worker";
+import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker";
 import {
   promises as streamPromises,
   Readable,
@@ -2192,7 +2192,6 @@ export class ScriptEngine {
       });
       // prewarm now while the parent thread is free. chrome wont schedule
       // child workers spawned from a parent thats about to Atomics.wait
-      try { prewarmWasiPool(); } catch (err) { _nativeConsole.warn("[Nodepod] WASI pool prewarm failed:", err); }
     }
 
     // Next.js createAsyncLocalStorage() prefers globalThis.AsyncLocalStorage over
@@ -2657,7 +2656,6 @@ export class ScriptEngine {
     code: string,
     filename: string = "/index.js",
   ): { exports: unknown; module: ModuleRecord } {
-    this._trimModuleCache();
     const dir = pathPolyfill.dirname(filename);
     // Only write when the content differs to avoid triggering file watchers
     // (e.g. nodemon/chokidar) with a no-op write that causes restart loops.

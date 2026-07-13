@@ -24,8 +24,20 @@ export class VFSBridge {
     this._broadcaster = fn;
   }
 
-  setSharedVFS(controller: SharedVFSController): void {
+  setSharedVFS(controller: SharedVFSController, hydrate = false): void {
     this._sharedVFS = controller;
+    if (hydrate) this._hydrateSharedVFS();
+  }
+
+  clearSharedVFS(): void {
+    this._sharedVFS = null;
+  }
+
+  private _hydrateSharedVFS(): void {
+    this._walkVolume("/", (path, isDirectory, content) => {
+      if (isDirectory) this._sharedVFSWriteDirectory(path);
+      else if (content) this._sharedVFSWrite(path, content);
+    });
   }
 
   // packs all files into one ArrayBuffer plus a manifest.

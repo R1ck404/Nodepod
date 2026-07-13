@@ -37,6 +37,17 @@ import { openSnapshotCache } from "../persistence/idb-cache";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { getEsbuild } from "../helpers/esbuild-engine";
+import { disposeEsbuild } from "../helpers/esbuild-engine";
+import { disposePool, poolStats } from "../threading/offload";
+import {
+  disposeWasmCache,
+  reclaimWasmCache,
+  wasmCacheStats,
+} from "../helpers/wasm-cache";
+import { getWorkerTransformCache } from "../threading/worker-transform-cache";
+import { invalidateBundleCache } from "../packages/browser-bundler";
+
+let activeNodepodCount = 0;
 
 // the SharedVFS is the synchronous filesystem visible to WASI and nested
 // workers. unlike the canonical MemoryVolume, it cannot grow after being
@@ -101,6 +112,9 @@ export class Nodepod {
   private _handler: MemoryHandler;
   private _sabEnabled: boolean;
   private _wasiFsChannel: BroadcastChannel | null = null;
+  private _sharedVFSBufferSize: number;
+  private _disposed = false;
+  private _unsubscribePressure: (() => void) | null = null;
 
   /* ---- Construction (use Nodepod.boot()) ---- */
 
@@ -121,9 +135,19 @@ export class Nodepod {
     this._cwd = cwd;
     this._env = env;
     this._handler = handler;
+    this._unsubscribePressure = handler.onPressure(() => {
+      // only discard reproducible data; live modules, processes, servers and
+      // writable VFS files are deliberately untouched.
+      handler.flush();
+      invalidateBundleCache();
+      reclaimWasmCache();
+    });
     this._sabEnabled = sabEnabled;
+    this._sharedVFSBufferSize =
+      sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE;
     this.instanceId = instanceId;
     this.fs = new NodepodFS(volume);
+    activeNodepodCount++;
     this._processManager = new ProcessManager(volume);
     this._vfsBridge = new VFSBridge(volume);
 
@@ -144,24 +168,15 @@ export class Nodepod {
 
     if (sabEnabled) {
       try {
-        this._sharedVFS = new SharedVFSController(
-          sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE,
-        );
-        this._processManager.setSharedBuffer(this._sharedVFS.buffer);
-        this._vfsBridge.setSharedVFS(this._sharedVFS);
-      } catch (e) {
-        // COOP/COEP headers probably missing
-      }
-
-      try {
         this._syncChannel = new SyncChannelController();
         this._processManager.setSyncBuffer(this._syncChannel.buffer);
       } catch (e) {
         // SyncChannel init failed
       }
 
-      // SAB was detected but controllers failed, probably COOP/COEP
-      if (!this._sharedVFS || !this._syncChannel) {
+      // core SAB features only depend on the small sync channel; the optional
+      // SharedFS mirror is allocated lazily by sharedFSBuffer.
+      if (!this._syncChannel) {
         this._sabEnabled = false;
         console.warn(
           "[Nodepod] SharedArrayBuffer init failed mid-boot, features disabled.",
@@ -308,7 +323,7 @@ export class Nodepod {
 
     // warm the shared esbuild instance while the rest of boot proceeds;
     // fire-and-forget — consumers await getEsbuild() themselves
-    if (opts.preloadEsbuild !== false && typeof window !== "undefined") {
+    if (opts.preloadEsbuild === true && typeof window !== "undefined") {
       getEsbuild().catch(() => {});
     }
 
@@ -380,6 +395,7 @@ export class Nodepod {
     args?: string[],
     opts?: SpawnOptions,
   ): Promise<NodepodProcess> {
+    this._assertActive();
     const proc = new NodepodProcess();
     const execCwd = opts?.cwd ?? this._cwd;
     const combinedEnv = { ...this._env, ...(opts?.env ?? {}) };
@@ -479,6 +495,7 @@ export class Nodepod {
   /* ---- createTerminal() ---- */
 
   createTerminal(opts: TerminalOptions): NodepodTerminal {
+    this._assertActive();
     const terminal = new NodepodTerminal(opts);
     terminal.setCwd(this._cwd);
     const customCommands = opts.customCommands ?? {};
@@ -730,10 +747,12 @@ export class Nodepod {
   // Useful for setting up a communication bridge between the main window and
   // the preview iframe, injecting polyfills, analytics, etc.
   async setPreviewScript(script: string): Promise<void> {
+    this._assertActive();
     this._proxy.setPreviewScript(this.instanceId, script);
   }
 
   async clearPreviewScript(): Promise<void> {
+    this._assertActive();
     this._proxy.setPreviewScript(this.instanceId, null);
   }
 
@@ -742,6 +761,7 @@ export class Nodepod {
   // preview url for a server on this port, or null. scoped to instanceId so
   // multiple Nodepods on one page don't collide
   port(num: number): string | null {
+    this._assertActive();
     if (this._proxy.activePorts(this.instanceId).includes(num)) {
       return this._proxy.serverUrl(this.instanceId, num);
     }
@@ -758,6 +778,7 @@ export class Nodepod {
   ]);
 
   snapshot(opts?: SnapshotOptions): Snapshot {
+    this._assertActive();
     const shallow = opts?.shallow ?? true;
     return this._volume.toSnapshot(
       undefined,
@@ -766,6 +787,7 @@ export class Nodepod {
   }
 
   async restore(snapshot: Snapshot, opts?: SnapshotOptions): Promise<void> {
+    this._assertActive();
     const autoInstall = opts?.autoInstall ?? true;
 
     // Swap the internal tree
@@ -781,6 +803,8 @@ export class Nodepod {
   /* ---- teardown ---- */
 
   teardown(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     if (this._unwatchVFS) {
       this._unwatchVFS();
       this._unwatchVFS = null;
@@ -796,8 +820,21 @@ export class Nodepod {
       this._wasiFsChannel = null;
     }
     this._processManager.teardown();
+    this._vfsBridge.clearSharedVFS();
+    this._sharedVFS = null;
+    this._syncChannel = null;
     this._volume.dispose();
     this._handler.destroy();
+    this._unsubscribePressure?.();
+    this._unsubscribePressure = null;
+    activeNodepodCount = Math.max(0, activeNodepodCount - 1);
+    if (activeNodepodCount === 0) {
+      disposePool();
+      disposeWasmCache();
+      disposeEsbuild();
+      getWorkerTransformCache().clear();
+      ProcessManager.disposeGlobalResources();
+    }
   }
 
   /* ---- Performance stats ---- */
@@ -808,13 +845,32 @@ export class Nodepod {
       totalBytes: number;
       dirCount: number;
       watcherCount: number;
+      lazyResidentBytes: number;
     };
     engine: { moduleCacheSize: number; transformCacheSize: number };
+    runtime: {
+      processes: number;
+      workers: number;
+      messagePorts: number;
+      pendingHttp: number;
+      sharedFSAllocated: boolean;
+      sharedFSBytes: number;
+      sharedFSUsedBytes: number;
+      wasmCacheEntries: number;
+      budgetMB: number;
+    };
     heap: { usedMB: number; totalMB: number; limitMB: number } | null;
   } {
     const vfs = this._volume.getStats();
     // Engine stats are per-worker; main thread no longer runs a ScriptEngine
-    const engine = { moduleCacheSize: 0, transformCacheSize: 0 };
+    const engine = {
+      moduleCacheSize: 0,
+      transformCacheSize: this._handler.transformCache.size,
+    };
+    const resources = this._processManager.resourceStats();
+    const pool = poolStats();
+    const wasm = wasmCacheStats();
+    const shared = this._sharedVFS?.getStats();
     let heap: { usedMB: number; totalMB: number; limitMB: number } | null =
       null;
     const perf =
@@ -826,7 +882,22 @@ export class Nodepod {
         limitMB: Math.round((perf.memory.jsHeapSizeLimit / 1048576) * 10) / 10,
       };
     }
-    return { vfs, engine, heap };
+    return {
+      vfs,
+      engine,
+      heap,
+      runtime: {
+        processes: resources.processes,
+        workers: resources.processes + pool.total,
+        messagePorts: resources.messagePorts,
+        pendingHttp: resources.pendingHttp,
+        sharedFSAllocated: !!shared,
+        sharedFSBytes: shared?.bufferSize ?? 0,
+        sharedFSUsedBytes: shared?.dataUsed ?? 0,
+        wasmCacheEntries: wasm.entries,
+        budgetMB: this._handler.options.budgetMB,
+      },
+    };
   }
 
   /**
@@ -840,7 +911,18 @@ export class Nodepod {
    * so callers can detect an undersized mirror.
    */
   get sharedFSBuffer(): SharedArrayBuffer | null {
-    return this._sharedVFS?.buffer ?? null;
+    this._assertActive();
+    if (!this._sabEnabled) return null;
+    if (!this._sharedVFS) {
+      try {
+        const shared = new SharedVFSController(this._sharedVFSBufferSize);
+        this._vfsBridge.setSharedVFS(shared, true);
+        this._sharedVFS = shared;
+      } catch {
+        return null;
+      }
+    }
+    return this._sharedVFS.buffer;
   }
 
   /**
@@ -884,5 +966,9 @@ export class Nodepod {
   /** true if SAB features are active on this instance */
   get isSharedArrayBufferEnabled(): boolean {
     return this._sabEnabled;
+  }
+
+  private _assertActive(): void {
+    if (this._disposed) throw new Error("[Nodepod] Instance has been torn down");
   }
 }

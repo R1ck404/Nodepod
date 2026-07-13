@@ -189,6 +189,7 @@ export function makeSystemError(
 
 export class MemoryVolume {
   private tree: VolumeNode;
+  private _disposed = false;
   private textEncoder = new TextEncoder();
   private textDecoder = new TextDecoder();
   // lean spawn mode (see VolumeMissHandler)
@@ -199,6 +200,9 @@ export class MemoryVolume {
   // paths invalidated by main (large-file broadcast) — re-fetchable via the
   // miss handler even when outside the lazy dir names
   private _lazyInvalidated = new Set<string>();
+  private _lazyResident = new Map<string, number>();
+  private _lazyResidentBytes = 0;
+  private _lazyResidentMaxBytes: number;
   // unique ino per path. rust walkdir with follow_links(true) tracks visited
   // (dev,ino) pairs to break cycles, so ino=0 for everything makes it drop
   // every file as "already visited".
@@ -271,8 +275,9 @@ export class MemoryVolume {
   private subscribers = new Map<string, Set<VolumeEventHandler>>();
   private _handler: MemoryHandler | null;
 
-  constructor(handler?: MemoryHandler | null) {
+  constructor(handler?: MemoryHandler | null, lazyResidentMaxBytes = 64 * 1024 * 1024) {
     this._handler = handler ?? null;
+    this._lazyResidentMaxBytes = Math.max(1, lazyResidentMaxBytes);
     this.tree = {
       kind: 'directory',
       children: new Map(),
@@ -317,7 +322,7 @@ export class MemoryVolume {
 
   // ---- Stats ----
 
-  getStats(): { fileCount: number; totalBytes: number; dirCount: number; watcherCount: number } {
+  getStats(): { fileCount: number; totalBytes: number; dirCount: number; watcherCount: number; lazyResidentBytes: number } {
     let fileCount = 0;
     let totalBytes = 0;
     let dirCount = 0;
@@ -335,14 +340,29 @@ export class MemoryVolume {
     walk(this.tree);
     let watcherCount = 0;
     for (const set of this.activeWatchers.values()) watcherCount += set.size;
-    return { fileCount, totalBytes, dirCount, watcherCount };
+    return { fileCount, totalBytes, dirCount, watcherCount, lazyResidentBytes: this._lazyResidentBytes };
   }
 
-  /** Clean up all watchers, subscribers, and global listeners. */
+  /** Clean up all owned data and listeners. A disposed volume is empty. */
   dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     this.activeWatchers.clear();
     this.subscribers.clear();
     this.globalChangeListeners.clear();
+    this._missHandler = null;
+    this._lazyDirNames = [];
+    this._lazyListed.clear();
+    this._lazyNegative.clear();
+    this._lazyInvalidated.clear();
+    this._lazyResident.clear();
+    this._lazyResidentBytes = 0;
+    this._inos.clear();
+    this.tree = {
+      kind: 'directory',
+      children: new Map(),
+      modified: Date.now(),
+    };
     if (this._handler) {
       this._handler.statCache.clear();
       this._handler.pathNormCache.clear();
@@ -412,7 +432,10 @@ export class MemoryVolume {
         if (parentDir !== "/" && !vol.existsSync(parentDir)) {
           vol.mkdirSync(parentDir, { recursive: true });
         }
-        const content = fullData.slice(entry.offset, entry.offset + entry.length);
+        // the transferred snapshot has a single owner in this worker; keeping
+        // views avoids a second full filesystem copy; later writes replace the
+        // node content and are naturally copy-on-write.
+        const content = fullData.subarray(entry.offset, entry.offset + entry.length);
         vol.writeInternal(vol.normalize(entry.path), content, false);
       }
     }
@@ -454,6 +477,7 @@ export class MemoryVolume {
   // ---- Path utilities ----
 
   private normalize(p: string): string {
+    if (this._disposed) throw new Error('[Nodepod] Filesystem has been disposed');
     if (this._handler) {
       const cached = this._handler.pathNormCache.get(p);
       if (cached !== undefined) return cached;
@@ -591,6 +615,7 @@ export class MemoryVolume {
     // array from postMessage, Node Buffer). storing anything but a Uint8Array
     // would break every downstream read
     const bytes = this.toBytes(data);
+    this._untrackLazyResident(norm);
 
     parent.children!.set(name, {
       kind: 'file',
@@ -619,6 +644,68 @@ export class MemoryVolume {
     this._lazyDirNames = handler ? lazyDirNames.slice() : [];
     this._lazyListed.clear();
     this._lazyNegative.clear();
+    if (!handler) {
+      this._lazyResident.clear();
+      this._lazyResidentBytes = 0;
+    }
+  }
+
+  private _untrackLazyResident(path: string): void {
+    const size = this._lazyResident.get(path);
+    if (size === undefined) return;
+    this._lazyResident.delete(path);
+    this._lazyResidentBytes -= size;
+  }
+
+  private _untrackLazyTree(prefix: string): void {
+    for (const path of Array.from(this._lazyResident.keys())) {
+      if (path === prefix || path.startsWith(prefix + '/')) {
+        this._untrackLazyResident(path);
+      }
+    }
+  }
+
+  private _remapLazyTree(from: string, to: string): void {
+    const moved: Array<[string, number]> = [];
+    for (const [path, size] of this._lazyResident) {
+      if (path === from || path.startsWith(from + '/')) {
+        moved.push([to + path.slice(from.length), size]);
+        this._lazyResident.delete(path);
+      }
+    }
+    for (const [path, size] of moved) this._lazyResident.set(path, size);
+  }
+
+  private _trackLazyResident(path: string, node: VolumeNode): void {
+    if (!node.content || !this._isUnderLazy(path)) return;
+    this._untrackLazyResident(path);
+    const size = node.content.byteLength;
+    this._lazyResident.set(path, size);
+    this._lazyResidentBytes += size;
+
+    while (
+      this._lazyResidentBytes > this._lazyResidentMaxBytes &&
+      this._lazyResident.size > 1
+    ) {
+      const oldest = this._lazyResident.keys().next().value as string | undefined;
+      if (!oldest) break;
+      const oldSize = this._lazyResident.get(oldest)!;
+      this._lazyResident.delete(oldest);
+      this._lazyResidentBytes -= oldSize;
+      const oldNode = this.locateRaw(oldest);
+      if (oldNode?.kind === 'file') {
+        oldNode.content = undefined;
+        oldNode.lazy = true;
+        oldNode.lazySize = oldSize;
+      }
+    }
+  }
+
+  private _touchLazyResident(path: string): void {
+    const size = this._lazyResident.get(path);
+    if (size === undefined) return;
+    this._lazyResident.delete(path);
+    this._lazyResident.set(path, size);
   }
 
   // Main broadcast said this file changed but was too large to ship bytes.
@@ -628,6 +715,7 @@ export class MemoryVolume {
   markLazyInvalidated(p: string): void {
     if (!this._missHandler) return;
     const norm = this.normalize(p);
+    this._untrackLazyTree(norm);
     this._lazyNegative.delete(norm);
     this._lazyInvalidated.add(norm);
     const parent = this.locate(this.parentOf(norm));
@@ -677,6 +765,8 @@ export class MemoryVolume {
       return false;
     }
     this.writeInternal(norm, bytes, false);
+    const hydrated = this.locateRaw(norm);
+    if (hydrated?.kind === 'file') this._trackLazyResident(norm, hydrated);
     return true;
   }
 
@@ -690,6 +780,7 @@ export class MemoryVolume {
     node.lazySize = undefined;
     node.modified = Date.now();
     if (this._handler) this._handler.invalidateStat(norm);
+    this._trackLazyResident(norm, node);
   }
 
   // Fetch only the size for a lazy stub — stat must not pull full content
@@ -867,6 +958,7 @@ export class MemoryVolume {
     if (node.lazy) this._hydrateStub(norm, node);
 
     const bytes = node.content || new Uint8Array(0);
+    this._touchLazyResident(norm);
     if (encoding === 'utf8' || encoding === 'utf-8') {
       return this.decodeText(bytes);
     }
@@ -941,6 +1033,7 @@ export class MemoryVolume {
     if (!target) throw makeSystemError('ENOENT', 'unlink', p);
     if (target.kind !== 'file') throw makeSystemError('EISDIR', 'unlink', p);
 
+    this._untrackLazyResident(norm);
     parent.children!.delete(name);
     if (this._handler) this._handler.invalidateStat(norm);
     this.triggerWatchers(norm, 'rename');
@@ -1021,10 +1114,12 @@ export class MemoryVolume {
     // if the target already exists, remove it first — matches POSIX rename
     // semantics that Vite relies on for the deps_temp → deps commit
     if (toParent.children!.has(toName)) {
+      this._untrackLazyTree(normTo);
       toParent.children!.delete(toName);
     }
     fromParent.children!.delete(fromName);
     toParent.children!.set(toName, node);
+    this._remapLazyTree(normFrom, normTo);
 
     if (this._handler) {
       this._handler.invalidateStat(normFrom);

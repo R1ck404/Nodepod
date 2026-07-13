@@ -61,6 +61,8 @@ export class LRUCache<K, V> {
 /* ---- Options ---- */
 
 export interface MemoryHandlerOptions {
+  /** Soft per-pod memory budget in MB. Default: 400. */
+  budgetMB?: number;
   /** LRU capacity for path normalization cache. Default: 2048 */
   pathNormCacheSize?: number;
   /** LRU capacity for stat result cache. Default: 512 */
@@ -82,6 +84,7 @@ export interface MemoryHandlerOptions {
 }
 
 const DEFAULTS: Required<MemoryHandlerOptions> = {
+  budgetMB: 400,
   pathNormCacheSize: 2048,
   statCacheSize: 512,
   resolveCacheSize: 4096,
@@ -107,6 +110,9 @@ export class MemoryHandler {
 
   constructor(opts?: MemoryHandlerOptions) {
     this.options = { ...DEFAULTS, ...opts };
+    if (opts?.budgetMB !== undefined && opts.heapWarnThresholdMB === undefined) {
+      this.options.heapWarnThresholdMB = Math.floor(opts.budgetMB * 0.875);
+    }
     this.pathNormCache = new LRUCache(this.options.pathNormCacheSize);
     this.statCache = new LRUCache(this.options.statCacheSize);
     this.transformCache = new LRUCache(this.options.transformCacheSize);

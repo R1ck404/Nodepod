@@ -289,18 +289,24 @@ const workerEndpoint: OffloadWorkerEndpoint = {
   async extract(task: ExtractTask): Promise<ExtractResult> {
     if (!pakoModule) throw new Error("Worker not initialized");
 
-    const response = await fetch(task.tarballUrl);
-    if (!response.ok) {
-      throw new Error(
-        `Archive download failed (HTTP ${response.status}): ${task.tarballUrl}`,
-      );
+    let compressed: Uint8Array;
+    if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
+      compressed = new Uint8Array(task.tarballBytes);
+    } else {
+      const response = await fetch(task.tarballUrl);
+      if (!response.ok) {
+        throw new Error(
+          `Archive download failed (HTTP ${response.status}): ${task.tarballUrl}`,
+        );
+      }
+      compressed = new Uint8Array(await response.arrayBuffer());
     }
-
-    const compressed = new Uint8Array(await response.arrayBuffer());
 
     // verify sha1 matches what the registry reported
     if (task.expectedShasum) {
-      const hashBuffer = await crypto.subtle.digest("SHA-1", compressed);
+      const hashInput = new Uint8Array(compressed.byteLength);
+      hashInput.set(compressed);
+      const hashBuffer = await crypto.subtle.digest("SHA-1", hashInput);
       const hashHex = Array.from(new Uint8Array(hashBuffer))
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
@@ -327,26 +333,14 @@ const workerEndpoint: OffloadWorkerEndpoint = {
 
       if (entry.kind === "file" && entry.payload) {
         try {
-          let data: string | Uint8Array;
-          let isBinary = false;
-          try {
-            // copy into a non-shared buffer before decoding, TextDecoder rejects SAB-backed views
-            const payload = entry.payload;
-            const decodable = (typeof SharedArrayBuffer !== "undefined" && payload.buffer instanceof SharedArrayBuffer)
-              ? (() => { const c = new Uint8Array(payload.byteLength); c.set(payload); return c; })()
-              : payload;
-            data = new TextDecoder("utf-8", { fatal: true }).decode(decodable);
-          } catch {
-            // >1MB binaries go over as raw Uint8Array via structured clone — base64 bloats memory and sometimes fails
-            if (entry.payload.length > 1024 * 1024) {
-              data = new Uint8Array(entry.payload);
-              isBinary = true;
-            } else {
-              data = uint8ToBase64(entry.payload);
-              isBinary = true;
-            }
-          }
-          files.push({ path: relative, data, isBinary });
+          // the destination VFS stores bytes; keeping every entry binary
+          // avoids UTF-16 and base64 amplification while the archive and its
+          // extracted result coexist.
+          files.push({
+            path: relative,
+            data: new Uint8Array(entry.payload),
+            isBinary: true,
+          });
         } catch (fileErr) {
           // don't fail the whole extraction for one bad file
           console.warn(`[offload] Failed to encode ${relative} (${entry.payload.length} bytes):`, fileErr);
@@ -354,7 +348,14 @@ const workerEndpoint: OffloadWorkerEndpoint = {
       }
     }
 
-    return { type: "extract" as const, id: task.id, files };
+    const result: ExtractResult = { type: "extract" as const, id: task.id, files };
+    if (task.wantTarball) {
+      result.tarballBytes = compressed.buffer.slice(
+        compressed.byteOffset,
+        compressed.byteOffset + compressed.byteLength,
+      ) as ArrayBuffer;
+    }
+    return result;
   },
 
   async build(task: BuildTask): Promise<BuildResult> {

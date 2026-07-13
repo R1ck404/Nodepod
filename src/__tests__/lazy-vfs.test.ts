@@ -191,6 +191,26 @@ describe("MemoryVolume lazy hydration", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 
+  it("evicts least-recently-used lazy bytes and transparently reloads them", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/node_modules/pkg", { recursive: true });
+    source.writeFileSync("/node_modules/pkg/a.bin", new Uint8Array([1, 2, 3, 4, 5]));
+    source.writeFileSync("/node_modules/pkg/b.bin", new Uint8Array([6, 7, 8, 9, 10]));
+    const snap = new VFSBridge(source).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const bounded = new MemoryVolume(null, 6);
+    bounded.mkdirSync("/node_modules", { recursive: true });
+    const boundedHandler = volumeBackedHandler(source);
+    bounded.setMissHandler(boundedHandler, snap.lazyDirNames!);
+
+    expect([...bounded.readFileSync("/node_modules/pkg/a.bin")]).toEqual([1, 2, 3, 4, 5]);
+    expect([...bounded.readFileSync("/node_modules/pkg/b.bin")]).toEqual([6, 7, 8, 9, 10]);
+    expect(bounded.getStats().lazyResidentBytes).toBe(5);
+
+    const before = boundedHandler.calls.readFile.length;
+    expect([...bounded.readFileSync("/node_modules/pkg/a.bin")]).toEqual([1, 2, 3, 4, 5]);
+    expect(boundedHandler.calls.readFile.length).toBe(before + 1);
+  });
+
   it("markLazyInvalidated drops the local copy and re-pulls fresh content, even outside lazy dirs", () => {
     // /project/index.js is outside node_modules and fully local
     expect(worker.readFileSync("/project/index.js", "utf8")).toBe("require('lodash')");

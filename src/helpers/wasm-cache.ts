@@ -20,10 +20,24 @@ const PRECOMPILE_THRESHOLD = 4 * 1024 * 1024; // 4 MB
 type CacheEntry = {
   promise: Promise<WebAssembly.Module>;
   module: WebAssembly.Module | null;
+  sourceBytes: number;
 };
 
 // L1: keyed by quickWasmHash(bytes) — content-derived, sync to compute
 const moduleCache = new Map<string, CacheEntry>();
+const MODULE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
+function trimModuleCache(): void {
+  let bytes = 0;
+  for (const entry of moduleCache.values()) bytes += entry.sourceBytes;
+  while (bytes > MODULE_CACHE_MAX_BYTES && moduleCache.size > 1) {
+    const oldest = moduleCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    const entry = moduleCache.get(oldest)!;
+    moduleCache.delete(oldest);
+    bytes -= entry.sourceBytes;
+  }
+}
 
 function actualByteLength(bytes: ArrayBuffer | ArrayBufferView): number {
   return bytes.byteLength;
@@ -72,7 +86,12 @@ export function registerCompiledModule(
   module: WebAssembly.Module,
 ): void {
   const key = quickWasmHash(bytes);
-  moduleCache.set(key, { promise: Promise.resolve(module), module });
+  moduleCache.set(key, {
+    promise: Promise.resolve(module),
+    module,
+    sourceBytes: bytes.byteLength,
+  });
+  trimModuleCache();
   persistModule(bytes, module);
 }
 
@@ -97,12 +116,14 @@ export function precompileWasm(bytes: Uint8Array | ArrayBuffer): void {
       return mod;
     })(),
     module: null,
+    sourceBytes: stable.byteLength,
   };
   entry.promise.then(
     (m) => { entry.module = m; },
     () => { moduleCache.delete(key); },
   );
   moduleCache.set(key, entry);
+  trimModuleCache();
 }
 
 export function getCachedModule(bytes: BufferSource): WebAssembly.Module | null {
@@ -188,17 +209,43 @@ export function compileWasmInWorker(
     return mod;
   })();
 
-  const entry: CacheEntry = { promise, module: null };
+  const entry: CacheEntry = { promise, module: null, sourceBytes: stable.byteLength };
   promise.then(
     (m) => { entry.module = m; },
     () => { moduleCache.delete(key); },
   );
   moduleCache.set(key, entry);
+  trimModuleCache();
   return promise;
 }
 
 export function needsAsyncCompile(bytes: BufferSource): boolean {
   return actualByteLength(bytes) >= PRECOMPILE_THRESHOLD;
+}
+
+export function wasmCacheStats(): { entries: number; pending: number } {
+  let pending = 0;
+  for (const entry of moduleCache.values()) if (!entry.module) pending++;
+  return { entries: moduleCache.size, pending };
+}
+
+/** Drop only completed, reproducible modules. In-flight compiles stay live. */
+export function reclaimWasmCache(): void {
+  for (const [key, entry] of moduleCache) {
+    if (entry.module) moduleCache.delete(key);
+  }
+}
+
+export function disposeWasmCache(): void {
+  moduleCache.clear();
+  for (const pending of _pendingCompiles.values()) {
+    pending.reject(new Error("Nodepod runtime disposed"));
+  }
+  _pendingCompiles.clear();
+  if (_compileWorker) {
+    try { _compileWorker.terminate(); } catch { /* ignore */ }
+    _compileWorker = null;
+  }
 }
 
 export { PRECOMPILE_THRESHOLD };

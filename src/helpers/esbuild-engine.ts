@@ -60,3 +60,10 @@ export function getEsbuild(opts?: { wasmURL?: string }): Promise<EsbuildEngine> 
 export function getEsbuildIfReady(): EsbuildEngine | null {
   return (globalThis as EsbuildGlobal).__nodepodEsbuildReady ?? null;
 }
+
+export function disposeEsbuild(): void {
+  const g = globalThis as EsbuildGlobal;
+  try { (g.__nodepodEsbuildReady as any)?.stop?.(); } catch { /* ignore */ }
+  g.__nodepodEsbuildReady = undefined;
+  g.__nodepodEsbuild = undefined;
+}

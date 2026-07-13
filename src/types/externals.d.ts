@@ -29,7 +29,7 @@ declare module 'esbuild-wasm' {
 }
 
 declare module 'virtual:process-worker-bundle' {
-  export const PROCESS_WORKER_BUNDLE: string;
+  export const PROCESS_WORKER_BUNDLE_GZIP_BASE64: string;
 }
 
 declare module 'wa-sqlite/src/sqlite-api.js' {

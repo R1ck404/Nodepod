@@ -182,8 +182,24 @@ let _nextWasiThreadId = 100;
 // process boots so theyre already running before anyone blocks, then inject
 // the actual bundle via importScripts when napi-rs needs one.
 const _wasiPool: globalThis.Worker[] = [];
-const _WASI_POOL_TARGET = 8;
+const _WASI_POOL_TARGET = 4;
+const _WASI_POOL_IDLE_MS = 30_000;
 let _poolPreambleUrl: string | null = null;
+let _wasiPoolIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePoolExpiry(): void {
+  if (_wasiPoolIdleTimer) clearTimeout(_wasiPoolIdleTimer);
+  if (_wasiPool.length === 0) {
+    _wasiPoolIdleTimer = null;
+    return;
+  }
+  _wasiPoolIdleTimer = setTimeout(() => {
+    _wasiPoolIdleTimer = null;
+    for (const worker of _wasiPool.splice(0)) {
+      try { worker.terminate(); } catch { /* ignore */ }
+    }
+  }, _WASI_POOL_IDLE_MS);
+}
 
 function getPoolPreambleUrl(): string {
   if (_poolPreambleUrl) return _poolPreambleUrl;
@@ -219,13 +235,16 @@ function refillPool(): void {
       break;
     }
   }
+  schedulePoolExpiry();
 }
 
 function pullFromPool(): globalThis.Worker | null {
   if (_wasiPool.length < _WASI_POOL_TARGET / 2) {
     queueMicrotask(refillPool);
   }
-  return _wasiPool.shift() ?? null;
+  const worker = _wasiPool.shift() ?? null;
+  schedulePoolExpiry();
+  return worker;
 }
 
 // call early in spawned-process boot, before anything blocks
@@ -394,6 +413,9 @@ function createRealWebWorker(
     return;
   }
 
+  // create the Chrome/Atomics reserve only when a threaded WASI worker is
+  // actually requested. Ordinary Node processes retain no idle WASI workers.
+  refillPool();
   const pooled = pullFromPool();
   if (pooled) {
     realWorker = pooled;

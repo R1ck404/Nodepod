@@ -12,6 +12,19 @@ import { getTarballCache } from "../persistence/tarball-cache";
 
 // skip round-tripping very large tarballs back from the worker just to cache
 const TARBALL_CACHE_MAX_BYTES = 20 * 1024 * 1024;
+let extractionTail: Promise<void> = Promise.resolve();
+
+async function withExtractionSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = extractionTail;
+  let release!: () => void;
+  extractionTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 /** Returns safe absolute path if relative stays inside destDir, else null (zip-slip guard). */
 export function safeJoin(destDir: string, relative: string): string | null {
@@ -219,7 +232,7 @@ export async function downloadAndExtract(
     cache = null;
   }
 
-  const result: ExtractResult = await offload({
+  const result: ExtractResult = await withExtractionSlot(() => offload({
     type: "extract",
     id: taskId(),
     tarballUrl: url,
@@ -228,7 +241,7 @@ export async function downloadAndExtract(
     expectedShasum: opts.expectedShasum,
     tarballBytes: cachedBytes ?? undefined,
     wantTarball: !cachedBytes && !!cache,
-  });
+  }));
 
   if (
     cache &&

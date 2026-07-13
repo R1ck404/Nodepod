@@ -24,7 +24,8 @@ import type {
   WorkerToMain_SqlitePreload,
 } from "./worker-protocol";
 import type { VFSBridge } from "./vfs-bridge";
-import { PROCESS_WORKER_BUNDLE } from "virtual:process-worker-bundle";
+import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
+import { ungzip } from "pako";
 import { SLOT_SIZE } from "./sync-channel";
 
 const MAX_PROCESS_DEPTH = 10;
@@ -39,8 +40,8 @@ export class ProcessManager extends EventEmitter {
   private _nextPid = 100;
   private _volume: MemoryVolume;
   private _vfsBridge: VFSBridge | null = null;
-  private _sharedBuffer: SharedArrayBuffer | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
+  private _processPorts = new Map<number, MessagePort[]>();
 
   // port → owning pid
   private _serverPorts = new Map<number, number>();
@@ -65,18 +66,14 @@ export class ProcessManager extends EventEmitter {
     this._vfsBridge = bridge;
   }
 
-  setSharedBuffer(buf: SharedArrayBuffer): void {
-    this._sharedBuffer = buf;
-  }
-
   setSyncBuffer(buf: SharedArrayBuffer): void {
     this._syncBuffer = buf;
   }
 
   // "lean" spawns exclude node_modules etc. from snapshots; workers hydrate
-  // lazily over a sync fs proxy (needs SAB). Default "full" — flip via the
+  // lazily over a sync fs proxy (needs SAB). Default "lean" — flip via the
   // NodepodOptions.spawnSnapshot option.
-  private _spawnSnapshotMode: "full" | "lean" = "full";
+  private _spawnSnapshotMode: "full" | "lean" = "lean";
   private _warnedLeanUnavailable = false;
 
   setSpawnSnapshotMode(mode: "full" | "lean"): void {
@@ -150,6 +147,7 @@ export class ProcessManager extends EventEmitter {
     // that as the only route (#54 follow-up).
     const wasiFsPorts: MessagePort[] = [];
     const transferPorts: MessagePort[] = [];
+    const ownedPorts: MessagePort[] = [];
     {
       const tabFsBridge = buildFileSystemBridge(this._volume, () => "/");
       const POOL_SIZE = 16;
@@ -161,6 +159,7 @@ export class ProcessManager extends EventEmitter {
           handleFsProxy(data.__fs__, tabFsBridge);
         };
         ch.port1.start();
+        ownedPorts.push(ch.port1);
         transferPorts.push(ch.port2);
         wasiFsPorts.push(ch.port2);
       }
@@ -177,6 +176,7 @@ export class ProcessManager extends EventEmitter {
         handleFsProxy(data.__fs__, lazyBridge);
       };
       lazyCh.port1.start();
+      ownedPorts.push(lazyCh.port1);
       transferPorts.push(lazyCh.port2);
       lazyFsPort = lazyCh.port2;
     }
@@ -191,7 +191,15 @@ export class ProcessManager extends EventEmitter {
       wasiFsPorts,
       lazyFsPort,
     };
-    handle.init(initMsg, transferPorts);
+    this._processPorts.set(pid, ownedPorts);
+    try {
+      handle.init(initMsg, transferPorts);
+    } catch (err) {
+      this._processes.delete(pid);
+      this._cleanupProcessResources(pid);
+      try { worker.terminate(); } catch { /* ignore */ }
+      throw err;
+    }
 
     this.emit("spawn", pid, config.command, config.args);
     return handle;
@@ -263,6 +271,36 @@ export class ProcessManager extends EventEmitter {
       }
     }
     this._processes.clear();
+    for (const pid of [...this._processPorts.keys()]) {
+      this._cleanupProcessResources(pid);
+    }
+    this._serverPorts.clear();
+    this._childPids.clear();
+    this._inheritStdinChildren.clear();
+    for (const [requestId, entry] of this._httpCallbacks) {
+      entry.fn({
+        type: "http-response",
+        requestId,
+        statusCode: 503,
+        statusMessage: "Nodepod Teardown",
+        headers: {},
+        body: "Nodepod was torn down",
+      } as WorkerToMain_HttpResponse);
+    }
+    this._httpCallbacks.clear();
+  }
+
+  private _cleanupProcessResources(pid: number): void {
+    const ports = this._processPorts.get(pid);
+    if (ports) {
+      for (const port of ports) {
+        try { port.onmessage = null; port.close(); } catch { /* ignore */ }
+      }
+      this._processPorts.delete(pid);
+    }
+    this._inheritStdinChildren.delete(pid);
+    this._childPids.delete(pid);
+    for (const children of this._childPids.values()) children.delete(pid);
   }
 
   get processCount(): number {
@@ -469,11 +507,36 @@ export class ProcessManager extends EventEmitter {
     return ProcessManager._workerProbePromise;
   }
 
+  static disposeGlobalResources(): void {
+    if (ProcessManager._workerBlobUrl) {
+      try { URL.revokeObjectURL(ProcessManager._workerBlobUrl); } catch { /* ignore */ }
+    }
+    ProcessManager._workerBlobUrl = null;
+    ProcessManager._externalWorkerSource = null;
+    ProcessManager._workerProbePromise = null;
+  }
+
+  resourceStats(): { processes: number; messagePorts: number; pendingHttp: number } {
+    let messagePorts = 0;
+    for (const ports of this._processPorts.values()) messagePorts += ports.length;
+    return {
+      processes: this._processes.size,
+      messagePorts,
+      pendingHttp: this._httpCallbacks.size,
+    };
+  }
+
   private _createWorker(): Worker {
     // blob URL built once from whichever source is available first; the
     // external asset (if probed successfully) avoids the embedded copy
     if (!ProcessManager._workerBlobUrl) {
-      const source = ProcessManager._externalWorkerSource ?? PROCESS_WORKER_BUNDLE;
+      let source = ProcessManager._externalWorkerSource;
+      if (!source) {
+        const binary = atob(PROCESS_WORKER_BUNDLE_GZIP_BASE64);
+        const compressed = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
+        source = ungzip(compressed, { to: "string" });
+      }
       const blob = new Blob([source], { type: "application/javascript" });
       ProcessManager._workerBlobUrl = URL.createObjectURL(blob);
     }
@@ -524,6 +587,7 @@ export class ProcessManager extends EventEmitter {
       // delayed so event handlers finish first
       setTimeout(() => {
         this._processes.delete(handle.pid);
+        this._cleanupProcessResources(handle.pid);
       }, 100);
     });
 
@@ -1215,4 +1279,3 @@ export class ProcessManager extends EventEmitter {
     }
   }
 }
-

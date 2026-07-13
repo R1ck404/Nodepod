@@ -51,13 +51,14 @@ export interface NodepodOptions {
    * workers fetch those files on demand over a synchronous fs proxy. Cuts
    * per-process memory roughly by the size of node_modules. Requires
    * SharedArrayBuffer (COOP/COEP) — silently falls back to "full" without it.
-   * Default: "full".
+   * Default: "lean" when SharedArrayBuffer is available, otherwise "full".
    */
   spawnSnapshot?: "full" | "lean";
   /**
    * Start downloading + compiling esbuild-wasm (~10MB) during boot so it's
    * ready by the time installs or builds need it. The download overlaps
-   * Service Worker registration and package installs. Default: true.
+   * Service Worker registration and package installs. Default: false; the
+   * engine otherwise initializes automatically on first use.
    */
   preloadEsbuild?: boolean;
   /**

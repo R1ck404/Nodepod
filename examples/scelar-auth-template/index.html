@@ -143,6 +143,9 @@
     const statusEl = document.getElementById('status');
     const runBtn = document.getElementById('run');
     const clearBtn = document.getElementById('clear');
+    let activePod = null;
+    let activeDevProcess = null;
+    let activeRun = null;
 
     function log(text, cls = 'stdout') {
       const span = document.createElement('span');
@@ -154,6 +157,17 @@
 
     function setStatus(text) {
       statusEl.textContent = text;
+    }
+
+    function measureMemory(label) {
+      // keep preview startup unblocked; browser-wide memory measurement can
+      // take several seconds and force a GC, so the default path samples the
+      // immediately available heap counter only.
+      const bytes = performance.memory?.usedJSHeapSize;
+      if (!bytes) return null;
+      const mb = bytes / 1024 / 1024;
+      log(`[memory/js-heap] ${label}: ${mb.toFixed(1)} MB`, 'info');
+      return mb;
     }
 
     clearBtn.addEventListener('click', () => {
@@ -184,13 +198,21 @@
       return proc;
     }
 
-    runBtn.addEventListener('click', async () => {
+    async function runPreview() {
       runBtn.disabled = true;
       preview.removeAttribute('src');
       setStatus('Booting…');
 
       let onServerReady = null;
+      let bootedHere = false;
       try {
+        measureMemory('blank baseline');
+        if (activeDevProcess) {
+          const replacedProcess = activeDevProcess;
+          activeDevProcess = null;
+          replacedProcess.kill();
+          await replacedProcess.completion;
+        }
         let viteUrl = null;
         let resolveVite;
         const viteReady = new Promise((r) => {
@@ -207,8 +229,15 @@
         getProxyInstance().on('server-ready', onServerReady);
 
         log('Booting Nodepod (workdir=/project)…', 'info');
-        const pod = await Nodepod.boot({ workdir: VFS_ROOT });
-        log('Booted.\n', 'pass');
+        const pod = activePod ?? await Nodepod.boot({ workdir: VFS_ROOT });
+        if (!activePod) {
+          activePod = pod;
+          bootedHere = true;
+          log('Booted a new Nodepod lease.\n', 'pass');
+        } else {
+          log('Reusing the existing Nodepod lease.\n', 'pass');
+        }
+        measureMemory('boot');
 
         log('Loading Scelar auth template from examples/scelar-auth-template/app/ …', 'info');
         const files = await loadAppFiles();
@@ -222,15 +251,15 @@
         const install = await runCommand(pod, 'npm', ['install']);
         const installRes = await install.completion;
         if (installRes.exitCode !== 0) {
-          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
-          setStatus('Install failed');
-          return;
+          throw new Error(`npm install failed (exit=${installRes.exitCode})`);
         }
         log('npm install done.\n', 'pass');
+        measureMemory('install complete');
 
         log('--- Vite dev (Better Auth middleware on /api/auth) ---', 'dim');
         setStatus('Starting Vite…');
         const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+        activeDevProcess = devProc;
 
         const raced = await Promise.race([
           viteReady,
@@ -239,30 +268,48 @@
         ]);
 
         if (raced?.__exit != null) {
-          log(`Vite exited early (code=${raced.__exit})`, 'fail');
-          setStatus('Vite failed');
-          return;
+          activeDevProcess = null;
+          throw new Error(`Vite exited early (code=${raced.__exit})`);
         }
         if (raced?.__timeout) {
-          log('Timed out waiting for Vite on port 5173', 'fail');
-          setStatus('Timeout');
           devProc.kill();
-          return;
+          activeDevProcess = null;
+          throw new Error('Timed out waiting for Vite on port 5173');
         }
 
         log(`\nVite ready: ${viteUrl}`, 'pass');
         setStatus(`Live — ${viteUrl}`);
         preview.src = viteUrl;
+        measureMemory('steady state');
+        log(`Runtime counters: ${JSON.stringify(pod.memoryStats())}`, 'dim');
         log('\nOpen the preview: Sign up or Log in, then visit protected routes.', 'info');
       } catch (err) {
         log(String(err?.stack || err), 'fail');
+        if (bootedHere && !activeDevProcess && activePod) {
+          activePod.teardown();
+          activePod = null;
+        }
         setStatus('Error — see log');
       } finally {
         if (onServerReady) {
           getProxyInstance().off('server-ready', onServerReady);
         }
-        runBtn.disabled = false;
       }
+    }
+
+    runBtn.addEventListener('click', () => {
+      if (activeRun) return;
+      activeRun = runPreview().finally(() => {
+        activeRun = null;
+        runBtn.disabled = false;
+      });
+    });
+
+    addEventListener('beforeunload', () => {
+      activeDevProcess?.kill();
+      activePod?.teardown();
+      activeDevProcess = null;
+      activePod = null;
     });
   </script>
 </body>

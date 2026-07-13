@@ -4,6 +4,7 @@ import wasm from "vite-plugin-wasm";
 import { resolve } from "path";
 import { readFileSync } from "fs";
 import { build as esbuild } from "esbuild";
+import { gzipSync } from "node:zlib";
 
 const pkg = JSON.parse(
   readFileSync(resolve(__dirname, "package.json"), "utf-8"),
@@ -58,7 +59,8 @@ function inlineProcessWorkerPlugin() {
     },
     load(id) {
       if (id === RESOLVED_ID) {
-        return `export const PROCESS_WORKER_BUNDLE = ${JSON.stringify(workerBundle)};`;
+        const compressed = gzipSync(Buffer.from(workerBundle)).toString("base64");
+        return `export const PROCESS_WORKER_BUNDLE_GZIP_BASE64 = ${JSON.stringify(compressed)};`;
       }
     },
     generateBundle() {

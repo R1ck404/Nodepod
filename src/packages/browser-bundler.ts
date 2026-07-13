@@ -13,6 +13,8 @@ import type { MemoryVolume } from "../memory-volume";
 // ---------------------------------------------------------------------------
 
 const bundledModules = new Map<string, string>();
+let bundledModuleBytes = 0;
+const BUNDLE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 let activeVolume: MemoryVolume | null = null;
 let externalPackages: string[] = [];
 
@@ -22,6 +24,30 @@ let externalPackages: string[] = [];
 
 export function invalidateBundleCache(): void {
   bundledModules.clear();
+  bundledModuleBytes = 0;
+}
+
+function getCachedBundle(specifier: string): string | undefined {
+  const value = bundledModules.get(specifier);
+  if (value === undefined) return undefined;
+  bundledModules.delete(specifier);
+  bundledModules.set(specifier, value);
+  return value;
+}
+
+function cacheBundle(specifier: string, value: string): void {
+  const previous = bundledModules.get(specifier);
+  if (previous !== undefined) bundledModuleBytes -= previous.length * 2;
+  bundledModules.delete(specifier);
+  bundledModules.set(specifier, value);
+  bundledModuleBytes += value.length * 2;
+  while (bundledModuleBytes > BUNDLE_CACHE_MAX_BYTES && bundledModules.size > 1) {
+    const oldest = bundledModules.keys().next().value as string | undefined;
+    if (!oldest) break;
+    const oldValue = bundledModules.get(oldest)!;
+    bundledModules.delete(oldest);
+    bundledModuleBytes -= oldValue.length * 2;
+  }
 }
 
 // Must be called before bundleForBrowser
@@ -36,7 +62,7 @@ export function setExternalPackages(packages: string[]): void {
 
 // Bundle a bare specifier (e.g. "zod", "lodash/merge") into a self-contained ESM string
 export async function bundleForBrowser(specifier: string): Promise<string> {
-  const hit = bundledModules.get(specifier);
+  const hit = getCachedBundle(specifier);
   if (hit) return hit;
 
   const entryFile = locateEntryPoint(specifier);
@@ -100,7 +126,7 @@ export async function bundleForBrowser(specifier: string): Promise<string> {
     esmCode = injectNamedExports(esmCode, knownExports);
   }
 
-  bundledModules.set(specifier, esmCode);
+  cacheBundle(specifier, esmCode);
   return esmCode;
 }
 
