@@ -21,6 +21,13 @@ import {
 } from "../persistence/binary-snapshot";
 import { getTarballCache } from "../persistence/tarball-cache";
 import type { PerformanceTracker } from "../performance-tracker";
+import { resolveWithCache } from "./resolution-cache";
+
+const RESOLVER_CACHE_VERSION = 1;
+
+function stableRecord(record: Record<string, string> | undefined): string {
+  return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -164,11 +171,18 @@ export class DependencyInstaller {
     };
 
     const stopResolution = this._performance?.start("install.resolve");
-    const tree = await resolveDependencyTree(
-      targetName,
-      targetRange,
-      resolutionOpts,
-    );
+    const resolutionKey = quickDigest(JSON.stringify({
+      version: RESOLVER_CACHE_VERSION,
+      package: targetName,
+      range: targetRange,
+      registry: flags.registry ?? "default",
+      dev: !!flags.withDevDeps,
+      optional: !!flags.withOptionalDeps,
+    }));
+    const resolved = await resolveWithCache(resolutionKey, () =>
+      resolveDependencyTree(targetName, targetRange, resolutionOpts));
+    const tree = resolved.tree;
+    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
     stopResolution?.();
 
     // snapshot cache keyed by the resolved package set — skips download,
@@ -293,7 +307,17 @@ export class DependencyInstaller {
     };
 
     const stopResolution = this._performance?.start("install.resolve");
-    const tree = await resolveFromManifest(manifest, resolutionOpts);
+    const resolutionKey = quickDigest(JSON.stringify({
+      version: RESOLVER_CACHE_VERSION,
+      registry: flags.registry ?? "default",
+      dependencies: stableRecord(manifest.dependencies),
+      devDependencies: flags.withDevDeps ? stableRecord(manifest.devDependencies) : "",
+      optionalDependencies: flags.withOptionalDeps ? stableRecord(manifest.optionalDependencies) : "",
+    }));
+    const resolved = await resolveWithCache(resolutionKey, () =>
+      resolveFromManifest(manifest, resolutionOpts));
+    const tree = resolved.tree;
+    if (resolved.hit) this._performance?.increment("install.resolutionCacheHits");
     stopResolution?.();
 
     const stopMaterialize = this._performance?.start("install.materialize");
