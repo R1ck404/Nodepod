@@ -36,6 +36,13 @@ export interface NodepodOptions {
    * defaults to true.
    */
   enableSharedArrayBuffer?: boolean;
+  /**
+   * capacity in bytes of the SharedArrayBuffer-backed fs mirror used by
+   * workers and WASI modules. default is 256 MiB — enough for typical app
+   * dependency trees including WASM toolchains. must be set before boot
+   * because a SharedArrayBuffer cannot grow after workers receive it.
+   */
+  sharedVFSBufferSize?: number;
   /** domains allowed through the cors proxy. merged with built-in defaults
    *  (npm, github, esm.sh etc). pass null to allow everything */
   allowedFetchDomains?: string[] | null;

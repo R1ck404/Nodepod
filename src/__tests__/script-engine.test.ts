@@ -179,6 +179,33 @@ describe("ScriptEngine", () => {
       );
       expect(result.exports).toBe("a/b");
     });
+
+    it("exposes a callable CommonJS module as dynamic-import default", () => {
+      const { engine } = createEngine({
+        "/project/plugin.cjs": "module.exports = function plugin() { return 42; };",
+        "/project/entry.mjs": [
+          "const mod = await import('./plugin.cjs');",
+          "export const shape = [typeof mod.default, mod.default()];",
+        ].join("\n"),
+      });
+      const result = engine.execute(
+        'module.exports = require("./entry.mjs").shape;',
+        "/project/index.js",
+      );
+      expect(result.exports).toEqual(["function", 42]);
+    });
+
+    it("recognizes native promises returned by async module callbacks", () => {
+      const { engine } = createEngine({
+        "/project/entry.js": [
+          "const callback = async () => ({ id: 'entry', external: true });",
+          "const result = callback();",
+          "module.exports = result instanceof Promise;",
+        ].join("\n"),
+      });
+      const result = engine.runFile("/project/entry.js");
+      expect(result.exports).toBe(true);
+    });
   });
 
   describe("clearCache()", () => {

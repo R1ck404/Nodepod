@@ -39,6 +39,12 @@ export function setWorkerThreadForkCallback(fn: WorkerThreadForkFn): void {
   _workerThreadForkFn = fn;
 }
 
+// returns the fork callback set by setWorkerThreadForkCallback. adapters use
+// this instead of depending on this module's private storage.
+export function getWorkerThreadForkCallback(): WorkerThreadForkFn | null {
+  return _workerThreadForkFn;
+}
+
 // script-engine injects a PatchedWorker factory here for napi-rs WASI worker support, factory gets (script, opts) like the constructor
 let _workerConstructorOverride: ((self: any, script: string | URL, opts?: any) => void) | null = null;
 
@@ -386,5 +392,6 @@ export default {
   getEnvironmentData,
   setEnvironmentData,
   setWorkerThreadForkCallback,
+  getWorkerThreadForkCallback,
   setWorkerConstructorOverride,
 };

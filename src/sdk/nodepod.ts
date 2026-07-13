@@ -38,6 +38,12 @@ import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { getEsbuild } from "../helpers/esbuild-engine";
 
+// the SharedVFS is the synchronous filesystem visible to WASI and nested
+// workers. unlike the canonical MemoryVolume, it cannot grow after being
+// passed to a worker. 64 MiB is too small for ordinary modern app dependency
+// trees once build-tool WASM binaries are included.
+const DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE = 256 * 1024 * 1024;
+
 // short url-safe id. always starts with a letter so it can't be confused
 // with a port number in /__virtual__/{id}/{port}
 function makeInstanceId(): string {
@@ -106,6 +112,7 @@ export class Nodepod {
     handler: MemoryHandler,
     env: Record<string, string>,
     sabEnabled: boolean,
+    sharedVFSBufferSize: number | undefined,
     instanceId: string,
   ) {
     this._volume = volume;
@@ -137,7 +144,9 @@ export class Nodepod {
 
     if (sabEnabled) {
       try {
-        this._sharedVFS = new SharedVFSController();
+        this._sharedVFS = new SharedVFSController(
+          sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE,
+        );
         this._processManager.setSharedBuffer(this._sharedVFS.buffer);
         this._vfsBridge.setSharedVFS(this._sharedVFS);
       } catch (e) {
@@ -286,6 +295,7 @@ export class Nodepod {
       handler,
       env,
       sabEnabled,
+      opts.sharedVFSBufferSize,
       makeInstanceId(),
     );
     nodepod._wasiFsChannel = wasiFsChannel;
@@ -825,8 +835,9 @@ export class Nodepod {
    * other side. null if SAB is unavailable, but boot() would have thrown in
    * that case so this is mostly defensive.
    *
-   * caps: 16,384 entries, 64 MB, 248-byte paths. writes past the caps
-   * silently drop, not ideal for node_modules scale scans.
+   * default capacity is 256 MiB (or sharedVFSBufferSize at boot), 16,384
+   * entries, 248-byte paths. writes past either cap count as dropped writes
+   * so callers can detect an undersized mirror.
    */
   get sharedFSBuffer(): SharedArrayBuffer | null {
     return this._sharedVFS?.buffer ?? null;

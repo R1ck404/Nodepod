@@ -546,7 +546,13 @@ function syncAwait(val: unknown): unknown {
 // resolves synchronously we want __syncAwait to unwrap the result.
 // Injected as `Promise` inside module wrappers.
 function createSyncPromise(): typeof Promise {
-  const NativePromise = Promise;
+  // async_hooks installs a context-propagating global Promise during module
+  // initialization. async functions still return promises from the intrinsic
+  // constructor, and napi-rs uses instanceof Promise to identify callback
+  // results. keep that check anchored to the intrinsic constructor so native
+  // async plugin hooks (rolldown/vite and other napi clients) are awaited
+  // instead of being decoded as ordinary objects.
+  const NativePromise = asyncCtxPolyfill.getNativePromiseConstructor();
 
   class SyncPromise<T> extends NativePromise<T> {
     private _syncValue: T | undefined;
@@ -856,6 +862,15 @@ function toImportNamespace(loaded: unknown): Record<string, unknown> {
   const ns: Record<string, unknown> = {};
   for (const key of Object.getOwnPropertyNames(mod)) {
     ns[key] = mod[key];
+  }
+
+  // native import() exposes CommonJS module.exports as default. without this,
+  // dynamic imports of callable CJS modules become a namespace of the function's
+  // own properties (length, name, ...), so vite's react plugin passes that
+  // namespace to babel as a plugin object.
+  if ((mod as any).__esModule !== true) {
+    ns.default = loaded;
+    return ns;
   }
 
   // import() should yield a module namespace like Node. Hoist named exports
@@ -2169,7 +2184,7 @@ export class ScriptEngine {
         resolverForWorker,
         this.proc.env as Record<string, string>,
         this.fsBridge,
-        (threadPoolPolyfill as any)._workerThreadForkFn ?? null,
+        threadPoolPolyfill.getWorkerThreadForkCallback(),
         this.opts.enableSharedArrayBuffer ?? true,
       );
       threadPoolPolyfill.setWorkerConstructorOverride((self, script, opts) => {

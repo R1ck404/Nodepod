@@ -15,6 +15,7 @@
 import type { MemoryVolume } from "../memory-volume";
 import { EventEmitter } from "../polyfills/events";
 import { getRegistry, type Handle } from "./event-loop";
+import { esmToCjs } from "../syntax-transforms";
 
 /**
  * true if scriptPath is a wasi-worker script in a node_modules package that
@@ -54,6 +55,7 @@ export function buildNapiWorkerBundle(
 ): string {
   const modules = new Map<string, string>(); // resolvedPath -> source
   const moduleIds = new Map<string, number>(); // resolvedPath -> numeric id
+  const moduleDeps = new Map<string, Map<string, string>>();
   let nextId = 0;
   const visited = new Set<string>();
 
@@ -73,6 +75,8 @@ export function buildNapiWorkerBundle(
     const id = nextId++;
     moduleIds.set(filePath, id);
     modules.set(filePath, source);
+    const deps = new Map<string, string>();
+    moduleDeps.set(filePath, deps);
 
     // simplified regex, good enough for napi-rs deps
     const importRe =
@@ -90,9 +94,7 @@ export function buildNapiWorkerBundle(
       try {
         const resolved = resolveModule(dep, fromDir);
         if (resolved && !isBuiltin(resolved)) {
-          // skip .min.js, deeply nested expressions overflow Chrome's parser
-          // when embedded in a blob worker. non-minified .cjs.js is identical
-          if (/\.min\.(js|cjs|mjs)$/.test(resolved)) continue;
+          deps.set(dep, resolved);
           collectDeps(resolved);
         }
       } catch {
@@ -120,12 +122,27 @@ export function buildNapiWorkerBundle(
     const id = moduleIds.get(filePath)!;
     const dir = filePath.substring(0, filePath.lastIndexOf("/")) || "/";
 
-    // only convert ESM -> CJS for actual ESM files (.mjs or containing import/export)
-    // don't touch CJS files, the regex would mangle minified code
+    // keep package module semantics intact. generated napi-rs workers commonly
+    // import the runtime through ESM, where a missing export becomes a corrupt
+    // WebAssembly import rather than a useful JavaScript error.
     const isESM = filePath.endsWith(".mjs") ||
       (/\b(import\s+[\w{*]|export\s+(default|const|let|var|function|class|\{|\*))\b/.test(source) &&
        !source.includes("module.exports") && !source.includes("exports.__esModule"));
-    let transformed = isESM ? esmToCjs(source) : source;
+    let transformed = isESM
+      ? esmToCjs(source.replace(/\bimport\.meta\.url\b/g, JSON.stringify(`file://${filePath}`)))
+      : source;
+
+    // generated node workers create a local require solely for import.meta.url.
+    // the wrapper supplies the resolver-backed require, which must stay live.
+    transformed = transformed.replace(
+      /(?:const|let|var)\s+require\s*=\s*createRequire\s*\([^)]*\)\s*;?/g,
+      "/* require provided by wrapper */",
+    );
+    // self is already the browser worker global and is read-only.
+    transformed = transformed.replace(
+      /self:\s*globalThis\s*,?/g,
+      "/* self already set in Worker */ ",
+    );
 
     // escape for embedding as a template literal: backtick, backslash, ${
     const escaped = transformed
@@ -134,7 +151,7 @@ export function buildNapiWorkerBundle(
       .replace(/\$\{/g, "\\${");
 
     parts.push(
-      `__modules[${id}] = { dir: ${JSON.stringify(dir)}, path: ${JSON.stringify(filePath)}, src: \`${escaped}\` };`,
+      `__modules[${id}] = { dir: ${JSON.stringify(dir)}, path: ${JSON.stringify(filePath)}, esm: ${isESM}, deps: ${JSON.stringify(Object.fromEntries(moduleDeps.get(filePath) ?? []))}, src: \`${escaped}\` };`,
     );
   }
 
@@ -588,119 +605,17 @@ function isBuiltin(id: string): boolean {
   return NODE_BUILTINS.has(bare);
 }
 
-/**
- * minimal ESM -> CJS for worker bundling
- * covers the patterns used by @emnapi/*, @napi-rs/*, @tybys/* packages
- */
-function esmToCjs(source: string): string {
-  let out = source;
-
-  // import X from 'Y' -> const X = require('Y')
-  out = out.replace(
-    /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    "const $1 = require('$2');",
-  );
-
-  // import { A, B } from 'Y' -> const { A, B } = require('Y')
-  out = out.replace(
-    /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    "const {$1} = require('$2');",
-  );
-
-  // import * as X from 'Y' -> const X = require('Y')
-  out = out.replace(
-    /import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    "const $1 = require('$2');",
-  );
-
-  // import 'Y' -> require('Y')
-  out = out.replace(
-    /import\s+['"]([^'"]+)['"]\s*;?/g,
-    "require('$1');",
-  );
-
-  // strip `const require = createRequire(...)` - the wrapper already supplies
-  // require as a parameter. napi-rs wasi-worker scripts have this line and it
-  // throws "Identifier 'require' has already been declared"
-  out = out.replace(
-    /(?:const|let|var)\s+require\s*=\s*createRequire\s*\([^)]*\)\s*;?/g,
-    "/* require provided by wrapper */",
-  );
-
-  // in real Web Workers, `self` is a read-only getter on WorkerGlobalScope
-  // napi-rs does Object.assign(globalThis, {self: globalThis, ...}) which
-  // throws. drop `self: globalThis` since self already === globalThis
-  out = out.replace(/self:\s*globalThis\s*,?/g, "/* self already set in Worker */ ");
-
-  // export default X -> module.exports.default = X
-  out = out.replace(
-    /export\s+default\s+/g,
-    "module.exports.default = ",
-  );
-
-  // export { A, B } -> module.exports.A = A; module.exports.B = B
-  out = out.replace(
-    /export\s+\{([^}]+)\}\s*;?/g,
-    (_, names) => {
-      return names
-        .split(",")
-        .map((n: string) => {
-          const trimmed = n.trim();
-          const asMatch = trimmed.match(/(\w+)\s+as\s+(\w+)/);
-          if (asMatch) return `module.exports.${asMatch[2]} = ${asMatch[1]};`;
-          return `module.exports.${trimmed} = ${trimmed};`;
-        })
-        .join("\n");
-    },
-  );
-
-  // export const/let/var/function/class X
-  out = out.replace(
-    /export\s+(const|let|var|function|class)\s+(\w+)/g,
-    "$1 $2; module.exports.$2 = $2; $1 $2",
-  );
-  // clean up double declarations from the rule above
-  out = out.replace(
-    /(const|let|var)\s+(\w+);\s*module\.exports\.\2\s*=\s*\2;\s*\1\s+\2/g,
-    "$1 $2",
-  );
-
-  // export * from 'Y' -> Object.assign(module.exports, require('Y'))
-  out = out.replace(
-    /export\s+\*\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    "Object.assign(module.exports, require('$1'));",
-  );
-
-  // export { A } from 'Y'
-  out = out.replace(
-    /export\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/g,
-    (_, names, mod) => {
-      return names
-        .split(",")
-        .map((n: string) => {
-          const trimmed = n.trim();
-          const asMatch = trimmed.match(/(\w+)\s+as\s+(\w+)/);
-          if (asMatch) return `module.exports.${asMatch[2]} = require('${mod}').${asMatch[1]};`;
-          return `module.exports.${trimmed} = require('${mod}').${trimmed};`;
-        })
-        .join("\n");
-    },
-  );
-
-  return out;
-}
-
 // worker preamble: minimal Node.js stubs for running inside a Web Worker
 function WORKER_PREAMBLE(env: Record<string, string>): string {
-  // pool size = 0 disables emnapi's UV thread pool in child workers
-  // without this, emnapi tries to create Workers for its async work pool,
-  // but child workers have no onCreateWorker callback
+  // Generated NAPI-RS loaders interpret zero as their default pool size. Use
+  // one worker here; child-thread delegation remains owned by the parent.
   // rayon/tokio thread spawning goes via emnapi's child-thread delegation:
   // child posts 'spawn-thread' to main, main creates Worker, writes TID to SAB
   const workerEnv = {
     ...env,
-    UV_THREADPOOL_SIZE: "0",
-    EMNAPI_WORKER_POOL_SIZE: "0",
+    UV_THREADPOOL_SIZE: "1",
+    NAPI_RS_ASYNC_WORK_POOL_SIZE: "1",
+    EMNAPI_WORKER_POOL_SIZE: "1",
     // don't set RAYON_NUM_THREADS here - WASM reads environ from shared
     // memory (set by the main thread's _initialize), not this process.env
   };
@@ -1205,28 +1120,34 @@ const __eventsStub = {
 };
 __eventsStub.default = __eventsStub.EventEmitter;
 
-// Buffer stub
-const __BufferStub = {
-  from(src, enc, len) {
+// Buffer must be callable as well as constructor-like. emnapi discovers it
+// from globalThis before it checks require('buffer').
+function __BufferStub(src, enc, len) {
+  return __BufferStub.from(src, enc, len);
+}
+__BufferStub.from = function(src, enc, len) {
     if (typeof src === 'string') return new TextEncoder().encode(src);
     if (src instanceof ArrayBuffer || src instanceof SharedArrayBuffer) {
       return new Uint8Array(src, typeof enc === 'number' ? enc : 0, len);
     }
     if (src instanceof Uint8Array) return new Uint8Array(src);
     return new Uint8Array(src || []);
-  },
-  alloc(len, fill) { const b = new Uint8Array(len); if (fill) b.fill(fill); return b; },
-  allocUnsafe(len) { return new Uint8Array(len); },
-  isBuffer(v) { return v instanceof Uint8Array; },
-  isEncoding() { return true; },
-  concat(list, totalLen) {
+};
+__BufferStub.alloc = function(len, fill) { const b = new Uint8Array(len); if (fill) b.fill(fill); return b; };
+__BufferStub.allocUnsafe = function(len) { return new Uint8Array(len); };
+__BufferStub.isBuffer = function(v) { return v instanceof Uint8Array; };
+__BufferStub.isEncoding = function() { return true; };
+__BufferStub.concat = function(list, totalLen) {
     if (!totalLen) totalLen = list.reduce((s, b) => s + b.length, 0);
     const out = new Uint8Array(totalLen); let off = 0;
     for (const b of list) { out.set(b, off); off += b.length; }
     return out;
-  },
-  byteLength(s, enc) { return new TextEncoder().encode(s).length; },
 };
+__BufferStub.byteLength = function(s, enc) { return new TextEncoder().encode(s).length; };
+// emnapi probes global Buffer before falling back to require('buffer'). The
+// constructor-like facade needs to exist in both places for its typed-array
+// and Buffer detection to follow Node's runtime path.
+globalThis.Buffer = __BufferStub;
 
 // WASM child thread initialization is handled by emnapi's instance proxy
 // which provides a no-op _initialize for child threads. No manual guard needed.
@@ -1717,12 +1638,22 @@ function __requireInner(idOrPath) {
     }
     if (!mod.fn) throw new Error('Module has no source: ' + idOrPath);
     const m = { exports: {}, id: mod.path, filename: mod.path, loaded: false };
+    if (mod.esm) Object.defineProperty(m.exports, '__esModule', { value: true });
     __moduleCache[idOrPath] = m;
     const localRequire = function(dep) {
       // Node builtins — check once, always return result (even empty object)
       const bare = dep.replace(/^node:/, '');
       const builtin = __builtinRequire(bare);
       if (builtin !== undefined) return builtin;
+      // the bundle records the resolver's exact answer for each import. dont
+      // infer package roots by scanning strings: nested deps can share a package
+      // name but ship incompatible napi runtime exports.
+      const mappedPath = mod.deps && mod.deps[dep];
+      if (mappedPath) {
+        const mappedId = __pathToId[mappedPath];
+        if (mappedId !== undefined) return __require(mappedId);
+        throw new Error('Bundled dependency missing: ' + dep + ' from ' + mod.path);
+      }
       // Resolve relative paths
       if (dep.startsWith('./') || dep.startsWith('../')) {
         const resolved = __resolvePath(mod.dir, dep);
@@ -1745,9 +1676,7 @@ function __requireInner(idOrPath) {
           return __require(id);
         }
       }
-      // Fall back to empty object for unknown modules (don't crash)
-      console.warn('[worker] Unknown module: ' + dep);
-      return {};
+      throw new Error('Cannot find module: ' + dep + ' from ' + mod.dir);
     };
     localRequire.resolve = function(id) { return id; };
     mod.fn(m, m.exports, localRequire, mod.path, mod.dir);
@@ -1766,8 +1695,30 @@ function __requireInner(idOrPath) {
   // Try builtin
   const builtin = __builtinRequire(idOrPath);
   if (builtin !== undefined) return builtin;
-  return {};
+  throw new Error('Cannot find module: ' + idOrPath);
 }
+
+function __validateNapiImports(imports) {
+  for (const namespace of ['env', 'napi', 'emnapi']) {
+    const values = imports && imports[namespace];
+    if (!values || typeof values !== 'object') continue;
+    for (const name of Object.keys(values)) {
+      if ((namespace === 'napi' || namespace === 'emnapi' || /^(?:napi|emnapi)_/.test(name)) && typeof values[name] !== 'function') {
+        throw new TypeError('Invalid WebAssembly import ' + namespace + '.' + name + ': expected function');
+      }
+    }
+  }
+  return imports;
+}
+const __nativeWasmInstantiate = WebAssembly.instantiate.bind(WebAssembly);
+WebAssembly.instantiate = function(moduleOrBytes, imports) {
+  return __nativeWasmInstantiate(moduleOrBytes, __validateNapiImports(imports));
+};
+const __nativeWasmInstance = WebAssembly.Instance;
+WebAssembly.Instance = function(module, imports) {
+  return new __nativeWasmInstance(module, __validateNapiImports(imports));
+};
+WebAssembly.Instance.prototype = __nativeWasmInstance.prototype;
 
 function __resolvePath(base, rel) {
   const parts = (base + '/' + rel).split('/');

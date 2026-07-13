@@ -63,5 +63,7 @@ createServer((req, res) => {
   console.log(`  SQLite test:          http://localhost:${port}/examples/sqlite-test/`);
   console.log(`  Better Auth + Vite:   http://localhost:${port}/examples/better-auth-vite/  (React Router demo in app/)`);
   console.log(`  Vite dev exit 1:      http://localhost:${port}/examples/vite-dev-exit-1/  (auth+sqlite repro)`);
+  console.log(`  Scelar auth template: http://localhost:${port}/examples/scelar-auth-template/`);
+  console.log(`  Scelar Vite repro:    http://localhost:${port}/examples/scelar-vite-config-repro/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
 });

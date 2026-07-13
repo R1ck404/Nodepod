@@ -20,6 +20,14 @@ function captureFrame(): StoreFrame {
 
 const NativePromise = Promise;
 
+// consumers bridging native async functions across an ABI need the intrinsic
+// constructor. installAsyncContext() replaces globalThis.Promise below, but
+// async functions still create intrinsic native promises; instanceof checks
+// against the replacement would reject valid results.
+export function getNativePromiseConstructor(): typeof Promise {
+  return NativePromise;
+}
+
 // Synchronous frame switch. Always restores in finally: continuations
 // registered outside an active run() fire interleaved with the run's awaits,
 // and leaving their (often empty) frame current would clobber the run's store

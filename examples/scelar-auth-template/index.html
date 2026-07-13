@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nodepod — Scelar auth template</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 16px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    header h1 { font-size: 16px; font-weight: 600; }
+    header p {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-top: 4px;
+      max-width: 80ch;
+    }
+    header code {
+      font-size: 11px;
+      background: #0f172a;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    button {
+      background: #334155;
+      color: #e2e8f0;
+      border: 1px solid #475569;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #475569; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .layout {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      min-height: 0;
+    }
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      border-right: 1px solid #334155;
+    }
+    .pane:last-child { border-right: none; }
+    .pane h2 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      padding: 10px 12px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    #output {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    #preview {
+      flex: 1;
+      border: none;
+      background: #fff;
+    }
+    #status {
+      font-size: 12px;
+      color: #94a3b8;
+      padding: 8px 12px;
+      border-bottom: 1px solid #334155;
+    }
+    .stdout { color: #86efac; }
+    .stderr { color: #fca5a5; }
+    .info { color: #7dd3fc; }
+    .dim { color: #64748b; }
+    .pass { color: #86efac; font-weight: 600; }
+    .fail { color: #fca5a5; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Scelar auth template (1:1)</h1>
+    <p>
+      Loads the exact project Scelar generates from its <code>auth</code> template
+      (<code>examples/scelar-auth-template/app/</code>) into Nodepod. TypeScript, React Router 8,
+      Tailwind 4, coss UI, Better Auth + SQLite. Regenerate with
+      <code>node examples/scelar-auth-template/sync-template.mjs</code> when Scelar templates change.
+    </p>
+  </header>
+
+  <div class="controls">
+    <button id="run">Boot + install + start</button>
+    <button id="clear">Clear log</button>
+  </div>
+
+  <div class="layout">
+    <div class="pane">
+      <h2>Log</h2>
+      <div id="output"></div>
+    </div>
+    <div class="pane">
+      <h2>Preview</h2>
+      <div id="status">Idle — click Boot to start</div>
+      <iframe
+        id="preview"
+        title="Scelar auth template preview"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+      ></iframe>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Nodepod, getProxyInstance } from '/dist/index.mjs';
+
+    const APP_ROOT = '/examples/scelar-auth-template/app';
+    const VFS_ROOT = '/project';
+
+    const out = document.getElementById('output');
+    const preview = document.getElementById('preview');
+    const statusEl = document.getElementById('status');
+    const runBtn = document.getElementById('run');
+    const clearBtn = document.getElementById('clear');
+
+    function log(text, cls = 'stdout') {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text + '\n';
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    clearBtn.addEventListener('click', () => {
+      out.textContent = '';
+    });
+
+    async function loadAppFiles() {
+      const manifestRes = await fetch(`${APP_ROOT}/manifest.json`);
+      if (!manifestRes.ok) {
+        throw new Error(`Failed to load manifest: ${manifestRes.status}`);
+      }
+      const files = await manifestRes.json();
+      const entries = [];
+      for (const rel of files) {
+        const res = await fetch(`${APP_ROOT}/${rel}`);
+        if (!res.ok) {
+          throw new Error(`Failed to load ${rel}: ${res.status}`);
+        }
+        entries.push([`${VFS_ROOT}/${rel}`, await res.text()]);
+      }
+      return entries;
+    }
+
+    async function runCommand(pod, command, args = []) {
+      const proc = await pod.spawn(command, args, { cwd: pod.cwd });
+      proc.on('output', (t) => log(t.trimEnd()));
+      proc.on('error', (t) => log(t.trimEnd(), 'stderr'));
+      return proc;
+    }
+
+    runBtn.addEventListener('click', async () => {
+      runBtn.disabled = true;
+      preview.removeAttribute('src');
+      setStatus('Booting…');
+
+      let onServerReady = null;
+      try {
+        let viteUrl = null;
+        let resolveVite;
+        const viteReady = new Promise((r) => {
+          resolveVite = r;
+        });
+
+        onServerReady = (port, url) => {
+          log(`Server ready: port=${port} ${url}`, 'info');
+          if (port === 5173 && !viteUrl) {
+            viteUrl = url;
+            resolveVite(url);
+          }
+        };
+        getProxyInstance().on('server-ready', onServerReady);
+
+        log('Booting Nodepod (workdir=/project)…', 'info');
+        const pod = await Nodepod.boot({ workdir: VFS_ROOT });
+        log('Booted.\n', 'pass');
+
+        log('Loading Scelar auth template from examples/scelar-auth-template/app/ …', 'info');
+        const files = await loadAppFiles();
+        for (const [path, content] of files) {
+          await pod.fs.writeFile(path, content);
+        }
+        log(`Wrote ${files.length} files to ${VFS_ROOT}.\n`, 'pass');
+
+        log('--- npm install ---', 'dim');
+        setStatus('Installing dependencies…');
+        const install = await runCommand(pod, 'npm', ['install']);
+        const installRes = await install.completion;
+        if (installRes.exitCode !== 0) {
+          log(`npm install failed (exit=${installRes.exitCode})`, 'fail');
+          setStatus('Install failed');
+          return;
+        }
+        log('npm install done.\n', 'pass');
+
+        log('--- Vite dev (Better Auth middleware on /api/auth) ---', 'dim');
+        setStatus('Starting Vite…');
+        const devProc = await runCommand(pod, 'npm', ['run', 'dev']);
+
+        const raced = await Promise.race([
+          viteReady,
+          devProc.completion.then((res) => ({ __exit: res.exitCode })),
+          new Promise((r) => setTimeout(() => r({ __timeout: true }), 180000)),
+        ]);
+
+        if (raced?.__exit != null) {
+          log(`Vite exited early (code=${raced.__exit})`, 'fail');
+          setStatus('Vite failed');
+          return;
+        }
+        if (raced?.__timeout) {
+          log('Timed out waiting for Vite on port 5173', 'fail');
+          setStatus('Timeout');
+          devProc.kill();
+          return;
+        }
+
+        log(`\nVite ready: ${viteUrl}`, 'pass');
+        setStatus(`Live — ${viteUrl}`);
+        preview.src = viteUrl;
+        log('\nOpen the preview: Sign up or Log in, then visit protected routes.', 'info');
+      } catch (err) {
+        log(String(err?.stack || err), 'fail');
+        setStatus('Error — see log');
+      } finally {
+        if (onServerReady) {
+          getProxyInstance().off('server-ready', onServerReady);
+        }
+        runBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
