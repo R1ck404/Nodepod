@@ -1,7 +1,7 @@
 // offload worker entry — runs transform/extract/build tasks on a dedicated thread
 // tar parser and base64 helpers are duplicated since workers can't share module state
 
-import { expose } from "comlink";
+import { expose, transfer as transferValue } from "comlink";
 import type {
   OffloadWorkerEndpoint,
   TransformTask,
@@ -110,6 +110,103 @@ interface TarEntry {
   payload?: Uint8Array;
 }
 
+export class ByteQueue {
+  private chunks: Uint8Array[] = [];
+  private offset = 0;
+  available = 0;
+
+  push(chunk: Uint8Array): void {
+    if (chunk.byteLength === 0) return;
+    this.chunks.push(chunk);
+    this.available += chunk.byteLength;
+  }
+
+  take(length: number): Uint8Array {
+    if (length > this.available) throw new Error("tar stream underflow");
+    const output = new Uint8Array(length);
+    let written = 0;
+    while (written < length) {
+      const first = this.chunks[0];
+      const count = Math.min(length - written, first.byteLength - this.offset);
+      output.set(first.subarray(this.offset, this.offset + count), written);
+      written += count;
+      this.offset += count;
+      this.available -= count;
+      if (this.offset === first.byteLength) {
+        this.chunks.shift();
+        this.offset = 0;
+      }
+    }
+    return output;
+  }
+
+  skip(length: number): void {
+    this.take(length);
+  }
+}
+
+function parseTarHeader(header: Uint8Array): Omit<TarEntry, "payload"> | null {
+  if (header.every((b) => b === 0)) return null;
+  const nameField = readNullTerminated(header, 0, 100);
+  if (!nameField) return null;
+  const byteSize = readOctalField(header, 124, 12);
+  const typeChar = String.fromCharCode(header[156]);
+  const prefixField = readNullTerminated(header, 345, 155);
+  return {
+    filepath: prefixField ? `${prefixField}/${nameField}` : nameField,
+    kind: classifyTypeFlag(typeChar),
+    byteSize,
+  };
+}
+
+async function* parseCompressedTar(
+  compressed: Uint8Array,
+): AsyncGenerator<TarEntry> {
+  if (typeof DecompressionStream === "undefined") {
+    if (!pakoModule) {
+      const pakoMod = await cdnImport(PAKO_URL);
+      pakoModule = pakoMod.default || pakoMod;
+    }
+    yield* parseTar(pakoModule.inflate(compressed) as Uint8Array);
+    return;
+  }
+
+  const stream = new Blob([compressed as BlobPart])
+    .stream()
+    .pipeThrough(new DecompressionStream("gzip"));
+  yield* parseTarStream(stream);
+}
+
+export async function* parseTarStream(
+  stream: ReadableStream<Uint8Array>,
+): AsyncGenerator<TarEntry> {
+  const reader = stream.getReader();
+  const queue = new ByteQueue();
+  let current: Omit<TarEntry, "payload"> | null = null;
+  while (true) {
+    const chunk = await reader.read();
+    if (!chunk.done) queue.push(chunk.value);
+    while (true) {
+      if (!current) {
+        if (queue.available < 512) break;
+        const header = parseTarHeader(queue.take(512));
+        if (!header) return;
+        current = header;
+      }
+      const padded = Math.ceil(current.byteSize / 512) * 512;
+      if (queue.available < padded) break;
+      const payload = current.byteSize > 0
+        ? queue.take(current.byteSize)
+        : new Uint8Array(0);
+      if (padded > current.byteSize) queue.skip(padded - current.byteSize);
+      yield { ...current, payload: current.kind === "file" ? payload : undefined };
+      current = null;
+    }
+    if (chunk.done) break;
+  }
+  if (current || queue.available > 0) throw new Error("Truncated tar archive");
+}
+
 function* parseTar(raw: Uint8Array): Generator<TarEntry> {
   const BLOCK = 512;
   let cursor = 0;
@@ -196,9 +293,6 @@ function ensureEsbuild(): Promise<void> {
 const workerEndpoint: OffloadWorkerEndpoint = {
   async init(): Promise<void> {
     if (initialized) return;
-
-    const pakoMod = await cdnImport(PAKO_URL);
-    pakoModule = pakoMod.default || pakoMod;
 
     initialized = true;
   },
@@ -287,7 +381,7 @@ const workerEndpoint: OffloadWorkerEndpoint = {
   },
 
   async extract(task: ExtractTask): Promise<ExtractResult> {
-    if (!pakoModule) throw new Error("Worker not initialized");
+    if (!initialized) throw new Error("Worker not initialized");
 
     let compressed: Uint8Array;
     if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
@@ -318,10 +412,8 @@ const workerEndpoint: OffloadWorkerEndpoint = {
       }
     }
 
-    const tarBytes = pakoModule.inflate(compressed) as Uint8Array;
-
     const files: ExtractedFile[] = [];
-    for (const entry of parseTar(tarBytes)) {
+    for await (const entry of parseCompressedTar(compressed)) {
       if (entry.kind !== "file" && entry.kind !== "directory") continue;
 
       let relative = entry.filepath;
@@ -355,7 +447,11 @@ const workerEndpoint: OffloadWorkerEndpoint = {
         compressed.byteOffset + compressed.byteLength,
       ) as ArrayBuffer;
     }
-    return result;
+    const transferables = files
+      .filter((file) => file.data instanceof Uint8Array)
+      .map((file) => (file.data as Uint8Array).buffer as ArrayBuffer);
+    if (result.tarballBytes) transferables.push(result.tarballBytes);
+    return transferValue(result, transferables);
   },
 
   async build(task: BuildTask): Promise<BuildResult> {
@@ -449,4 +545,6 @@ const workerEndpoint: OffloadWorkerEndpoint = {
   },
 };
 
-expose(workerEndpoint);
+if (typeof self !== "undefined" && typeof self.postMessage === "function") {
+  expose(workerEndpoint);
+}

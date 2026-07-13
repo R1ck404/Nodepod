@@ -220,9 +220,8 @@ export async function downloadAndExtract(
 ): Promise<string[]> {
   opts.onProgress?.(`Fetching ${url}...`);
 
-  // warm runs skip the network: pass cached tarball bytes into the worker;
-  // on a miss ask the worker for the compressed bytes and persist them.
-  // any cache failure degrades to an uncached install.
+  // fetch outside the extraction slot so downloads can overlap while archive
+  // inflation stays serialized under the memory budget
   let cachedBytes: ArrayBuffer | null = null;
   let cache: Awaited<ReturnType<typeof getTarballCache>> = null;
   try {
@@ -232,52 +231,59 @@ export async function downloadAndExtract(
     cache = null;
   }
 
+  if (!cachedBytes) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Archive download failed (HTTP ${response.status}): ${url}`);
+    }
+    cachedBytes = await response.arrayBuffer();
+  }
+
+  const extractionId = taskId();
   const result: ExtractResult = await withExtractionSlot(() => offload({
     type: "extract",
-    id: taskId(),
+    id: extractionId,
     tarballUrl: url,
     stripComponents: opts.stripComponents ?? 1,
     priority: TaskPriority.NORMAL,
     expectedShasum: opts.expectedShasum,
-    tarballBytes: cachedBytes ?? undefined,
-    wantTarball: !cachedBytes && !!cache,
+    tarballBytes: cachedBytes,
+    wantTarball: false,
   }));
 
   if (
     cache &&
-    !cachedBytes &&
-    result.tarballBytes &&
-    result.tarballBytes.byteLength > 0 &&
-    result.tarballBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
+    cachedBytes.byteLength > 0 &&
+    cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
   ) {
-    cache.put(url, result.tarballBytes, opts.expectedShasum).catch(() => {});
+    cache.put(url, cachedBytes, opts.expectedShasum).catch(() => {});
   }
 
+  const stageRoot = `/.nodepod/install/${extractionId}`;
   const writtenPaths: string[] = [];
+  vol.mkdirSync(stageRoot, { recursive: true });
   for (const file of result.files) {
     if (opts.filter && !opts.filter(file.path)) continue;
 
+    const staged = safeJoin(stageRoot, file.path);
     const absolute = safeJoin(destDir, file.path);
-    if (!absolute) continue;
-    const parentDir = path.dirname(absolute);
-    vol.mkdirSync(parentDir, { recursive: true });
+    if (!staged || !absolute) continue;
+    vol.mkdirSync(path.dirname(staged), { recursive: true });
 
-    if (file.isBinary) {
-      // binary data arrives as raw Uint8Array (large files via structured clone)
-      // or base64 string (small files)
-      const bytes = file.data instanceof Uint8Array
-        ? file.data
-        : base64ToBytes(file.data as string);
-      vol.writeFileSync(absolute, bytes);
-      // pre-compile WASM so it's ready by the time code needs it
-      if (absolute.endsWith(".wasm")) {
-        precompileWasm(bytes);
-      }
-    } else {
-      vol.writeFileSync(absolute, file.data as string);
+    const bytes = file.data instanceof Uint8Array
+      ? file.data
+      : file.isBinary
+        ? base64ToBytes(file.data as string)
+        : file.data as string;
+    vol.writeFileSync(staged, bytes);
+    if (absolute.endsWith(".wasm") && bytes instanceof Uint8Array) {
+      precompileWasm(bytes);
     }
     writtenPaths.push(absolute);
   }
+
+  vol.mkdirSync(path.dirname(destDir), { recursive: true });
+  vol.renameSync(stageRoot, destDir);
 
   opts.onProgress?.(`Extracted ${writtenPaths.length} files`);
   return writtenPaths;

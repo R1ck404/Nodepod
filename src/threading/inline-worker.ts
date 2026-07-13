@@ -73,7 +73,18 @@ function miniExpose(obj) {
 
     Promise.resolve(returnValue)
       .then(function(result) {
-        self.postMessage({ id: id, type: "RAW", value: result });
+        const transferables = [];
+        if (result && Array.isArray(result.files)) {
+          for (const file of result.files) {
+            if (file && file.data instanceof Uint8Array && file.data.buffer instanceof ArrayBuffer) {
+              transferables.push(file.data.buffer);
+            }
+          }
+        }
+        if (result && result.tarballBytes instanceof ArrayBuffer) {
+          transferables.push(result.tarballBytes);
+        }
+        self.postMessage({ id: id, type: "RAW", value: result }, transferables);
       })
       .catch(function(err) {
         self.postMessage({
@@ -151,6 +162,87 @@ function* parseTar(raw) {
   }
 }
 
+class ByteQueue {
+  constructor() { this.chunks = []; this.offset = 0; this.available = 0; }
+  push(chunk) {
+    if (!chunk.byteLength) return;
+    this.chunks.push(chunk);
+    this.available += chunk.byteLength;
+  }
+  take(length) {
+    if (length > this.available) throw new Error("tar stream underflow");
+    const output = new Uint8Array(length);
+    let written = 0;
+    while (written < length) {
+      const first = this.chunks[0];
+      const count = Math.min(length - written, first.byteLength - this.offset);
+      output.set(first.subarray(this.offset, this.offset + count), written);
+      written += count;
+      this.offset += count;
+      this.available -= count;
+      if (this.offset === first.byteLength) {
+        this.chunks.shift();
+        this.offset = 0;
+      }
+    }
+    return output;
+  }
+  skip(length) { this.take(length); }
+}
+
+function parseTarHeader(header) {
+  if (header.every(function(b) { return b === 0; })) return null;
+  const nameField = readNullTerminated(header, 0, 100);
+  if (!nameField) return null;
+  const byteSize = readOctalField(header, 124, 12);
+  const typeChar = String.fromCharCode(header[156]);
+  const prefixField = readNullTerminated(header, 345, 155);
+  return {
+    filepath: prefixField ? prefixField + "/" + nameField : nameField,
+    kind: classifyTypeFlag(typeChar),
+    byteSize: byteSize,
+  };
+}
+
+async function* parseCompressedTar(compressed) {
+  if (typeof DecompressionStream === "undefined") {
+    if (!pakoModule) {
+      const pakoMod = await cdnImport(PAKO_URL);
+      pakoModule = pakoMod.default || pakoMod;
+    }
+    yield* parseTar(pakoModule.inflate(compressed));
+    return;
+  }
+  const reader = new Blob([compressed]).stream()
+    .pipeThrough(new DecompressionStream("gzip")).getReader();
+  const queue = new ByteQueue();
+  let current = null;
+  while (true) {
+    const chunk = await reader.read();
+    if (!chunk.done) queue.push(chunk.value);
+    while (true) {
+      if (!current) {
+        if (queue.available < 512) break;
+        current = parseTarHeader(queue.take(512));
+        if (!current) return;
+      }
+      const padded = Math.ceil(current.byteSize / 512) * 512;
+      if (queue.available < padded) break;
+      const payload = current.byteSize > 0 ? queue.take(current.byteSize) : new Uint8Array(0);
+      if (padded > current.byteSize) queue.skip(padded - current.byteSize);
+      yield {
+        filepath: current.filepath,
+        kind: current.kind,
+        byteSize: current.byteSize,
+        payload: current.kind === "file" ? payload : undefined,
+      };
+      current = null;
+    }
+    if (chunk.done) break;
+  }
+  if (current || queue.available > 0) throw new Error("Truncated tar archive");
+}
+
 function detectJsx(source) {
   if (/<[A-Z][a-zA-Z0-9.]*[\\s/>]/.test(source)) return true;
   if (/<\\/[a-zA-Z]/.test(source)) return true;
@@ -195,9 +287,6 @@ function ensureEsbuild() {
 const endpoint = {
   async init() {
     if (_initialized) return;
-
-    const pakoMod = await cdnImport(PAKO_URL);
-    pakoModule = pakoMod.default || pakoMod;
 
     _initialized = true;
   },
@@ -248,7 +337,7 @@ const endpoint = {
   },
 
   async extract(task) {
-    if (!pakoModule) throw new Error("Worker not initialized");
+    if (!_initialized) throw new Error("Worker not initialized");
 
     // main thread passes cached tarball bytes on warm runs — skip the fetch
     let compressed;
@@ -261,10 +350,8 @@ const endpoint = {
       }
       compressed = new Uint8Array(await response.arrayBuffer());
     }
-    const tarBytes = pakoModule.inflate(compressed);
-
     const files = [];
-    for (const entry of parseTar(tarBytes)) {
+    for await (const entry of parseCompressedTar(compressed)) {
       if (entry.kind !== "file" && entry.kind !== "directory") continue;
       let relative = entry.filepath;
       if (task.stripComponents > 0) {
@@ -273,20 +360,7 @@ const endpoint = {
         relative = segments.slice(task.stripComponents).join("/");
       }
       if (entry.kind === "file" && entry.payload) {
-        let data;
-        let isBinary = false;
-        try {
-          // TextDecoder rejects SAB-backed views
-          const payload = entry.payload;
-          const decodable = (typeof SharedArrayBuffer !== "undefined" && payload.buffer instanceof SharedArrayBuffer)
-            ? (function () { const c = new Uint8Array(payload.byteLength); c.set(payload); return c; })()
-            : payload;
-          data = new TextDecoder("utf-8", { fatal: true }).decode(decodable);
-        } catch (e) {
-          data = uint8ToBase64(entry.payload);
-          isBinary = true;
-        }
-        files.push({ path: relative, data: data, isBinary: isBinary });
+        files.push({ path: relative, data: entry.payload, isBinary: true });
       }
     }
 
