@@ -11,6 +11,7 @@ import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
 import {
   setSqliteHostBridge,
   warmSqliteEngine,
+  warmSqliteWasmBytes,
   WASM_CACHE_PATH,
   WASM_SAB_HEADER_BYTES,
   WASM_SAB_MAX_BYTES,
@@ -327,11 +328,15 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
 
   installSqliteHostBridge();
 
-  // DatabaseSync must be ready before synchronous user code can construct it
-  try {
-    await warmSqliteEngine();
-  } catch (err) {
-    console.warn("[node:sqlite] automatic initialization failed:", err);
+  if (msg.sqliteStartup === "bytes") {
+    warmSqliteWasmBytes();
+  } else {
+    // DatabaseSync must be ready before synchronous user code can construct it
+    try {
+      await warmSqliteEngine();
+    } catch (err) {
+      console.warn("[node:sqlite] automatic initialization failed:", err);
+    }
   }
 
   _initialized = true;

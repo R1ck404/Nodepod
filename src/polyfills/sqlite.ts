@@ -906,6 +906,16 @@ export async function warmSqliteEngine(): Promise<boolean> {
   return preloadSqlite();
 }
 
+export function warmSqliteWasmBytes(): boolean {
+  if (!hostBridge) return false;
+  try {
+    hostBridge.ensureWasmCached();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 interface DbOptions {
   open?: boolean;
   readBigInts?: boolean;
@@ -1556,6 +1566,7 @@ export default {
   backup,
   constants,
   preloadSqlite,
+  warmSqliteWasmBytes,
   setVolume,
   setSqliteCwd,
   setSqliteHostBridge,

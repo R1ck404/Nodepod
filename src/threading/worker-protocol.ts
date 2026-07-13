@@ -33,6 +33,7 @@ export interface MainToWorker_Init {
   // dedicated fs proxy port for the process worker's own lazy VFS reads
   // (lean spawn mode — snapshot excluded node_modules etc.)
   lazyFsPort?: MessagePort;
+  sqliteStartup?: "bytes" | "engine";
 }
 
 export interface MainToWorker_Probe {

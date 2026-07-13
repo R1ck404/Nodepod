@@ -209,6 +209,9 @@ export class ProcessManager extends EventEmitter {
       syncBuffer: spawnConfig.syncBuffer,
       wasiFsPorts,
       lazyFsPort,
+      sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
+        ? "bytes"
+        : "engine",
     };
     this._processPorts.set(pid, ownedPorts);
     try {
@@ -222,6 +225,24 @@ export class ProcessManager extends EventEmitter {
 
     this.emit("spawn", pid, config.command, config.args);
     return handle;
+  }
+
+  private _isDependencyManagementCommand(command: string, args: string[]): boolean {
+    const name = command.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+    const manager = name.replace(/\.(cmd|exe)$/, "");
+    if (manager !== "npm" && manager !== "pnpm" && manager !== "yarn" && manager !== "bun") {
+      return false;
+    }
+    const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+    return subcommand === undefined
+      || subcommand === "install"
+      || subcommand === "i"
+      || subcommand === "ci"
+      || subcommand === "add"
+      || subcommand === "remove"
+      || subcommand === "uninstall"
+      || subcommand === "update"
+      || subcommand === "up";
   }
 
 
