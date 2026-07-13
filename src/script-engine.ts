@@ -19,7 +19,6 @@ import {
   MAIN_FIELD_EXTENSIONS,
   INDEX_FILES,
   IMPORTS_FIELD_EXTENSIONS,
-  LIMITS,
 } from "./constants/config";
 import { buildProcessEnv, ProcessObject } from "./polyfills/process";
 import * as httpPolyfill from "./polyfills/http";
@@ -313,7 +312,50 @@ function rewriteDynamicImportsRegex(source: string): string {
 
 // ── ESM → CJS conversion ──
 function convertModuleSyntax(source: string, filePath: string): string {
-  if (!/\bimport\b|\bexport\b/.test(source)) return source;
+  return convertModuleSyntaxDetailed(source, filePath).code;
+}
+
+function astHasTopLevelAwait(ast: any): boolean {
+  let found = false;
+  let insideAsync = 0;
+  const walk = (node: any): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    if (typeof node.type !== "string") return;
+    const isAsyncFn =
+      (node.type === "FunctionDeclaration" ||
+        node.type === "FunctionExpression" ||
+        node.type === "ArrowFunctionExpression") && node.async;
+    if (isAsyncFn) insideAsync++;
+    if (
+      (node.type === "AwaitExpression" ||
+        (node.type === "ForOfStatement" && node.await)) &&
+      insideAsync === 0
+    ) {
+      found = true;
+    }
+    if (!found) {
+      for (const key of Object.keys(node)) {
+        if (key === "type" || key === "start" || key === "end") continue;
+        walk(node[key]);
+      }
+    }
+    if (isAsyncFn) insideAsync--;
+  };
+  walk(ast);
+  return found;
+}
+
+function convertModuleSyntaxDetailed(
+  source: string,
+  filePath: string,
+): { code: string; hasTLA: boolean } {
+  if (!/\bimport\b|\bexport\b/.test(source)) {
+    return { code: source, hasTLA: hasTopLevelAwait(source) };
+  }
   try {
     return convertViaAst(source, filePath);
   } catch (astErr) {
@@ -323,11 +365,15 @@ function convertModuleSyntax(source: string, filePath: string): string {
       "falling back to regex:",
       astErr instanceof Error ? astErr.message : String(astErr),
     );
-    return convertViaRegex(source, filePath);
+    const code = convertViaRegex(source, filePath);
+    return { code, hasTLA: hasTopLevelAwait(code) };
   }
 }
 
-function convertViaAst(source: string, filePath: string): string {
+function convertViaAst(
+  source: string,
+  filePath: string,
+): { code: string; hasTLA: boolean } {
   const ast = acorn.parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
@@ -373,7 +419,7 @@ function convertViaAst(source: string, filePath: string): string {
   // .mjs files with `const require = createRequire(...)` hit TDZ after esmToCjs
   output = demoteLexicalRequire(output);
 
-  return output;
+  return { code: output, hasTLA: astHasTopLevelAwait(ast) };
 }
 
 // stamped by convertModuleSyntax, stripped by buildModuleWrapper. #56
@@ -1589,9 +1635,6 @@ function buildResolver(
 
     cache[resolved] = record;
 
-    const keys = Object.keys(cache);
-    if (keys.length > LIMITS.MODULE_CACHE_MAX) delete cache[keys[0]];
-
     if (resolved.endsWith(".json")) {
       const raw = vol.readFileSync(resolved, "utf8");
       record.exports = JSON.parse(raw);
@@ -1622,6 +1665,7 @@ function buildResolver(
 
     const codeCacheKey = `${resolved}|${quickDigest(rawSource)}`;
     let processedCode = codeCache?.get(codeCacheKey);
+    let moduleHasTLA = codeCache?.get(`${codeCacheKey}|tla`) === "1";
 
     if (!processedCode) {
       processedCode = rawSource;
@@ -1681,13 +1725,18 @@ function buildResolver(
           /* can't parse — leave untransformed */
         }
       } else {
-        processedCode = convertModuleSyntax(processedCode, resolved);
+        const converted = convertModuleSyntaxDetailed(processedCode, resolved);
+        processedCode = converted.code;
+        moduleHasTLA = converted.hasTLA;
       }
       codeCache?.set(codeCacheKey, processedCode);
+      codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
     }
 
     const isCjs = resolved.endsWith(".cjs");
-    const moduleHasTLA = !isCjs && hasTopLevelAwait(processedCode);
+    if (!isCjs && !codeCache?.has(`${codeCacheKey}|tla`)) {
+      moduleHasTLA = hasTopLevelAwait(processedCode);
+    }
     const useFullDeAsync = deAsyncImports || moduleHasTLA;
     if (!isCjs)
       processedCode = stripTopLevelAwait(
@@ -2685,6 +2734,7 @@ export class ScriptEngine {
     if (isTypeScriptFile(filename)) {
       processed = stripTypeScript(processed);
     }
+    let fileHasTLA = false;
     if (filename.endsWith(".cjs")) {
       try {
         const cjsAst = acorn.parse(processed, {
@@ -2732,11 +2782,12 @@ export class ScriptEngine {
         /* can't parse */
       }
     } else {
-      processed = convertModuleSyntax(processed, filename);
+      const converted = convertModuleSyntaxDetailed(processed, filename);
+      processed = converted.code;
+      fileHasTLA = converted.hasTLA;
     }
 
     const isCjs = filename.endsWith(".cjs");
-    const fileHasTLA = !isCjs && hasTopLevelAwait(processed);
     if (!isCjs) processed = stripTopLevelAwait(processed);
 
     const resolver = buildResolver(
@@ -2830,6 +2881,7 @@ export class ScriptEngine {
     if (isTypeScriptFile(filename)) {
       processed = stripTypeScript(processed);
     }
+    let tla = false;
     if (filename.endsWith(".cjs")) {
       processed = rewriteDynamicImportsRegex(processed);
       processed = processed.replace(
@@ -2841,9 +2893,10 @@ export class ScriptEngine {
         `({ url: "file://${filename}" })`,
       );
     } else {
-      processed = convertModuleSyntax(processed, filename);
+      const converted = convertModuleSyntaxDetailed(processed, filename);
+      processed = converted.code;
+      tla = converted.hasTLA;
     }
-    const tla = hasTopLevelAwait(processed);
     const tlaStripped = stripTopLevelAwait(processed);
 
     // Don't propagate deAsyncImports from entry — it uses native await (async IIFE),
