@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 interface PerfResult {
   phases: Record<string, number>;
   runtime: {
-    timings: Record<string, { lastMs: number }>;
+    timings: Record<string, { count: number; totalMs: number; lastMs: number }>;
     counters: Record<string, number>;
   };
   memory: { heap: { usedMB: number } | null };
@@ -71,6 +71,10 @@ test("records cold and warm Scelar startup phases", async ({ browser }, testInfo
     viteReady: {
       medianMs: percentile(runs.map((run) => run.warm.phases.viteReadyMs), 0.5),
       p95Ms: percentile(runs.map((run) => run.warm.phases.viteReadyMs), 0.95),
+    },
+    processReady: {
+      coldMedianMs: percentile(runs.map((run) => run.cold.runtime.timings["process.ready"]?.totalMs ?? 0), 0.5),
+      warmMedianMs: percentile(runs.map((run) => run.warm.runtime.timings["process.ready"]?.totalMs ?? 0), 0.5),
     },
   };
   console.log(`Scelar performance: ${JSON.stringify(summary)}`);
