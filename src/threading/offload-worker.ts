@@ -428,11 +428,16 @@ const workerEndpoint: OffloadWorkerEndpoint = {
           // the destination VFS stores bytes; keeping every entry binary
           // avoids UTF-16 and base64 amplification while the archive and its
           // extracted result coexist.
-          files.push({
+          const file = {
             path: relative,
             data: new Uint8Array(entry.payload),
             isBinary: true,
-          });
+          };
+          if (task.streamPort) {
+            task.streamPort.postMessage({ type: "file", file }, [file.data.buffer]);
+          } else {
+            files.push(file);
+          }
         } catch (fileErr) {
           // don't fail the whole extraction for one bad file
           console.warn(`[offload] Failed to encode ${relative} (${entry.payload.length} bytes):`, fileErr);
@@ -440,7 +445,16 @@ const workerEndpoint: OffloadWorkerEndpoint = {
       }
     }
 
-    const result: ExtractResult = { type: "extract" as const, id: task.id, files };
+    if (task.streamPort) {
+      task.streamPort.postMessage({ type: "done" });
+      task.streamPort.close();
+    }
+    const result: ExtractResult = {
+      type: "extract" as const,
+      id: task.id,
+      files,
+      streamed: !!task.streamPort,
+    };
     if (task.wantTarball) {
       result.tarballBytes = compressed.buffer.slice(
         compressed.byteOffset,

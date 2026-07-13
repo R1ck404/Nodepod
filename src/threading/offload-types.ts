@@ -39,6 +39,7 @@ export interface ExtractTask {
   tarballBytes?: ArrayBuffer;
   // ask the worker to return the compressed bytes so main can cache them
   wantTarball?: boolean;
+  streamPort?: MessagePort;
 }
 
 export interface ExtractedFile {
@@ -54,6 +55,7 @@ export interface ExtractResult {
   files: ExtractedFile[];
   // compressed tarball bytes, present when the task set wantTarball
   tarballBytes?: ArrayBuffer;
+  streamed?: boolean;
 }
 
 export interface BuildTask {

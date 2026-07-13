@@ -11,6 +11,7 @@ import type {
   BuildTask,
   BuildResult,
 } from "./offload-types";
+import { transfer } from "comlink";
 
 // --- Internal types ---
 
@@ -152,7 +153,11 @@ export class TaskQueue {
           result = await endpoint.transform(queued.task);
           break;
         case "extract":
-          result = await endpoint.extract(queued.task);
+          result = await endpoint.extract(
+            queued.task.streamPort
+              ? transfer(queued.task, [queued.task.streamPort])
+              : queued.task,
+          );
           break;
         case "build":
           result = await endpoint.build(queued.task);

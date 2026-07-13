@@ -26,6 +26,18 @@ async function withExtractionSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+function removeTree(vol: MemoryVolume, root: string): void {
+  if (!vol.existsSync(root)) return;
+  if (!vol.statSync(root).isDirectory()) {
+    vol.unlinkSync(root);
+    return;
+  }
+  for (const name of vol.readdirSync(root) as string[]) {
+    removeTree(vol, path.join(root, name));
+  }
+  vol.rmdirSync(root);
+}
+
 /** Returns safe absolute path if relative stays inside destDir, else null (zip-slip guard). */
 export function safeJoin(destDir: string, relative: string): string | null {
   const base = path.normalize(destDir).replace(/\/+$/, "");
@@ -240,16 +252,60 @@ export async function downloadAndExtract(
   }
 
   const extractionId = taskId();
-  const result: ExtractResult = await withExtractionSlot(() => offload({
-    type: "extract",
-    id: extractionId,
-    tarballUrl: url,
-    stripComponents: opts.stripComponents ?? 1,
-    priority: TaskPriority.NORMAL,
-    expectedShasum: opts.expectedShasum,
-    tarballBytes: cachedBytes,
-    wantTarball: false,
-  }));
+  const stageRoot = `/.nodepod/install/${extractionId}`;
+  const writtenPaths: string[] = [];
+  vol.mkdirSync(stageRoot, { recursive: true });
+  const channel = new MessageChannel();
+  let finishStream!: () => void;
+  const streamDone = new Promise<void>((resolve) => { finishStream = resolve; });
+  channel.port1.onmessage = (event: MessageEvent) => {
+    const message = event.data;
+    if (message?.type === "done") {
+      finishStream();
+      return;
+    }
+    if (message?.type !== "file" || !message.file) return;
+    writeExtractedFile(message.file);
+  };
+  channel.port1.start();
+
+  const writeExtractedFile = (file: ExtractResult["files"][number]): void => {
+    if (opts.filter && !opts.filter(file.path)) return;
+    const staged = safeJoin(stageRoot, file.path);
+    const absolute = safeJoin(destDir, file.path);
+    if (!staged || !absolute) return;
+    vol.mkdirSync(path.dirname(staged), { recursive: true });
+    const bytes = file.data instanceof Uint8Array
+      ? file.data
+      : file.isBinary
+        ? base64ToBytes(file.data as string)
+        : file.data as string;
+    vol.writeFileSync(staged, bytes);
+    if (absolute.endsWith(".wasm") && bytes instanceof Uint8Array) precompileWasm(bytes);
+    writtenPaths.push(absolute);
+  };
+
+  let result: ExtractResult;
+  try {
+    result = await withExtractionSlot(() => offload({
+      type: "extract",
+      id: extractionId,
+      tarballUrl: url,
+      stripComponents: opts.stripComponents ?? 1,
+      priority: TaskPriority.NORMAL,
+      expectedShasum: opts.expectedShasum,
+      tarballBytes: cachedBytes,
+      wantTarball: false,
+      streamPort: channel.port2,
+    }));
+    if (result.streamed) await streamDone;
+    else for (const file of result.files) writeExtractedFile(file);
+  } catch (error) {
+    removeTree(vol, stageRoot);
+    throw error;
+  } finally {
+    channel.port1.close();
+  }
 
   if (
     cache &&
@@ -257,29 +313,6 @@ export async function downloadAndExtract(
     cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
   ) {
     cache.put(url, cachedBytes, opts.expectedShasum).catch(() => {});
-  }
-
-  const stageRoot = `/.nodepod/install/${extractionId}`;
-  const writtenPaths: string[] = [];
-  vol.mkdirSync(stageRoot, { recursive: true });
-  for (const file of result.files) {
-    if (opts.filter && !opts.filter(file.path)) continue;
-
-    const staged = safeJoin(stageRoot, file.path);
-    const absolute = safeJoin(destDir, file.path);
-    if (!staged || !absolute) continue;
-    vol.mkdirSync(path.dirname(staged), { recursive: true });
-
-    const bytes = file.data instanceof Uint8Array
-      ? file.data
-      : file.isBinary
-        ? base64ToBytes(file.data as string)
-        : file.data as string;
-    vol.writeFileSync(staged, bytes);
-    if (absolute.endsWith(".wasm") && bytes instanceof Uint8Array) {
-      precompileWasm(bytes);
-    }
-    writtenPaths.push(absolute);
   }
 
   vol.mkdirSync(path.dirname(destDir), { recursive: true });

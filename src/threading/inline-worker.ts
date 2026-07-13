@@ -350,6 +350,17 @@ const endpoint = {
       }
       compressed = new Uint8Array(await response.arrayBuffer());
     }
+    if (task.expectedShasum) {
+      const hashInput = new Uint8Array(compressed.byteLength);
+      hashInput.set(compressed);
+      const hashBuffer = await crypto.subtle.digest("SHA-1", hashInput);
+      const hashHex = Array.from(new Uint8Array(hashBuffer))
+        .map(function(b) { return b.toString(16).padStart(2, "0"); })
+        .join("");
+      if (hashHex !== task.expectedShasum) {
+        throw new Error("Integrity check failed for " + task.tarballUrl + ": expected shasum " + task.expectedShasum + ", got " + hashHex);
+      }
+    }
     const files = [];
     for await (const entry of parseCompressedTar(compressed)) {
       if (entry.kind !== "file" && entry.kind !== "directory") continue;
@@ -360,11 +371,20 @@ const endpoint = {
         relative = segments.slice(task.stripComponents).join("/");
       }
       if (entry.kind === "file" && entry.payload) {
-        files.push({ path: relative, data: entry.payload, isBinary: true });
+        const file = { path: relative, data: entry.payload, isBinary: true };
+        if (task.streamPort) {
+          task.streamPort.postMessage({ type: "file", file: file }, [file.data.buffer]);
+        } else {
+          files.push(file);
+        }
       }
     }
 
-    const result = { type: "extract", id: task.id, files: files };
+    if (task.streamPort) {
+      task.streamPort.postMessage({ type: "done" });
+      task.streamPort.close();
+    }
+    const result = { type: "extract", id: task.id, files: files, streamed: !!task.streamPort };
     // hand the compressed bytes back so main can persist them (tarball cache)
     if (task.wantTarball) {
       result.tarballBytes = compressed.buffer.byteLength === compressed.byteLength
