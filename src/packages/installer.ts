@@ -20,6 +20,7 @@ import {
   restoreBinarySnapshot,
 } from "../persistence/binary-snapshot";
 import { getTarballCache } from "../persistence/tarball-cache";
+import type { PerformanceTracker } from "../performance-tracker";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -118,12 +119,21 @@ export class DependencyInstaller {
   private registryClient: RegistryClient;
   private workingDir: string;
   private _snapshotCache: IDBSnapshotCache | null;
+  private _performance: PerformanceTracker | null;
 
-  constructor(vol: MemoryVolume, opts: { cwd?: string; snapshotCache?: IDBSnapshotCache | null } & RegistryConfig = {}) {
+  constructor(
+    vol: MemoryVolume,
+    opts: {
+      cwd?: string;
+      snapshotCache?: IDBSnapshotCache | null;
+      performanceTracker?: PerformanceTracker | null;
+    } & RegistryConfig = {},
+  ) {
     this.vol = vol;
     this.registryClient = new RegistryClient(opts);
     this.workingDir = opts.cwd || "/";
     this._snapshotCache = opts.snapshotCache ?? null;
+    this._performance = opts.performanceTracker ?? null;
   }
 
   // -----------------------------------------------------------------------
@@ -135,6 +145,7 @@ export class DependencyInstaller {
     version?: string,
     flags: InstallFlags = {},
   ): Promise<InstallOutcome> {
+    const stopInstall = this._performance?.start("install.total");
     const { onProgress } = flags;
 
     const spec = splitSpecifier(packageName);
@@ -152,11 +163,13 @@ export class DependencyInstaller {
       onProgress,
     };
 
+    const stopResolution = this._performance?.start("install.resolve");
     const tree = await resolveDependencyTree(
       targetName,
       targetRange,
       resolutionOpts,
     );
+    stopResolution?.();
 
     // snapshot cache keyed by the resolved package set — skips download,
     // extract, and transform on warm runs (resolution still hit the registry).
@@ -173,7 +186,9 @@ export class DependencyInstaller {
         const cached = await this._snapshotCache.get(treeKey);
         if (cached) {
           onProgress?.("Restoring cached packages...");
+          const stopRestore = this._performance?.start("install.restore");
           const restored = restoreBinarySnapshot(this.vol, cached);
+          stopRestore?.();
           // bin stubs + lock file are deterministic — recreate from the tree
           const nmRoot = path.join(this.workingDir, "node_modules");
           for (const [depName] of tree) {
@@ -187,6 +202,8 @@ export class DependencyInstaller {
             }
           }
           onProgress?.(`Restored ${restored} cached entries`);
+          this._performance?.increment("install.cacheHits");
+          stopInstall?.();
           return { resolved: tree, newPackages: [] };
         }
       } catch {
@@ -194,7 +211,9 @@ export class DependencyInstaller {
       }
     }
 
+    const stopMaterialize = this._performance?.start("install.materialize");
     const newPkgs = await this.materializePackages(tree, flags);
+    stopMaterialize?.();
 
     // cache just this tree's package dirs so unrelated node_modules content
     // from the session doesn't leak into the entry
@@ -222,6 +241,7 @@ export class DependencyInstaller {
 
     onProgress?.(`Installed ${tree.size} package(s)`);
 
+    stopInstall?.();
     return { resolved: tree, newPackages: newPkgs };
   }
 
@@ -229,6 +249,7 @@ export class DependencyInstaller {
     manifestPath?: string,
     flags: InstallFlags = {},
   ): Promise<InstallOutcome> {
+    const stopInstall = this._performance?.start("install.total");
     const { onProgress } = flags;
 
     const jsonPath = manifestPath || path.join(this.workingDir, "package.json");
@@ -247,8 +268,12 @@ export class DependencyInstaller {
         const cached = await this._snapshotCache.get(cacheKey);
         if (cached) {
           onProgress?.("Restoring cached node_modules...");
+          const stopRestore = this._performance?.start("install.restore");
           const restored = restoreBinarySnapshot(this.vol, cached);
+          stopRestore?.();
           onProgress?.(`Restored ${restored} cached entries`);
+          this._performance?.increment("install.cacheHits");
+          stopInstall?.();
           return { resolved: new Map(), newPackages: [] };
         }
       } catch {
@@ -267,9 +292,13 @@ export class DependencyInstaller {
       onProgress,
     };
 
+    const stopResolution = this._performance?.start("install.resolve");
     const tree = await resolveFromManifest(manifest, resolutionOpts);
+    stopResolution?.();
 
+    const stopMaterialize = this._performance?.start("install.materialize");
     const newPkgs = await this.materializePackages(tree, flags);
+    stopMaterialize?.();
 
     // Cache the installed node_modules snapshot for future reuse (raw bytes,
     // no base64 — restores go through the bulk binary path)
@@ -284,6 +313,7 @@ export class DependencyInstaller {
 
     onProgress?.(`Installed ${tree.size} package(s)`);
 
+    stopInstall?.();
     return { resolved: tree, newPackages: newPkgs };
   }
 
@@ -372,48 +402,48 @@ export class DependencyInstaller {
     }
 
     // Safe to batch aggressively since extract + transform are offloaded to workers
-    // archive inflation is serialized separately; four fetch/transform lanes
-    // recover cold-install speed without recreating the old six-inflate peak.
-    const WORKER_COUNT = 4;
+    // downloads stay work-conserving while archive inflation is serialized
+    const WORKER_COUNT = 6;
     onProgress?.(`Downloading ${pending.length} package(s)...`);
 
-    for (let offset = 0; offset < pending.length; offset += WORKER_COUNT) {
-      const batch = pending.slice(offset, offset + WORKER_COUNT);
+    let nextPackage = 0;
+    const runLane = async () => {
+      while (nextPackage < pending.length) {
+        const { depName, dep, targetDir } = pending[nextPackage++];
+        onProgress?.(`  Fetching ${depName}@${dep.version}...`);
 
-      await Promise.all(
-        batch.map(async ({ depName, dep, targetDir }) => {
-          onProgress?.(`  Fetching ${depName}@${dep.version}...`);
+        await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
+          stripComponents: 1,
+          expectedShasum: dep.shasum,
+        });
 
-          await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
-            stripComponents: 1,
-            expectedShasum: dep.shasum,
-          });
-
-          if (shouldTransform) {
-            try {
-              const transformed = await convertPackage(
-                this.vol,
-                targetDir,
-                onProgress,
-              );
-              if (transformed > 0) {
-                onProgress?.(
-                  `  Transformed ${transformed} file(s) in ${depName}`,
-                );
-              }
-            } catch (err) {
+        if (shouldTransform) {
+          try {
+            const transformed = await convertPackage(
+              this.vol,
+              targetDir,
+              onProgress,
+            );
+            if (transformed > 0) {
               onProgress?.(
-                `  Warning: transformation failed for ${depName}: ${err}`,
+                `  Transformed ${transformed} file(s) in ${depName}`,
               );
             }
+          } catch (err) {
+            onProgress?.(
+              `  Warning: transformation failed for ${depName}: ${err}`,
+            );
           }
+        }
 
-          this.createBinStubs(nmRoot, depName, targetDir);
+        this.createBinStubs(nmRoot, depName, targetDir);
 
-          additions.push(depName);
-        }),
-      );
-    }
+        additions.push(depName);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(WORKER_COUNT, pending.length) }, () => runLane()),
+    );
 
     this.writeLockFile(tree);
 
