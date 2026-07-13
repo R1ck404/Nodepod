@@ -90,6 +90,20 @@ describe("ScriptEngine", () => {
       expect(result.exports).toBe(10);
     });
 
+    it("reads a package-local file URL from CommonJS", () => {
+      const { engine } = createEngine({
+        "/project/node_modules/pkg/package.json": '{"main":"index.cjs"}',
+        "/project/node_modules/pkg/index.cjs":
+          'const fs = require("fs"); const href = new (require("url").URL)("file:" + __filename).href; module.exports = fs.readFileSync(new URL("asset.wasm", href), "utf8");',
+        "/project/node_modules/pkg/asset.wasm": "wasm-bytes",
+      });
+      const result = engine.execute(
+        'module.exports = require("pkg");',
+        "/project/index.js",
+      );
+      expect(result.exports).toBe("wasm-bytes");
+    });
+
     it("requires chained files (A requires B requires C)", () => {
       const { engine } = createEngine({
         "/project/c.js": "module.exports = 3;",
