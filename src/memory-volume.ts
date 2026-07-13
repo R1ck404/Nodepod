@@ -1106,6 +1106,48 @@ export class MemoryVolume {
     this.notifyGlobalListeners(norm, 'unlink');
   }
 
+  removeTreeSync(p: string): void {
+    const norm = this.normalize(p);
+    const parentPath = this.parentOf(norm);
+    const name = this.nameOf(norm);
+    if (!name) throw new Error(`EPERM: operation not permitted, '${p}'`);
+
+    const parent = this.locate(parentPath);
+    if (!parent || parent.kind !== 'directory') throw makeSystemError('ENOENT', 'rm', p);
+    let target = parent.children!.get(name);
+    if (!target && this._missHandler && this._hydrateMiss(norm)) {
+      target = parent.children!.get(name);
+    }
+    if (!target) throw makeSystemError('ENOENT', 'rm', p);
+    if (target.kind !== 'directory') {
+      this.unlinkSync(norm);
+      return;
+    }
+
+    if (this._missHandler) this._hydrateTree(norm, target);
+    const removed: string[] = [];
+    const collect = (node: VolumeNode, base: string): void => {
+      if (node.kind === 'directory' && node.children) {
+        for (const [childName, child] of node.children) {
+          collect(child, `${base}/${childName}`);
+        }
+      }
+      removed.push(base);
+    };
+    collect(target, norm);
+
+    parent.children!.delete(name);
+    this._untrackLazyTree(norm);
+    for (const removedPath of removed) {
+      this._lazyListed.delete(removedPath);
+      this._lazyNegative.add(removedPath);
+      if (this._handler) this._handler.invalidateStat(removedPath);
+      this.triggerWatchers(removedPath, 'rename');
+      this.broadcast('delete', removedPath);
+      this.notifyGlobalListeners(removedPath, 'unlink');
+    }
+  }
+
   renameSync(from: string, to: string): void {
     const normFrom = this.normalize(from);
     const normTo = this.normalize(to);

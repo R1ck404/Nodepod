@@ -197,6 +197,27 @@ describe("MemoryVolume", () => {
       const vol = new MemoryVolume();
       expect(() => vol.rmdirSync("/nope")).toThrow();
     });
+
+    it("removes a populated tree atomically and reports every path", () => {
+      const vol = new MemoryVolume();
+      vol.mkdirSync("/cache/temp/nested", { recursive: true });
+      vol.writeFileSync("/cache/temp/a.js", "a");
+      vol.writeFileSync("/cache/temp/nested/b.js", "b");
+      const removed: string[] = [];
+      vol.onGlobalChange((path, event) => {
+        if (event === "unlink") removed.push(path);
+      });
+
+      vol.removeTreeSync("/cache/temp");
+
+      expect(vol.existsSync("/cache/temp")).toBe(false);
+      expect(removed).toEqual([
+        "/cache/temp/nested/b.js",
+        "/cache/temp/nested",
+        "/cache/temp/a.js",
+        "/cache/temp",
+      ]);
+    });
   });
 
   describe("renameSync", () => {

@@ -122,8 +122,8 @@ describe("installer snapshot cache (binary format)", () => {
       name: "app",
       dependencies: { "left-pad": "^1.3.0" },
     });
-    const { quickDigest } = await import("../helpers/digest");
-    await cache.set(quickDigest(manifestRaw), snapshot);
+    const { manifestSnapshotKey } = await import("../packages/installer");
+    await cache.set(manifestSnapshotKey(manifestRaw), snapshot);
 
     const vol = new MemoryVolume();
     vol.writeFileSync("/package.json", manifestRaw);
@@ -135,6 +135,22 @@ describe("installer snapshot cache (binary format)", () => {
     expect(vol.readFileSync("/node_modules/left-pad/index.js", "utf8")).toBe(
       "module.exports = (s) => s;",
     );
+  });
+
+  it("rejects an incomplete manifest snapshot", async () => {
+    const manifestRaw = JSON.stringify({
+      name: "app",
+      dependencies: { "left-pad": "^1.3.0", missing: "^1.0.0" },
+    });
+    const seeded = new MemoryVolume();
+    seeded.mkdirSync("/node_modules/left-pad", { recursive: true });
+    seeded.writeFileSync("/node_modules/left-pad/package.json", '{"name":"left-pad"}');
+    const snapshot = createFilteredBinarySnapshot(seeded, (p) =>
+      p.includes("/node_modules/"),
+    );
+    const { isManifestSnapshotComplete } = await import("../packages/installer");
+
+    expect(isManifestSnapshotComplete(snapshot, "/", JSON.parse(manifestRaw))).toBe(false);
   });
 });
 

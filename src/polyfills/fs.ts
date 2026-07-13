@@ -1733,12 +1733,7 @@ export function buildFileSystemBridge(
       const st = volume.statSync(p);
       if (st.isDirectory()) {
         if (opts?.recursive) {
-          const children = volume.readdirSync(p);
-          for (const child of children) {
-            const childPath = p.endsWith("/") ? p + child : p + "/" + child;
-            bridge.rmSync(childPath, opts);
-          }
-          volume.rmdirSync(p);
+          volume.removeTreeSync(p);
         } else {
           throw makeSystemError("EISDIR", "rm", p);
         }

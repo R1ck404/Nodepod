@@ -24,9 +24,21 @@ import type { PerformanceTracker } from "../performance-tracker";
 import { resolveWithCache } from "./resolution-cache";
 
 const RESOLVER_CACHE_VERSION = 1;
+const SNAPSHOT_CACHE_VERSION = 2;
 
 function stableRecord(record: Record<string, string> | undefined): string {
   return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+export function manifestSnapshotKey(raw: string, flags: InstallFlags = {}): string {
+  return quickDigest(JSON.stringify({
+    version: SNAPSHOT_CACHE_VERSION,
+    manifest: raw,
+    registry: flags.registry ?? "default",
+    dev: !!flags.withDevDeps,
+    optional: !!flags.withOptionalDeps,
+    transform: isEagerTransform(flags.transformModules) ? "eager" : "lazy",
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +64,22 @@ export interface InstallFlags {
 // "eager" | true → install-time transforms; false | undefined → lazy (default)
 export function isEagerTransform(value: boolean | "eager" | undefined): boolean {
   return value === "eager" || value === true;
+}
+
+export function isManifestSnapshotComplete(
+  snapshot: Parameters<typeof restoreBinarySnapshot>[1],
+  workingDir: string,
+  manifest: PackageManifest,
+  flags: InstallFlags = {},
+): boolean {
+  const requiredPackages = {
+    ...manifest.dependencies,
+    ...(flags.withDevDeps ? manifest.devDependencies : undefined),
+  };
+  const cachedPaths = new Set(snapshot.manifest.map((entry) => entry.path));
+  return Object.keys(requiredPackages).every((name) =>
+    cachedPaths.has(path.join(workingDir, "node_modules", name, "package.json")),
+  );
 }
 
 export interface InstallOutcome {
@@ -276,11 +304,11 @@ export class DependencyInstaller {
     const manifest: PackageManifest = JSON.parse(raw);
 
     // Check IDB snapshot cache — skip full install if we have a cached node_modules
-    const cacheKey = this._snapshotCache ? quickDigest(raw) : null;
+    const cacheKey = this._snapshotCache ? manifestSnapshotKey(raw, flags) : null;
     if (this._snapshotCache && cacheKey) {
       try {
         const cached = await this._snapshotCache.get(cacheKey);
-        if (cached) {
+        if (cached && isManifestSnapshotComplete(cached, this.workingDir, manifest, flags)) {
           onProgress?.("Restoring cached node_modules...");
           const stopRestore = this._performance?.start("install.restore");
           const restored = restoreBinarySnapshot(this.vol, cached);
@@ -436,10 +464,26 @@ export class DependencyInstaller {
         const { depName, dep, targetDir } = pending[nextPackage++];
         onProgress?.(`  Fetching ${depName}@${dep.version}...`);
 
-        await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
-          stripComponents: 1,
-          expectedShasum: dep.shasum,
-        });
+        let extracted = false;
+        for (let attempt = 0; attempt < 2 && !extracted; attempt++) {
+          if (attempt > 0) {
+            onProgress?.(`  Retrying ${depName}@${dep.version} after incomplete extraction...`);
+            if (this.vol.existsSync(targetDir)) this.vol.removeTreeSync(targetDir);
+          }
+          try {
+            await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
+              stripComponents: 1,
+              expectedShasum: dep.shasum,
+            });
+            const manifestPath = path.join(targetDir, "package.json");
+            if (!this.vol.existsSync(manifestPath)) {
+              throw new Error(`Package archive did not contain ${manifestPath}`);
+            }
+            extracted = true;
+          } catch (error) {
+            if (attempt === 1) throw error;
+          }
+        }
 
         if (shouldTransform) {
           try {
@@ -468,6 +512,13 @@ export class DependencyInstaller {
     await Promise.all(
       Array.from({ length: Math.min(WORKER_COUNT, pending.length) }, () => runLane()),
     );
+
+    const incomplete = [...tree.keys()].filter((depName) =>
+      !this.vol.existsSync(path.join(nmRoot, depName, "package.json")),
+    );
+    if (incomplete.length > 0) {
+      throw new Error(`Installation incomplete: missing ${incomplete.join(", ")}`);
+    }
 
     this.writeLockFile(tree);
 

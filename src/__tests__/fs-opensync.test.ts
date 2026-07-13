@@ -43,3 +43,17 @@ describe("fs.openSync numeric flags", () => {
     expect(vol.readFileSync("/s.txt", "utf8")).toBe("ok");
   });
 });
+
+describe("fs.rmSync", () => {
+  it("recursively removes a populated Vite optimizer directory", () => {
+    const vol = new MemoryVolume();
+    vol.mkdirSync("/project/node_modules/.vite/deps_temp_123/chunks", { recursive: true });
+    vol.writeFileSync("/project/node_modules/.vite/deps_temp_123/package.json", "{}");
+    vol.writeFileSync("/project/node_modules/.vite/deps_temp_123/chunks/react.js", "export {};");
+    const fs = buildFileSystemBridge(vol);
+
+    fs.rmSync("/project/node_modules/.vite/deps_temp_123", { recursive: true, force: true });
+
+    expect(vol.existsSync("/project/node_modules/.vite/deps_temp_123")).toBe(false);
+  });
+});

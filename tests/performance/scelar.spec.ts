@@ -27,24 +27,41 @@ async function runScelar(page: Page): Promise<PerfResult> {
     }));
     throw new Error(`Scelar startup failed: ${detail.error ?? "unknown error"}\n${detail.output ?? ""}`);
   }
-  await page.waitForFunction(() => Boolean((window as any).__nodepodPerfResult));
+  const optimizerFailure = /Unhandled rejection|PARSE_ERROR|Build failed with|ENOTEMPTY|Failed to resolve import|Internal server error|UNLOADABLE_DEPENDENCY/;
+  await page.waitForFunction(
+    (source) => {
+      const output = document.querySelector("#output")?.textContent ?? "";
+      return (window as any).__nodepodPerfResult?.previewLoaded === true || new RegExp(source).test(output);
+    },
+    optimizerFailure.source,
+    { timeout: 60_000 },
+  );
+  const output = await page.locator("#output").textContent() ?? "";
+  if (optimizerFailure.test(output)) {
+    throw new Error(`Scelar preview failed after Vite became ready:\n${output}`);
+  }
+  await expect(page.frameLocator("#preview").getByRole("button", { name: "Sign in" }))
+    .toBeVisible({ timeout: 60_000 });
+  await expect(page.locator("#output"))
+    .not.toContainText(optimizerFailure);
   return page.evaluate(() => (window as any).__nodepodPerfResult);
 }
 
 test("records cold and warm Scelar startup phases", async ({ browser }, testInfo) => {
   const runs: Array<{ cold: PerfResult; warm: PerfResult }> = [];
   const runCount = Number(process.env.NODEPOD_PERF_RUNS ?? 5);
+  test.setTimeout(Math.max(240_000, runCount * 60_000));
   for (let index = 0; index < runCount; index++) {
     const context = await browser.newContext();
     const page = await context.newPage();
-    const cold = await runScelar(page);
+    const cold = await test.step(`run ${index + 1} cold`, () => runScelar(page));
     expect(cold.phases.bootMs).toBeGreaterThanOrEqual(0);
     expect(cold.phases.installMs).toBeGreaterThan(0);
     expect(cold.phases.viteReadyMs).toBeGreaterThan(0);
     expect(cold.runtime.timings["boot.total"]?.lastMs).toBeGreaterThanOrEqual(0);
 
     await page.reload();
-    const warm = await runScelar(page);
+    const warm = await test.step(`run ${index + 1} warm`, () => runScelar(page));
     expect(warm.phases.installMs).toBeGreaterThan(0);
     expect(warm.memory.heap?.usedMB ?? 0).toBeLessThan(450);
     runs.push({ cold, warm });
