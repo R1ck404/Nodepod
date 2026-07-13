@@ -122,6 +122,30 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
       return stat;
     },
 
+    statMany(paths: string[]) {
+      let res = call(state, port, "statMany", [paths], DEFAULT_PAYLOAD);
+      if (res && res.ok && res.truncated) {
+        res = call(state, port, "statMany", [paths], res.fullLength + 1024);
+      }
+      if (!res || !res.ok) return null;
+      const stats = decodeJson(res.bytes) as Array<{
+        _isFile?: boolean;
+        _isDir?: boolean;
+        size?: number;
+      } | null> | null;
+      if (!Array.isArray(stats)) return null;
+      return stats.map((stat, index) => {
+        if (!stat) return null;
+        const value = {
+          isFile: !!stat._isFile,
+          isDirectory: !!stat._isDir,
+          size: stat.size ?? 0,
+        };
+        if (value.isFile && paths[index]) knownSizes.set(paths[index]!, value.size);
+        return value;
+      });
+    },
+
     readFile(path: string) {
       const knownSize = knownSizes.get(path) ?? 0;
       let res = call(
@@ -142,19 +166,24 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
     },
 
     readdir(path: string) {
-      let res = call(state, port, "readdirSync", [path, { withFileTypes: true }], DEFAULT_PAYLOAD);
+      let res = call(state, port, "readdirWithTypes", [path], DEFAULT_PAYLOAD);
       if (res && res.ok && res.truncated) {
-        res = call(state, port, "readdirSync", [path, { withFileTypes: true }], res.fullLength + 1024);
+        res = call(state, port, "readdirWithTypes", [path], res.fullLength + 1024);
       }
       if (!res || !res.ok) return null;
       const entries = decodeJson(res.bytes) as
-        | Array<{ name?: string; _isDir?: boolean }>
+        | Array<{ name?: string; _isDir?: boolean; size?: number }>
         | null;
       if (!Array.isArray(entries)) return null;
-      const out: Array<{ name: string; isDirectory: boolean }> = [];
+      const out: Array<{ name: string; isDirectory: boolean; size?: number }> = [];
       for (const e of entries) {
         if (!e || typeof e.name !== "string") continue;
-        out.push({ name: e.name, isDirectory: !!e._isDir });
+        const entry = { name: e.name, isDirectory: !!e._isDir, size: e.size };
+        out.push(entry);
+        if (!entry.isDirectory && entry.size !== undefined) {
+          const child = path === "/" ? `/${entry.name}` : `${path}/${entry.name}`;
+          knownSizes.set(child, entry.size);
+        }
       }
       return out;
     },

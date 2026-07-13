@@ -23,8 +23,9 @@ export interface VolumeNode {
 // snapshot). Implementations block on a SAB round-trip to the main thread.
 export interface VolumeMissHandler {
   readFile(path: string): Uint8Array | null;
-  readdir(path: string): Array<{ name: string; isDirectory: boolean }> | null;
+  readdir(path: string): Array<{ name: string; isDirectory: boolean; size?: number }> | null;
   stat(path: string): { isFile: boolean; isDirectory: boolean; size: number } | null;
+  statMany?(paths: string[]): Array<{ isFile: boolean; isDirectory: boolean; size: number } | null> | null;
 }
 
 type FileChangeHandler = (filePath: string, content: string) => void;
@@ -856,7 +857,7 @@ export class MemoryVolume {
       return;
     }
     this._lazyListed.add(norm);
-    let entries: Array<{ name: string; isDirectory: boolean }> | null = null;
+    let entries: Array<{ name: string; isDirectory: boolean; size?: number }> | null = null;
     try { entries = this._missHandler.readdir(norm); } catch { entries = null; }
     if (!entries) return;
     if (!node.children) node.children = new Map();
@@ -866,7 +867,7 @@ export class MemoryVolume {
         entry.name,
         entry.isDirectory
           ? { kind: 'directory', children: new Map(), modified: Date.now() }
-          : { kind: 'file', lazy: true, modified: Date.now() },
+          : { kind: 'file', lazy: true, lazySize: entry.size, modified: Date.now() },
       );
     }
   }

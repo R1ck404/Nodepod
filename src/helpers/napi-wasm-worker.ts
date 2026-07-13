@@ -511,34 +511,39 @@ export function handleFsProxy(
   const maxPayload = sab.buffer.byteLength - 16; // minus 16-byte header
 
   try {
-    const fn = fsBridge[type];
-    if (typeof fn !== "function") {
-      throw new Error(`fs.${type} is not a function`);
+    let result: any;
+    if (type === "statMany") {
+      const paths = Array.isArray(payload[0]) ? payload[0] : [];
+      result = paths.map((path: string) => {
+        try { return flattenProxyStat(fsBridge.statSync(path)); } catch { return null; }
+      });
+    } else if (type === "readdirWithTypes") {
+      const dir = String(payload[0] ?? "/").replace(/\/$/, "") || "/";
+      const entries = fsBridge.readdirSync(dir, { withFileTypes: true });
+      result = entries.map((entry: any) => {
+        const child = dir === "/" ? `/${entry.name}` : `${dir}/${entry.name}`;
+        let size = 0;
+        if (typeof entry.isFile === "function" && entry.isFile()) {
+          try { size = fsBridge.statSync(child).size ?? 0; } catch { /* stale entry */ }
+        }
+        return {
+          name: entry.name,
+          parentPath: entry.parentPath || entry.path,
+          _isFile: typeof entry.isFile === "function" ? entry.isFile() : false,
+          _isDir: typeof entry.isDirectory === "function" ? entry.isDirectory() : false,
+          _isSymlink: typeof entry.isSymbolicLink === "function" ? entry.isSymbolicLink() : false,
+          size,
+        };
+      });
+    } else {
+      const fn = fsBridge[type];
+      if (typeof fn !== "function") throw new Error(`fs.${type} is not a function`);
+      result = fn.apply(fsBridge, payload);
     }
-
-    let result = fn.apply(fsBridge, payload);
 
     // flatten stat objects so they survive structured clone
     if ((type === "statSync" || type === "lstatSync") && result && typeof result.isFile === "function") {
-      result = {
-        size: result.size,
-        mode: result.mode,
-        nlink: result.nlink,
-        uid: result.uid,
-        gid: result.gid,
-        dev: result.dev,
-        ino: result.ino,
-        rdev: result.rdev || 0,
-        blksize: result.blksize || 4096,
-        blocks: result.blocks || 0,
-        mtimeMs: result.mtimeMs,
-        atimeMs: result.atimeMs,
-        ctimeMs: result.ctimeMs,
-        birthtimeMs: result.birthtimeMs,
-        _isFile: result.isFile(),
-        _isDir: result.isDirectory(),
-        _isSymlink: typeof result.isSymbolicLink === "function" ? result.isSymbolicLink() : false,
-      };
+      result = flattenProxyStat(result);
     }
 
     // flatten Dirent[] from readdirSync({withFileTypes:true}). structured
@@ -582,6 +587,28 @@ export function handleFsProxy(
   } finally {
     Atomics.notify(sab, 0);
   }
+}
+
+function flattenProxyStat(result: any): any {
+  return {
+    size: result.size,
+    mode: result.mode,
+    nlink: result.nlink,
+    uid: result.uid,
+    gid: result.gid,
+    dev: result.dev,
+    ino: result.ino,
+    rdev: result.rdev || 0,
+    blksize: result.blksize || 4096,
+    blocks: result.blocks || 0,
+    mtimeMs: result.mtimeMs,
+    atimeMs: result.atimeMs,
+    ctimeMs: result.ctimeMs,
+    birthtimeMs: result.birthtimeMs,
+    _isFile: result.isFile(),
+    _isDir: result.isDirectory(),
+    _isSymlink: typeof result.isSymbolicLink === "function" ? result.isSymbolicLink() : false,
+  };
 }
 
 function getValueType(v: unknown): number {

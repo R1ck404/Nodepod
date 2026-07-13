@@ -51,4 +51,39 @@ describe("lazy filesystem SAB client", () => {
     expect(fake.buffers).toHaveLength(2);
     expect(fake.buffers[1].byteLength).toBeGreaterThan(payload.length);
   });
+
+  it("uses batched metadata operations for directory scans", () => {
+    const encoder = new TextEncoder();
+    const calls: string[] = [];
+    const fake = fakePort((type) => {
+      calls.push(type);
+      if (type === "readdirWithTypes") {
+        return {
+          type: 6,
+          bytes: encoder.encode(JSON.stringify([
+            { name: "package.json", _isFile: true, _isDir: false, size: 42 },
+            { name: "dist", _isFile: false, _isDir: true, size: 0 },
+          ])),
+        };
+      }
+      return {
+        type: 6,
+        bytes: encoder.encode(JSON.stringify([
+          { _isFile: true, _isDir: false, size: 42 },
+          null,
+        ])),
+      };
+    });
+    const client = createLazyFsClient(fake.port);
+
+    expect(client.readdir("/pkg")).toEqual([
+      { name: "package.json", isDirectory: false, size: 42 },
+      { name: "dist", isDirectory: true, size: 0 },
+    ]);
+    expect(client.statMany?.(["/pkg/package.json", "/missing"])).toEqual([
+      { isFile: true, isDirectory: false, size: 42 },
+      null,
+    ]);
+    expect(calls).toEqual(["readdirWithTypes", "statMany"]);
+  });
 });
