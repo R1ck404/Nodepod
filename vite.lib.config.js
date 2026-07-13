@@ -105,6 +105,6 @@ export default defineConfig({
       external: allExternal,
     },
     sourcemap: true,
-    minify: false,
+    minify: "esbuild",
   },
 });

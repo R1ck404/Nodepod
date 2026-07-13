@@ -80,6 +80,26 @@ describe("createFilteredBinarySnapshot / restoreBinarySnapshot", () => {
     expect(target.existsSync("/x/node_modules/pkg/empty-dir")).toBe(true);
     expect(target.statSync("/x/node_modules/pkg/empty-dir").isDirectory()).toBe(true);
   });
+
+  it("mounts silently and detaches file content on write", () => {
+    const source = new MemoryVolume();
+    source.writeFileSync("/node_modules/pkg/index.js", "original");
+    const snapshot = createFilteredBinarySnapshot(source, () => true);
+    const originalBytes = new Uint8Array(snapshot.data).slice();
+
+    const target = new MemoryVolume();
+    const events: string[] = [];
+    const watcher = target.watch("/", { recursive: true }, (_event, path) => {
+      if (path) events.push(path);
+    });
+    restoreBinarySnapshot(target, snapshot);
+    expect(events).toEqual([]);
+
+    target.writeFileSync("/node_modules/pkg/index.js", "changed");
+    expect(new Uint8Array(snapshot.data)).toEqual(originalBytes);
+    expect(target.readFileSync("/node_modules/pkg/index.js", "utf8")).toBe("changed");
+    watcher.close();
+  });
 });
 
 describe("installer snapshot cache (binary format)", () => {

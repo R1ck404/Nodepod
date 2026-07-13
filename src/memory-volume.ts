@@ -274,6 +274,10 @@ export class MemoryVolume {
   private activeWatchers = new Map<string, Set<ActiveWatcher>>();
   private subscribers = new Map<string, Set<VolumeEventHandler>>();
   private _handler: MemoryHandler | null;
+  private _bulkMountHandler: ((snapshot: {
+    manifest: Array<{ path: string; offset: number; length: number; isDirectory: boolean }>;
+    data: ArrayBuffer;
+  }) => void) | null = null;
 
   constructor(handler?: MemoryHandler | null, lazyResidentMaxBytes = 64 * 1024 * 1024) {
     this._handler = handler ?? null;
@@ -303,6 +307,10 @@ export class MemoryVolume {
     const handlers = this.subscribers.get(event);
     if (handlers) handlers.delete(handler);
     return this;
+  }
+
+  setBulkMountHandler(handler: typeof this._bulkMountHandler): void {
+    this._bulkMountHandler = handler;
   }
 
   private broadcast(event: 'change', path: string, content: string): void;
@@ -351,6 +359,7 @@ export class MemoryVolume {
     this.subscribers.clear();
     this.globalChangeListeners.clear();
     this._missHandler = null;
+    this._bulkMountHandler = null;
     this._lazyDirNames = [];
     this._lazyListed.clear();
     this._lazyNegative.clear();
@@ -441,6 +450,34 @@ export class MemoryVolume {
     }
 
     return vol;
+  }
+
+  // merge a binary snapshot without copying file payloads or emitting events
+  mountBinarySnapshot(snapshot: {
+    manifest: Array<{
+      path: string;
+      offset: number;
+      length: number;
+      isDirectory: boolean;
+    }>;
+    data: ArrayBuffer;
+  }, notifyBulk = true): number {
+    const fullData = new Uint8Array(snapshot.data);
+    let mounted = 0;
+
+    for (const entry of snapshot.manifest) {
+      if (!entry.isDirectory || entry.path === '/') continue;
+      this.ensureDir(this.normalize(entry.path));
+      mounted++;
+    }
+    for (const entry of snapshot.manifest) {
+      if (entry.isDirectory || entry.path === '/') continue;
+      const content = fullData.subarray(entry.offset, entry.offset + entry.length);
+      this.writeInternal(this.normalize(entry.path), content, false);
+      mounted++;
+    }
+    if (notifyBulk) this._bulkMountHandler?.(snapshot);
+    return mounted;
   }
 
   static fromSnapshot(snapshot: VolumeSnapshot): MemoryVolume {

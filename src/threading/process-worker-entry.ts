@@ -151,6 +151,9 @@ self.addEventListener("message", (ev: MessageEvent) => {
   const msg = ev.data as MainToWorkerMessage;
 
   switch (msg.type) {
+    case "probe":
+      post({ type: "probe-ready" });
+      break;
     case "init":
       void handleInit(msg);
       break;
@@ -178,6 +181,16 @@ self.addEventListener("message", (ev: MessageEvent) => {
       break;
     case "vfs-sync":
       handleVFSSync(msg);
+      break;
+    case "vfs-snapshot":
+      if (_volume) {
+        _suppressVFSWatch = true;
+        try {
+          _volume.mountBinarySnapshot(msg.snapshot, false);
+        } finally {
+          _suppressVFSWatch = false;
+        }
+      }
       break;
     case "vfs-invalidate":
       // large-file change: drop local copy, re-pull lazily on next access
@@ -249,6 +262,10 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   _env = msg.env || {};
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
+  _volume.setBulkMountHandler((snapshot) => {
+    const data = snapshot.data.slice(0);
+    post({ type: "vfs-snapshot", snapshot: { ...snapshot, data } }, [data]);
+  });
 
   // lean spawn mode: snapshot excluded heavy dirs (node_modules etc.) —
   // install a synchronous fallback that pulls misses from the main thread.
@@ -310,8 +327,7 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
 
   installSqliteHostBridge();
 
-  // DatabaseSync is synchronous; warm automatically before user code runs so
-  // callers get normal Node.js behavior without a preload API or an async gap.
+  // DatabaseSync must be ready before synchronous user code can construct it
   try {
     await warmSqliteEngine();
   } catch (err) {

@@ -76,36 +76,5 @@ export function restoreBinarySnapshot(
   vol: MemoryVolume,
   snapshot: VFSBinarySnapshot,
 ): number {
-  const fullData = new Uint8Array(snapshot.data);
-
-  const sorted = [...snapshot.manifest].sort((a, b) => {
-    if (a.isDirectory && !b.isDirectory) return -1;
-    if (!a.isDirectory && b.isDirectory) return 1;
-    return a.path.split("/").length - b.path.split("/").length;
-  });
-
-  let restored = 0;
-  for (const entry of sorted) {
-    if (entry.path === "/") continue;
-    try {
-      if (entry.isDirectory) {
-        if (!vol.existsSync(entry.path)) {
-          vol.mkdirSync(entry.path, { recursive: true });
-        }
-      } else {
-        const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/")) || "/";
-        if (parentDir !== "/" && !vol.existsSync(parentDir)) {
-          vol.mkdirSync(parentDir, { recursive: true });
-        }
-        vol.writeFileSync(
-          entry.path,
-          fullData.slice(entry.offset, entry.offset + entry.length),
-        );
-      }
-      restored++;
-    } catch {
-      // per-entry failures shouldn't abort the whole restore
-    }
-  }
-  return restored;
+  return vol.mountBinarySnapshot(snapshot);
 }

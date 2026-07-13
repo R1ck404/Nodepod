@@ -20,7 +20,7 @@ export type ProcessState = "starting" | "running" | "exited";
 
 export class ProcessHandle extends EventEmitter {
   readonly pid: number;
-  readonly worker: Worker;
+  worker: Worker;
   readonly command: string;
   readonly args: string[];
   readonly parentPid?: number;
@@ -29,6 +29,9 @@ export class ProcessHandle extends EventEmitter {
   private _exitCode: number | undefined;
   private _stdout = "";
   private _stderr = "";
+  private _fallbackWorker: (() => Worker) | null;
+  private _pendingInit: { msg: MainToWorker_Init; transfer: Transferable[] } | null = null;
+  private _probeTimer: ReturnType<typeof setTimeout> | null = null;
 
   // When > 0, "exit" is deferred — children still running, output keeps flowing
   private _exitHoldCount = 0;
@@ -59,15 +62,16 @@ export class ProcessHandle extends EventEmitter {
   get state(): ProcessState { return this._state; }
   get exitCode(): number | undefined { return this._exitCode; }
 
-  constructor(worker: Worker, config: SpawnConfig) {
+  constructor(worker: Worker, config: SpawnConfig, fallbackWorker?: () => Worker) {
     super();
     this.pid = config.snapshot ? Math.floor(Math.random() * 90000) + 10000 : 0; // will be set properly
     this.worker = worker;
     this.command = config.command;
     this.args = config.args;
     this.parentPid = config.parentPid;
+    this._fallbackWorker = fallbackWorker ?? null;
 
-    this._setupWorkerListeners();
+    this._setupWorkerListeners(worker);
   }
 
   _setPid(pid: number): void {
@@ -84,6 +88,12 @@ export class ProcessHandle extends EventEmitter {
       transfer.push(initMsg.snapshot.data);
     }
     if (extraTransfer) transfer.push(...extraTransfer);
+    if (this._fallbackWorker) {
+      this._pendingInit = { msg: initMsg, transfer };
+      this.worker.postMessage({ type: "probe" });
+      this._probeTimer = setTimeout(() => this._activateFallback(), 2_000);
+      return;
+    }
     this.postMessage(initMsg, transfer);
   }
 
@@ -155,12 +165,24 @@ export class ProcessHandle extends EventEmitter {
     this.emit("exit", exitCode, this._stdout, this._stderr);
   }
 
-  private _setupWorkerListeners(): void {
-    this.worker.addEventListener("message", (ev: MessageEvent) => {
+  private _setupWorkerListeners(worker: Worker): void {
+    worker.addEventListener("message", (ev: MessageEvent) => {
+      if (worker !== this.worker) return;
       const msg = ev.data as WorkerToMainMessage;
       if (!msg || !msg.type) return;
 
       switch (msg.type) {
+        case "probe-ready":
+          if (this._probeTimer) clearTimeout(this._probeTimer);
+          this._probeTimer = null;
+          this._fallbackWorker = null;
+          if (this._pendingInit) {
+            const pending = this._pendingInit;
+            this._pendingInit = null;
+            this.postMessage(pending.msg, pending.transfer);
+          }
+          break;
+
         case "ready":
           this._state = "running";
           this.emit("ready");
@@ -205,6 +227,10 @@ export class ProcessHandle extends EventEmitter {
 
         case "vfs-delete":
           this.emit("vfs-delete", msg.path);
+          break;
+
+        case "vfs-snapshot":
+          this.emit("vfs-snapshot", msg.snapshot);
           break;
 
         case "spawn-request":
@@ -282,11 +308,32 @@ export class ProcessHandle extends EventEmitter {
       }
     });
 
-    this.worker.addEventListener("error", (ev: ErrorEvent) => {
+    worker.addEventListener("error", (ev: ErrorEvent) => {
+      if (worker !== this.worker) return;
+      if (this._fallbackWorker && this._state === "starting") {
+        this._activateFallback();
+        return;
+      }
       this.emit("worker-error", ev.message, undefined);
       if (this._state !== "exited") {
         this._terminate(1);
       }
     });
+  }
+
+  private _activateFallback(): void {
+    const factory = this._fallbackWorker;
+    if (!factory || this._state !== "starting") return;
+    this._fallbackWorker = null;
+    if (this._probeTimer) clearTimeout(this._probeTimer);
+    this._probeTimer = null;
+    try { this.worker.terminate(); } catch { /* ignore */ }
+    this.worker = factory();
+    this._setupWorkerListeners(this.worker);
+    if (this._pendingInit) {
+      const pending = this._pendingInit;
+      this._pendingInit = null;
+      this.postMessage(pending.msg, pending.transfer);
+    }
   }
 }

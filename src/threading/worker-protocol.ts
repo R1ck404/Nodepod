@@ -35,6 +35,10 @@ export interface MainToWorker_Init {
   lazyFsPort?: MessagePort;
 }
 
+export interface MainToWorker_Probe {
+  type: "probe";
+}
+
 export interface MainToWorker_Exec {
   type: "exec";
   filePath: string;
@@ -72,6 +76,11 @@ export interface MainToWorker_VFSSync {
   path: string;
   content: ArrayBuffer | null; // null = deleted
   isDirectory: boolean;
+}
+
+export interface MainToWorker_VFSSnapshot {
+  type: "vfs-snapshot";
+  snapshot: VFSBinarySnapshot;
 }
 
 // large-file change notification (lean spawn mode): no bytes on the wire,
@@ -160,11 +169,13 @@ export interface MainToWorker_WsClose {
 
 export type MainToWorkerMessage =
   | MainToWorker_Init
+  | MainToWorker_Probe
   | MainToWorker_Exec
   | MainToWorker_Stdin
   | MainToWorker_Signal
   | MainToWorker_Resize
   | MainToWorker_VFSSync
+  | MainToWorker_VFSSnapshot
   | MainToWorker_VFSInvalidate
   | MainToWorker_VFSChunk
   | MainToWorker_SpawnResult
@@ -182,6 +193,10 @@ export type MainToWorkerMessage =
 export interface WorkerToMain_Ready {
   type: "ready";
   pid: number;
+}
+
+export interface WorkerToMain_ProbeReady {
+  type: "probe-ready";
 }
 
 export interface WorkerToMain_Stdout {
@@ -217,6 +232,11 @@ export interface WorkerToMain_VFSWrite {
 export interface WorkerToMain_VFSDelete {
   type: "vfs-delete";
   path: string;
+}
+
+export interface WorkerToMain_VFSSnapshot {
+  type: "vfs-snapshot";
+  snapshot: VFSBinarySnapshot;
 }
 
 export interface WorkerToMain_SpawnRequest {
@@ -357,12 +377,14 @@ export interface WorkerToMain_WsFrame {
 
 export type WorkerToMainMessage =
   | WorkerToMain_Ready
+  | WorkerToMain_ProbeReady
   | WorkerToMain_Stdout
   | WorkerToMain_Stderr
   | WorkerToMain_Exit
   | WorkerToMain_Console
   | WorkerToMain_VFSWrite
   | WorkerToMain_VFSDelete
+  | WorkerToMain_VFSSnapshot
   | WorkerToMain_SpawnRequest
   | WorkerToMain_ForkRequest
   | WorkerToMain_WorkerThreadRequest

@@ -154,6 +154,16 @@ export class VFSBridge {
     }
   }
 
+  handleWorkerSnapshot(snapshot: VFSBinarySnapshot): void {
+    this._suppressWatch = true;
+    try {
+      this._volume.mountBinarySnapshot(snapshot, false);
+      if (this._sharedVFS) this._hydrateSharedVFS();
+    } finally {
+      this._suppressWatch = false;
+    }
+  }
+
   // writeFile returns false on table/data exhaustion — silent drops mean
   // workers stop seeing updates, so surface it once per session
   private _sharedVFSWrite(path: string, content: Uint8Array): void {

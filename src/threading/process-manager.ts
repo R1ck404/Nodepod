@@ -27,6 +27,7 @@ import type { VFSBridge } from "./vfs-bridge";
 import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
 import { ungzip } from "pako";
 import { SLOT_SIZE } from "./sync-channel";
+import type { PerformanceTracker } from "../performance-tracker";
 
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
@@ -39,6 +40,7 @@ export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
   private _volume: MemoryVolume;
+  private _performance: PerformanceTracker | null;
   private _vfsBridge: VFSBridge | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
   private _processPorts = new Map<number, MessagePort[]>();
@@ -57,9 +59,13 @@ export class ProcessManager extends EventEmitter {
   private _nextHttpRequestId = 1;
   private static readonly HTTP_REQUEST_TIMEOUT_MS = 300_000;
 
-  constructor(volume: MemoryVolume) {
+  constructor(
+    volume: MemoryVolume,
+    performanceTracker: PerformanceTracker | null = null,
+  ) {
     super();
     this._volume = volume;
+    this._performance = performanceTracker;
   }
 
   setVFSBridge(bridge: VFSBridge): void {
@@ -87,6 +93,7 @@ export class ProcessManager extends EventEmitter {
     env?: Record<string, string>;
     parentPid?: number;
   }): ProcessHandle {
+    const stopSpawn = this._performance?.start("process.ready");
     if (this._processes.size >= MAX_PROCESSES) {
       throw new Error(`Process limit exceeded (max ${MAX_PROCESSES})`);
     }
@@ -118,11 +125,13 @@ export class ProcessManager extends EventEmitter {
       lean = false;
     }
 
+    const stopSnapshot = this._performance?.start("process.snapshot");
     const snapshot = this._vfsBridge
       ? this._vfsBridge.createSnapshot(
           lean ? { excludeDirNames: LEAN_EXCLUDE_DIR_NAMES } : undefined,
         )
       : this._createEmptySnapshot();
+    stopSnapshot?.();
 
     const spawnConfig: SpawnConfig = {
       command: config.command,
@@ -134,8 +143,18 @@ export class ProcessManager extends EventEmitter {
       parentPid: config.parentPid,
     };
 
+    const stopWorker = this._performance?.start("process.workerConstruct");
     const worker = this._createWorker();
-    const handle = new ProcessHandle(worker, spawnConfig);
+    stopWorker?.();
+    const directWorker = Boolean((worker as Worker & { __nodepodDirect?: boolean }).__nodepodDirect);
+    const handle = new ProcessHandle(worker, spawnConfig, directWorker ? () => {
+      ProcessManager._externalWorkerUrl = null;
+      this._performance?.increment("process.workerFallbacks");
+      return this._createEmbeddedWorker();
+    } : undefined);
+    handle.on("ready", () => stopSpawn?.());
+    handle.on("worker-error", () => stopSpawn?.());
+    handle.on("exit", () => stopSpawn?.());
     handle._setPid(pid);
 
     this._processes.set(pid, handle);
@@ -204,6 +223,7 @@ export class ProcessManager extends EventEmitter {
     this.emit("spawn", pid, config.command, config.args);
     return handle;
   }
+
 
   getProcess(pid: number): ProcessHandle | undefined {
     return this._processes.get(pid);
@@ -466,7 +486,7 @@ export class ProcessManager extends EventEmitter {
   }
 
   private static _workerBlobUrl: string | null = null;
-  private static _externalWorkerSource: string | null = null;
+  private static _externalWorkerUrl: string | null = null;
   private static _workerProbePromise: Promise<void> | null = null;
 
   /**
@@ -492,13 +512,12 @@ export class ProcessManager extends EventEmitter {
         if (!/^https?:/.test(url)) return;
       }
       try {
-        const resp = await fetch(url);
+        const resp = await fetch(url, { method: "HEAD" });
         if (!resp.ok) return;
         const contentType = resp.headers.get("content-type") || "";
         // guard against SPA index.html fallbacks answering for missing paths
         if (contentType && !/javascript|ecmascript/i.test(contentType)) return;
-        const text = await resp.text();
-        if (text.length > 0) ProcessManager._externalWorkerSource = text;
+        ProcessManager._externalWorkerUrl = url;
       } catch {
         /* asset not served — embedded fallback keeps working */
       }
@@ -512,7 +531,7 @@ export class ProcessManager extends EventEmitter {
       try { URL.revokeObjectURL(ProcessManager._workerBlobUrl); } catch { /* ignore */ }
     }
     ProcessManager._workerBlobUrl = null;
-    ProcessManager._externalWorkerSource = null;
+    ProcessManager._externalWorkerUrl = null;
     ProcessManager._workerProbePromise = null;
   }
 
@@ -527,19 +546,31 @@ export class ProcessManager extends EventEmitter {
   }
 
   private _createWorker(): Worker {
-    // blob URL built once from whichever source is available first; the
-    // external asset (if probed successfully) avoids the embedded copy
-    if (!ProcessManager._workerBlobUrl) {
-      let source = ProcessManager._externalWorkerSource;
-      if (!source) {
-        const binary = atob(PROCESS_WORKER_BUNDLE_GZIP_BASE64);
-        const compressed = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
-        source = ungzip(compressed, { to: "string" });
+    if (ProcessManager._externalWorkerUrl) {
+      try {
+        const worker = new Worker(ProcessManager._externalWorkerUrl);
+        (worker as Worker & { __nodepodDirect?: boolean }).__nodepodDirect = true;
+        this._performance?.increment("process.directWorkers");
+        return worker;
+      } catch {
+        ProcessManager._externalWorkerUrl = null;
       }
+    }
+
+    return this._createEmbeddedWorker();
+  }
+
+  private _createEmbeddedWorker(): Worker {
+    // blob URL is the CSP/CDN/missing-asset fallback
+    if (!ProcessManager._workerBlobUrl) {
+      const binary = atob(PROCESS_WORKER_BUNDLE_GZIP_BASE64);
+      const compressed = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
+      const source = ungzip(compressed, { to: "string" });
       const blob = new Blob([source], { type: "application/javascript" });
       ProcessManager._workerBlobUrl = URL.createObjectURL(blob);
     }
+    this._performance?.increment("process.embeddedWorkers");
     return new Worker(ProcessManager._workerBlobUrl);
   }
 
@@ -610,6 +641,19 @@ export class ProcessManager extends EventEmitter {
         if (!isInternalVfsPath(path)) {
           this._vfsBridge.broadcastChange(path, null, handle.pid);
         }
+      }
+    });
+
+    handle.on("vfs-snapshot", (snapshot: VFSBinarySnapshot) => {
+      if (!this._vfsBridge) return;
+      this._vfsBridge.handleWorkerSnapshot(snapshot);
+      for (const [pid, peer] of this._processes) {
+        if (pid === handle.pid || peer.state === "exited") continue;
+        const data = snapshot.data.slice(0);
+        peer.postMessage({
+          type: "vfs-snapshot",
+          snapshot: { ...snapshot, data },
+        }, [data]);
       }
     });
 
