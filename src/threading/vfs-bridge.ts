@@ -145,7 +145,19 @@ export class VFSBridge {
   // writeFile returns false on table/data exhaustion — silent drops mean
   // workers stop seeing updates, so surface it once per session
   private _sharedVFSWrite(path: string, content: Uint8Array): void {
-    if (!this._sharedVFS!.writeFile(path, content) && !this._warnedSharedVFSDrop) {
+    if (!this._sharedVFS!.writeFile(path, content)) {
+      this._warnSharedVFSDrop(path);
+    }
+  }
+
+  private _sharedVFSWriteDirectory(path: string): void {
+    if (!this._sharedVFS!.writeDirectory(path)) {
+      this._warnSharedVFSDrop(path);
+    }
+  }
+
+  private _warnSharedVFSDrop(path: string): void {
+    if (!this._warnedSharedVFSDrop) {
       this._warnedSharedVFSDrop = true;
       const stats = this._sharedVFS!.getStats();
       console.warn(
@@ -162,7 +174,7 @@ export class VFSBridge {
         this._volume.mkdirSync(path, { recursive: true });
       }
       if (this._sharedVFS) {
-        this._sharedVFS.writeDirectory(path);
+        this._sharedVFSWriteDirectory(path);
       }
     } finally {
       this._suppressWatch = false;
@@ -246,7 +258,7 @@ export class VFSBridge {
           const stat = this._volume.statSync(absPath);
           if (stat.isDirectory()) {
             this.broadcastChange(absPath, new ArrayBuffer(0), -1);
-            if (this._sharedVFS) this._sharedVFS.writeDirectory(absPath);
+            if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
           } else {
             const data = this._volume.readFileSync(absPath);
             // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage

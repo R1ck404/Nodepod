@@ -208,10 +208,10 @@ describe("SharedVFSController + SharedVFSReader", () => {
     });
 
     it("writeFile returns false when data won't fit", () => {
-      // need a buffer big enough for the fixed table (32+16384*272, see
+      // need a buffer big enough for the fixed table (32+65536*272, see
       // shared-vfs.ts layout) plus a tiny bit of data, then try to overflow
       // that tiny bit.
-      const HEADER_AND_TABLE = 32 + 16384 * 272;
+      const HEADER_AND_TABLE = 32 + 65536 * 272;
       const ctrl = new SharedVFSController(HEADER_AND_TABLE + 1024);
 
       expect(ctrl.writeFile("/small.dat", new Uint8Array(500))).toBe(true);
@@ -422,7 +422,7 @@ describe("cross-thread attach (SAB via worker_threads)", () => {
       const ENTRY_CONTENT_LENGTH = 8;
       const ENTRY_PATH_OFFSET = 20;
       const ENTRY_PATH_MAX = 248;
-      const DATA_OFFSET = HEADER_SIZE + 16384 * ENTRY_SIZE;
+      const DATA_OFFSET = HEADER_SIZE + 65536 * ENTRY_SIZE;
       const FLAG_ACTIVE = 1;
 
       const buf = workerData.buffer;
@@ -484,7 +484,7 @@ describe("cross-thread attach (SAB via worker_threads)", () => {
 
 describe("compaction + waste accounting (plan 014)", () => {
   // fixed header+table plus a 4MB data region for churn tests
-  const HEADER_AND_TABLE = 32 + 16384 * 272;
+  const HEADER_AND_TABLE = 32 + 65536 * 272;
   const DATA_REGION = 4 * 1024 * 1024;
   const SMALL = HEADER_AND_TABLE + DATA_REGION;
 

@@ -49,7 +49,11 @@ const FLAG_SYMLINK = 4;
 //   [4] waste bytes (orphaned data-region bytes from updates/deletes)
 //   [5..7] reserved
 const HEADER_SIZE = 32;
-const MAX_ENTRIES = 16384;
+// Modern application dependency trees routinely exceed 16K files. The table
+// is shared by all worker readers and cannot grow after boot, so reserve
+// enough metadata for a full node_modules tree rather than silently omitting
+// later files/directories from the worker-visible filesystem.
+const MAX_ENTRIES = 65536;
 const TABLE_SIZE = MAX_ENTRIES * ENTRY_SIZE;
 const DATA_OFFSET = HEADER_SIZE + TABLE_SIZE;
 

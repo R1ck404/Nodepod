@@ -835,7 +835,7 @@ export class Nodepod {
    * other side. null if SAB is unavailable, but boot() would have thrown in
    * that case so this is mostly defensive.
    *
-   * default capacity is 256 MiB (or sharedVFSBufferSize at boot), 16,384
+   * default capacity is 256 MiB (or sharedVFSBufferSize at boot), 65,536
    * entries, 248-byte paths. writes past either cap count as dropped writes
    * so callers can detect an undersized mirror.
    */
