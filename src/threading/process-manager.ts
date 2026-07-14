@@ -10,6 +10,7 @@ import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../p
 import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
+import { isRecoverableWasmPath, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import type {
   SpawnConfig,
   ProcessInfo,
@@ -18,6 +19,8 @@ import type {
   WorkerToMain_SpawnRequest,
   WorkerToMain_ForkRequest,
   WorkerToMain_WorkerThreadRequest,
+  WorkerToMain_WasiWorkerRequest,
+  WorkerToMain_WasiWorkerTerminate,
   WorkerToMain_SpawnSync,
   WorkerToMain_HttpResponse,
   WorkerToMain_HttpClientRequest,
@@ -36,6 +39,21 @@ const MAX_PROCESSES = 50;
 // lazily by the worker. Mirrors the SDK's shallow-snapshot exclude set.
 const LEAN_EXCLUDE_DIR_NAMES = ["node_modules", ".npm", ".cache"];
 
+interface WasiBrokerChild {
+  worker: Worker;
+  url: string;
+  readyTimer: ReturnType<typeof setTimeout>;
+}
+
+interface WasiBrokerRoot extends WasiBrokerChild {
+  parentPid: number;
+  requestId: number;
+  source: string;
+  ipcListener: (msg: any) => void;
+  loadMessage: any | null;
+  children: Map<number, WasiBrokerChild>;
+}
+
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
@@ -44,6 +62,8 @@ export class ProcessManager extends EventEmitter {
   private _vfsBridge: VFSBridge | null = null;
   private _syncBuffer: SharedArrayBuffer | null = null;
   private _processPorts = new Map<number, MessagePort[]>();
+  private _wasiWorkers = new Map<string, WasiBrokerRoot>();
+  private _nextWasiTid = 0x40000000;
 
   // port → owning pid
   private _serverPorts = new Map<number, number>();
@@ -160,29 +180,8 @@ export class ProcessManager extends EventEmitter {
     this._processes.set(pid, handle);
     this._wireHandleEvents(handle);
 
-    // pool of fs proxy MessagePorts for the spawned process to hand out to
-    // its WASI workers. one port per worker, tab side handles each. chrome
-    // drops BroadcastChannel delivery from blob workers so we cant rely on
-    // that as the only route (#54 follow-up).
-    const wasiFsPorts: MessagePort[] = [];
     const transferPorts: MessagePort[] = [];
     const ownedPorts: MessagePort[] = [];
-    {
-      const tabFsBridge = buildFileSystemBridge(this._volume, () => "/");
-      const POOL_SIZE = 16;
-      for (let i = 0; i < POOL_SIZE; i++) {
-        const ch = new MessageChannel();
-        ch.port1.onmessage = (e: MessageEvent) => {
-          const data = e.data;
-          if (!data || typeof data !== "object" || !data.__fs__) return;
-          handleFsProxy(data.__fs__, tabFsBridge);
-        };
-        ch.port1.start();
-        ownedPorts.push(ch.port1);
-        transferPorts.push(ch.port2);
-        wasiFsPorts.push(ch.port2);
-      }
-    }
 
     // lean mode: dedicated fs proxy channel for the worker's own lazy reads
     let lazyFsPort: MessagePort | undefined;
@@ -192,7 +191,7 @@ export class ProcessManager extends EventEmitter {
       lazyCh.port1.onmessage = (e: MessageEvent) => {
         const data = e.data;
         if (!data || typeof data !== "object" || !data.__fs__) return;
-        handleFsProxy(data.__fs__, lazyBridge);
+        this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
       };
       lazyCh.port1.start();
       ownedPorts.push(lazyCh.port1);
@@ -207,7 +206,6 @@ export class ProcessManager extends EventEmitter {
       env: spawnConfig.env,
       snapshot: spawnConfig.snapshot,
       syncBuffer: spawnConfig.syncBuffer,
-      wasiFsPorts,
       lazyFsPort,
       sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
         ? "bytes"
@@ -217,8 +215,8 @@ export class ProcessManager extends EventEmitter {
     try {
       handle.init(initMsg, transferPorts);
     } catch (err) {
-      this._processes.delete(pid);
       this._cleanupProcessResources(pid);
+      this._processes.delete(pid);
       try { worker.terminate(); } catch { /* ignore */ }
       throw err;
     }
@@ -311,10 +309,10 @@ export class ProcessManager extends EventEmitter {
         /* ignore */
       }
     }
-    this._processes.clear();
-    for (const pid of [...this._processPorts.keys()]) {
+    for (const pid of [...this._processes.keys()]) {
       this._cleanupProcessResources(pid);
     }
+    this._processes.clear();
     this._serverPorts.clear();
     this._childPids.clear();
     this._inheritStdinChildren.clear();
@@ -342,6 +340,51 @@ export class ProcessManager extends EventEmitter {
     this._inheritStdinChildren.delete(pid);
     this._childPids.delete(pid);
     for (const children of this._childPids.values()) children.delete(pid);
+    for (const [key, owned] of this._wasiWorkers) {
+      if (owned.parentPid !== pid) continue;
+      try { owned.worker.terminate(); } catch { /* ignore */ }
+      try { URL.revokeObjectURL(owned.url); } catch { /* ignore */ }
+      clearTimeout(owned.readyTimer);
+      for (const child of owned.children.values()) {
+        clearTimeout(child.readyTimer);
+        try { child.worker.terminate(); } catch { /* ignore */ }
+        try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+      }
+      owned.children.clear();
+      const parent = this._processes.get(pid);
+      parent?.removeListener("ipc-message", owned.ipcListener);
+      this._wasiWorkers.delete(key);
+    }
+  }
+
+  private _wasiWorkerKey(pid: number, requestId: number): string {
+    return `${pid}:${requestId}`;
+  }
+
+  private _finishWasiWorker(parent: ProcessHandle, requestId: number, exitCode: number): void {
+    const key = this._wasiWorkerKey(parent.pid, requestId);
+    const owned = this._wasiWorkers.get(key);
+    if (!owned) return;
+    this._wasiWorkers.delete(key);
+    parent.removeListener("ipc-message", owned.ipcListener);
+    clearTimeout(owned.readyTimer);
+    try { owned.worker.terminate(); } catch { /* ignore */ }
+    try { URL.revokeObjectURL(owned.url); } catch { /* ignore */ }
+    for (const child of owned.children.values()) {
+      clearTimeout(child.readyTimer);
+      try { child.worker.terminate(); } catch { /* ignore */ }
+      try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+    }
+    owned.children.clear();
+    if (!parent.workerExited) {
+      parent.postMessage({
+        type: "child-exit",
+        requestId,
+        exitCode,
+        stdout: "",
+        stderr: "",
+      });
+    }
   }
 
   get processCount(): number {
@@ -556,11 +599,129 @@ export class ProcessManager extends EventEmitter {
     ProcessManager._workerProbePromise = null;
   }
 
-  resourceStats(): { processes: number; messagePorts: number; pendingHttp: number } {
+  private _createWasiBootstrap(name: string): { worker: Worker; url: string } {
+    const bootstrap = `self.onmessage = (event) => {
+      if (!event.data || !event.data.__nodepod_wasi_init__) return;
+      const init = event.data;
+      globalThis.__nodepodWorkerData = init.workerData;
+      self.onmessage = null;
+      try {
+        (0, eval)(init.source);
+        self.postMessage({ __nodepod_broker_ready__: true });
+      } catch (error) {
+        self.postMessage({ __nodepod_worker_error__: String(error && error.stack || error) });
+      }
+    };`;
+    const url = URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" }));
+    return { worker: new Worker(url, { name }), url };
+  }
+
+  private _handleFsProxyWithRecovery(
+    request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
+    bridge: ReturnType<typeof buildFileSystemBridge>,
+  ): void {
+    const path = request.payload?.[0];
+    const canRecover = (request.type === "statSync" || request.type === "readFileSync")
+      && isRecoverableWasmPath(path)
+      && !this._volume.existsSync(path);
+    if (!canRecover) {
+      handleFsProxy(request, bridge);
+      return;
+    }
+    void prefetchWasmFromCdn(this._volume, path).finally(() => {
+      handleFsProxy(request, bridge);
+    });
+  }
+
+  private _notifyDelegatedThread(root: WasiBrokerRoot, errorOrTid: number, error: boolean, value: number): void {
+    const memory = root.loadMessage?.__emnapi__?.payload?.wasmMemory as WebAssembly.Memory | undefined;
+    if (!memory || !(memory.buffer instanceof SharedArrayBuffer)) return;
+    const result = new Int32Array(memory.buffer, errorOrTid, 2);
+    Atomics.store(result, 0, error ? 1 : 0);
+    Atomics.store(result, 1, value);
+    Atomics.notify(result, 1);
+  }
+
+  private _spawnDelegatedWasiThread(
+    root: WasiBrokerRoot,
+    fsBridge: ReturnType<typeof buildFileSystemBridge>,
+    payload: { startArg: number; errorOrTid: number },
+  ): void {
+    if (!root.loadMessage) {
+      this._notifyDelegatedThread(root, payload.errorOrTid, true, 6);
+      return;
+    }
+    const tid = this._nextWasiTid++;
+    let child: WasiBrokerChild | null = null;
+    const fail = (): void => {
+      this._notifyDelegatedThread(root, payload.errorOrTid, true, 6);
+      if (!child) return;
+      clearTimeout(child.readyTimer);
+      try { child.worker.terminate(); } catch { /* ignore */ }
+      try { URL.revokeObjectURL(child.url); } catch { /* ignore */ }
+      root.children.delete(tid);
+    };
+    try {
+      const created = this._createWasiBootstrap(`napi-wasi-thread-${tid}`);
+      const readyTimer = setTimeout(fail, 30_000);
+      child = { ...created, readyTimer };
+      root.children.set(tid, child);
+      created.worker.onmessage = (event: MessageEvent) => {
+        const data = event.data;
+        if (data && typeof data === "object" && data.__fs__) {
+          this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
+          return;
+        }
+        if (data?.__nodepod_worker_error__) {
+          fail();
+          return;
+        }
+        if (data?.__nodepod_broker_ready__) {
+          clearTimeout(readyTimer);
+          created.worker.postMessage(root.loadMessage);
+          return;
+        }
+        const emnapi = data?.__emnapi__;
+        if (emnapi?.type === "loaded") {
+          created.worker.postMessage({
+            __emnapi__: {
+              type: "start",
+              payload: { tid, arg: payload.startArg },
+            },
+          });
+          this._notifyDelegatedThread(root, payload.errorOrTid, false, tid);
+          return;
+        }
+        if (emnapi?.type === "spawn-thread") {
+          this._spawnDelegatedWasiThread(root, fsBridge, emnapi.payload);
+          return;
+        }
+        if (emnapi?.type === "cleanup-thread") {
+          clearTimeout(readyTimer);
+          try { created.worker.terminate(); } catch { /* ignore */ }
+          try { URL.revokeObjectURL(created.url); } catch { /* ignore */ }
+          root.children.delete(tid);
+        }
+      };
+      created.worker.onerror = fail;
+      created.worker.postMessage({
+        __nodepod_wasi_init__: true,
+        source: root.source,
+        workerData: null,
+      });
+    } catch {
+      fail();
+    }
+  }
+
+  resourceStats(): { processes: number; workers: number; messagePorts: number; pendingHttp: number } {
     let messagePorts = 0;
     for (const ports of this._processPorts.values()) messagePorts += ports.length;
+    let wasiWorkers = 0;
+    for (const root of this._wasiWorkers.values()) wasiWorkers += 1 + root.children.size;
     return {
       processes: this._processes.size,
+      workers: this._processes.size + wasiWorkers,
       messagePorts,
       pendingHttp: this._httpCallbacks.size,
     };
@@ -638,8 +799,8 @@ export class ProcessManager extends EventEmitter {
       this.emit("exit", handle.pid, exitCode);
       // delayed so event handlers finish first
       setTimeout(() => {
-        this._processes.delete(handle.pid);
         this._cleanupProcessResources(handle.pid);
+        this._processes.delete(handle.pid);
       }, 100);
     });
 
@@ -1055,6 +1216,103 @@ export class ProcessManager extends EventEmitter {
           error: e instanceof Error ? e.message : String(e),
         });
       }
+    });
+
+    handle.on("wasiworker-request", (msg: WorkerToMain_WasiWorkerRequest) => {
+      const key = this._wasiWorkerKey(handle.pid, msg.requestId);
+      try {
+        if (this._wasiWorkers.has(key)) throw new Error(`duplicate WASI worker request ${msg.requestId}`);
+        const { worker, url } = this._createWasiBootstrap(msg.name);
+        const fsBridge = buildFileSystemBridge(this._volume, () => "/");
+        const earlyMessages: unknown[] = [];
+        let ready = false;
+        let owned: WasiBrokerRoot;
+        const ipcListener = (ipcMsg: any): void => {
+          if (ipcMsg.targetRequestId !== msg.requestId) return;
+          if (ipcMsg.data?.__emnapi__?.type === "load") owned.loadMessage = ipcMsg.data;
+          if (!ready) {
+            earlyMessages.push(ipcMsg.data);
+            return;
+          }
+          worker.postMessage(ipcMsg.data);
+        };
+        const readyTimer = setTimeout(() => {
+          handle.postMessage({
+            type: "ipc-message",
+            targetRequestId: msg.requestId,
+            data: { __nodepod_worker_error__: "WASI worker ready handshake timed out" },
+          } as any);
+          this._finishWasiWorker(handle, msg.requestId, 1);
+        }, 30_000);
+        owned = {
+          worker,
+          url,
+          parentPid: handle.pid,
+          requestId: msg.requestId,
+          source: msg.source,
+          ipcListener,
+          readyTimer,
+          loadMessage: null,
+          children: new Map(),
+        };
+        this._wasiWorkers.set(key, owned);
+        handle.on("ipc-message", ipcListener);
+        worker.onmessage = (event: MessageEvent) => {
+          const data = event.data;
+          if (data && typeof data === "object" && data.__fs__) {
+            this._handleFsProxyWithRecovery(data.__fs__, fsBridge);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_worker_error__) {
+            handle.postMessage({
+              type: "ipc-message",
+              targetRequestId: msg.requestId,
+              data,
+            } as any);
+            this._finishWasiWorker(handle, msg.requestId, 1);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_broker_ready__) {
+            ready = true;
+            clearTimeout(readyTimer);
+            for (const queued of earlyMessages.splice(0)) worker.postMessage(queued);
+          }
+          if (data?.__emnapi__?.type === "spawn-thread") {
+            this._spawnDelegatedWasiThread(owned, fsBridge, data.__emnapi__.payload);
+            return;
+          }
+          if (data && typeof data === "object" && data.__nodepod_worker_exit__ !== undefined) {
+            this._finishWasiWorker(handle, msg.requestId, Number(data.__nodepod_worker_exit__) || 0);
+            return;
+          }
+          handle.postMessage({ type: "ipc-message", targetRequestId: msg.requestId, data } as any);
+        };
+        worker.onerror = (event: ErrorEvent) => {
+          handle.postMessage({
+            type: "ipc-message",
+            targetRequestId: msg.requestId,
+            data: { __nodepod_worker_error__: event.message || "WASI worker error" },
+          } as any);
+          this._finishWasiWorker(handle, msg.requestId, 1);
+        };
+        worker.postMessage({
+          __nodepod_wasi_init__: true,
+          source: msg.source,
+          workerData: msg.workerData,
+        });
+        handle.postMessage({ type: "spawn-result", requestId: msg.requestId, pid: 0 });
+      } catch (error) {
+        handle.postMessage({
+          type: "spawn-result",
+          requestId: msg.requestId,
+          pid: -1,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+
+    handle.on("wasiworker-terminate", (msg: WorkerToMain_WasiWorkerTerminate) => {
+      this._finishWasiWorker(handle, msg.requestId, 1);
     });
 
     handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {

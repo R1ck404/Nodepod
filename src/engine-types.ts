@@ -51,6 +51,13 @@ export interface VolumeSnapshot {
 
 export interface VolumeEntry {
   path: string;
-  kind: 'file' | 'directory';
+  kind: 'file' | 'directory' | 'symlink';
   data?: string; // base64-encoded
+  target?: string;
+  inode?: number;
+  mode?: number;
+  atimeMs?: number;
+  mtimeMs?: number;
+  ctimeMs?: number;
+  nlink?: number;
 }

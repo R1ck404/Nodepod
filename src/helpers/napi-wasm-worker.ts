@@ -16,6 +16,41 @@ import type { MemoryVolume } from "../memory-volume";
 import { EventEmitter } from "../polyfills/events";
 import { getRegistry, type Handle } from "./event-loop";
 import { esmToCjs } from "../syntax-transforms";
+import { parse } from "acorn";
+import { getWasiRuntimeSource } from "../polyfills/wasi";
+
+function scanWorkerDependencies(source: string): { dependencies: string[]; esm: boolean } {
+  let ast: any;
+  let esm = true;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module", allowHashBang: true });
+  } catch {
+    esm = false;
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "script", allowHashBang: true });
+  }
+  const dependencies = new Set<string>();
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if ((node.type === "ImportDeclaration" || node.type === "ExportNamedDeclaration" || node.type === "ExportAllDeclaration") &&
+        typeof node.source?.value === "string") {
+      dependencies.add(node.source.value);
+      esm = true;
+    } else if (node.type === "ImportExpression" && typeof node.source?.value === "string") {
+      dependencies.add(node.source.value);
+      esm = true;
+    } else if (node.type === "CallExpression" && node.callee?.type === "Identifier" &&
+        node.callee.name === "require" && typeof node.arguments?.[0]?.value === "string") {
+      dependencies.add(node.arguments[0].value);
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "start" || key === "end" || key === "loc") continue;
+      if (Array.isArray(value)) for (const child of value) visit(child);
+      else if (value && typeof value === "object") visit(value);
+    }
+  };
+  visit(ast);
+  return { dependencies: [...dependencies], esm };
+}
 
 /**
  * true if scriptPath is a wasi-worker script in a node_modules package that
@@ -56,6 +91,7 @@ export function buildNapiWorkerBundle(
   const modules = new Map<string, string>(); // resolvedPath -> source
   const moduleIds = new Map<string, number>(); // resolvedPath -> numeric id
   const moduleDeps = new Map<string, Map<string, string>>();
+  const moduleEsm = new Map<string, boolean>();
   let nextId = 0;
   const visited = new Set<string>();
 
@@ -78,15 +114,11 @@ export function buildNapiWorkerBundle(
     const deps = new Map<string, string>();
     moduleDeps.set(filePath, deps);
 
-    // simplified regex, good enough for napi-rs deps
-    const importRe =
-      /(?:import\s+.*?\s+from\s+['"]([^'"]+)['"]|require\s*\(\s*['"]([^'"]+)['"]\s*\)|export\s+.*?\s+from\s+['"]([^'"]+)['"])/g;
-    let match: RegExpExecArray | null;
+    const scanned = scanWorkerDependencies(source);
+    moduleEsm.set(filePath, scanned.esm || filePath.endsWith(".mjs"));
     const fromDir = filePath.substring(0, filePath.lastIndexOf("/")) || "/";
 
-    while ((match = importRe.exec(source)) !== null) {
-      const dep = match[1] || match[2] || match[3];
-      if (!dep) continue;
+    for (const dep of scanned.dependencies) {
 
       // Node.js builtins get stubs instead
       if (isBuiltin(dep)) continue;
@@ -125,9 +157,7 @@ export function buildNapiWorkerBundle(
     // keep package module semantics intact. generated napi-rs workers commonly
     // import the runtime through ESM, where a missing export becomes a corrupt
     // WebAssembly import rather than a useful JavaScript error.
-    const isESM = filePath.endsWith(".mjs") ||
-      (/\b(import\s+[\w{*]|export\s+(default|const|let|var|function|class|\{|\*))\b/.test(source) &&
-       !source.includes("module.exports") && !source.includes("exports.__esModule"));
+    const isESM = moduleEsm.get(filePath) ?? filePath.endsWith(".mjs");
     let transformed = isESM
       ? esmToCjs(source.replace(/\bimport\.meta\.url\b/g, JSON.stringify(`file://${filePath}`)))
       : source;
@@ -176,94 +206,6 @@ try {
 
 let _nextWasiThreadId = 100;
 
-// chrome silently drops `new Worker()` if the parent web worker is about to
-// enter Atomics.wait (tailwind oxide does this back to back in
-// instantiateNapiModuleSync). pre-spawn empty workers while the spawned
-// process boots so theyre already running before anyone blocks, then inject
-// the actual bundle via importScripts when napi-rs needs one.
-const _wasiPool: globalThis.Worker[] = [];
-const _WASI_POOL_TARGET = 4;
-const _WASI_POOL_IDLE_MS = 30_000;
-let _poolPreambleUrl: string | null = null;
-let _wasiPoolIdleTimer: ReturnType<typeof setTimeout> | null = null;
-
-function schedulePoolExpiry(): void {
-  if (_wasiPoolIdleTimer) clearTimeout(_wasiPoolIdleTimer);
-  if (_wasiPool.length === 0) {
-    _wasiPoolIdleTimer = null;
-    return;
-  }
-  _wasiPoolIdleTimer = setTimeout(() => {
-    _wasiPoolIdleTimer = null;
-    for (const worker of _wasiPool.splice(0)) {
-      try { worker.terminate(); } catch { /* ignore */ }
-    }
-  }, _WASI_POOL_IDLE_MS);
-}
-
-function getPoolPreambleUrl(): string {
-  if (_poolPreambleUrl) return _poolPreambleUrl;
-  const src = `
-    self.onmessage = function(e) {
-      var d = e && e.data;
-      if (d && d.__nodepod_init_bundle__) {
-        var url = d.bundleUrl;
-        // stash transferred fs port for the bundle preamble to pick up
-        if (d.fsPort) {
-          globalThis.__nodepodWasiFsPort = d.fsPort;
-          try { d.fsPort.start(); } catch (_) {}
-        }
-        try {
-          self.onmessage = null;
-          importScripts(url);
-        } catch (err) {
-          try { self.postMessage({ __nodepod_pool_err__: String(err && err.message || err) }); } catch (_) {}
-        }
-      }
-    };
-  `;
-  const blob = new Blob([src], { type: "application/javascript" });
-  _poolPreambleUrl = URL.createObjectURL(blob);
-  return _poolPreambleUrl;
-}
-
-function refillPool(): void {
-  while (_wasiPool.length < _WASI_POOL_TARGET) {
-    try {
-      _wasiPool.push(new globalThis.Worker(getPoolPreambleUrl(), { name: "wasi-pool" }));
-    } catch {
-      break;
-    }
-  }
-  schedulePoolExpiry();
-}
-
-function pullFromPool(): globalThis.Worker | null {
-  if (_wasiPool.length < _WASI_POOL_TARGET / 2) {
-    queueMicrotask(refillPool);
-  }
-  const worker = _wasiPool.shift() ?? null;
-  schedulePoolExpiry();
-  return worker;
-}
-
-// call early in spawned-process boot, before anything blocks
-export function prewarmWasiPool(): void {
-  refillPool();
-}
-
-// MessagePort pool from the tab. each port is a 1:1 fs proxy channel for one
-// WASI worker. sidesteps chrome dropping BroadcastChannel messages from blob
-// workers, and works when the parent is in sync wasm (oxide.scan).
-const _wasiFsPortPool: MessagePort[] = [];
-export function setWasiFsPortPool(ports: MessagePort[]): void {
-  _wasiFsPortPool.length = 0;
-  for (const p of ports) _wasiFsPortPool.push(p);
-}
-function pullFsPort(): MessagePort | null {
-  return _wasiFsPortPool.shift() ?? null;
-}
-
 /**
  * makes a PatchedWorker constructor that spawns real browser Web Workers for
  * napi-rs WASI scripts, falling back to the standard fork-based worker otherwise
@@ -310,6 +252,7 @@ export function createNapiWorkerFactory(
         processEnv,
         fsBridge,
         bundleCache,
+        fallbackWorkerFn,
       );
     }
 
@@ -372,6 +315,7 @@ function createRealWebWorker(
   processEnv: Record<string, string>,
   fsBridge: any,
   bundleCache: Map<string, string>,
+  brokerWorkerFn: ((...args: any[]) => any) | null,
 ) {
   const self = this;
   self.threadId = _nextWasiThreadId++;
@@ -400,114 +344,80 @@ function createRealWebWorker(
       return;
     }
   }
+  const workerBundleSource = bundleSource.replaceAll("__NODEPOD_THREAD_ID__", String(self.threadId));
 
-  let realWorker: globalThis.Worker;
-  let blobUrl: string;
-  try {
-    const blob = new Blob([bundleSource], { type: "application/javascript" });
-    blobUrl = URL.createObjectURL(blob);
-  } catch (err: any) {
-    queueMicrotask(() =>
-      self.emit("error", new Error(`Failed to build WASI bundle: ${err.message}`)),
-    );
+  if (brokerWorkerFn) {
+    let unrefTimer: ReturnType<typeof setTimeout> | null = null;
+    const close = (code: number): void => {
+      if (self._terminated) return;
+      if (unrefTimer) clearTimeout(unrefTimer);
+      unrefTimer = null;
+      (self._elHandle as Handle | null)?.close();
+      self._elHandle = null;
+      self._terminated = true;
+      self.emit("exit", code);
+    };
+    const handle = brokerWorkerFn(workerBundleSource, {
+      workerData: opts?.workerData ?? null,
+      threadId: self.threadId,
+      isEval: true,
+      rawWasi: true,
+      cwd: (globalThis as any).process?.cwd?.() ?? "/",
+      env: processEnv,
+      onOnline: () => {
+        if (!self._terminated) self.emit("online");
+      },
+      onMessage: (data: unknown) => self.emit("message", data),
+      onError: (error: Error) => self.emit("error", error),
+      onExit: close,
+    });
+    self._handle = handle;
+    self._elHandle = getRegistry().register("Worker");
+    self.postMessage = (value: unknown) => {
+      if (!self._terminated) handle.postMessage(value);
+    };
+    self.terminate = () => {
+      if (!self._terminated) {
+        handle.terminate();
+        close(1);
+      }
+      return Promise.resolve(1);
+    };
+    self.ref = () => {
+      if (unrefTimer) clearTimeout(unrefTimer);
+      unrefTimer = null;
+      if (!self._terminated) (self._elHandle as Handle | null)?.ref();
+      return self;
+    };
+    self.unref = () => {
+      // napi-rs unrefs its bootstrap worker before Vite binds the HTTP server.
+      // Delay that transition through the startup gap, then honor Node's
+      // unref semantics so one-shot native-module processes can drain.
+      if (!self._terminated && !unrefTimer) {
+        unrefTimer = setTimeout(() => {
+          unrefTimer = null;
+          (self._elHandle as Handle | null)?.unref();
+        }, 3_000);
+        (unrefTimer as any)?.unref?.();
+      }
+      return self;
+    };
     return;
   }
 
-  // create the Chrome/Atomics reserve only when a threaded WASI worker is
-  // actually requested. Ordinary Node processes retain no idle WASI workers.
-  refillPool();
-  const pooled = pullFromPool();
-  if (pooled) {
-    realWorker = pooled;
-    const fsPort = pullFsPort();
-    try {
-      const initMsg: any = { __nodepod_init_bundle__: true, bundleUrl: blobUrl };
-      if (fsPort) {
-        initMsg.fsPort = fsPort;
-        realWorker.postMessage(initMsg, [fsPort]);
-      } else {
-        realWorker.postMessage(initMsg);
-      }
-    } catch { /* ignore */ }
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
-  } else {
-    // pool empty, direct spawn. hits the chrome quirk if parent is about to
-    // block but at least non-blocking cases still work.
-    try {
-      realWorker = new globalThis.Worker(blobUrl, { name: `napi-wasi-${self.threadId}` });
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
-    } catch (err: any) {
-      queueMicrotask(() =>
-        self.emit(
-          "error",
-          new Error(`Failed to create WASI Web Worker: ${err.message}`),
-        ),
-      );
-      return;
-    }
-  }
-
-  realWorker.onmessage = (e: MessageEvent) => {
-    const data = e.data;
-    if (data && typeof data === "object" && data.__fs__) {
-      handleFsProxy(data.__fs__, fsBridge);
-      return;
-    }
-    self.emit("message", data);
-  };
-
-  realWorker.onerror = (e: ErrorEvent) => {
-    self.emit("error", new Error(e.message || "Worker error"));
-    // web workers dont emit exit, fake one so the loop ref isnt leaked
-    if (!self._terminated) {
-      (self._elHandle as Handle | null)?.close();
-      self._elHandle = null;
-      self._terminated = true;
-      try { self.emit("exit", 1); } catch { /* ignore */ }
-    }
-  };
-
-  self._realWorker = realWorker;
-  self.postMessage = (value: unknown, transferList?: unknown[]) => {
-    if (!self._terminated) {
-      realWorker.postMessage(value, transferList as Transferable[]);
-    }
-  };
-  self.terminate = () => {
-    if (!self._terminated) {
-      (self._elHandle as Handle | null)?.close();
-      self._elHandle = null;
-      self._terminated = true;
-      realWorker.terminate();
-    }
-    return Promise.resolve(0);
-  };
-  self.ref = () => {
-    if (!self._terminated) (self._elHandle as Handle | null)?.ref();
-    return self;
-  };
-  // napi-rs's wasi.cjs calls worker.unref() to mirror node behavior where the
-  // http server keeps the loop alive. in nodepod the spawned process loop
-  // would drain before vite even binds, so we ignore unref. terminate/onExit
-  // still close the handle so the loop drains once the worker is done.
-  self.unref = () => self;
-
-  // start reffed like Node.js does
-  self._elHandle = getRegistry().register("Worker");
-
-  queueMicrotask(() => {
-    if (!self._terminated) self.emit("online");
-  });
+  queueMicrotask(() => self.emit("error", new Error(
+    "WASI worker broker is unavailable in this execution context",
+  )));
 }
 
-// handles __fs__ messages from WASI workers. exported so Nodepod.boot can
-// subscribe to the broadcast channel and service the same protocol from the
-// browser tab when the spawned process is busy in sync WASM
+// handles one sequenced synchronous filesystem request from a brokered worker
 export function handleFsProxy(
-  req: { sab: Int32Array; type: string; payload: any[] },
+  req: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
   fsBridge: any,
 ): void {
   const { sab, type, payload } = req;
+  const requestId = req.requestId ?? Atomics.load(sab, 3);
+  if (Atomics.load(sab, 0) !== -1 || Atomics.load(sab, 3) !== requestId) return;
   const maxPayload = sab.buffer.byteLength - 16; // minus 16-byte header
 
   try {
@@ -563,10 +473,15 @@ export function handleFsProxy(
     const encoded = encodeValue(result);
     const resultType = getValueType(result);
 
-    Atomics.store(sab, 1, resultType);
     Atomics.store(sab, 2, encoded.byteLength);
+    if (encoded.byteLength > maxPayload) {
+      Atomics.store(sab, 0, 2);
+      Atomics.notify(sab, 0);
+      return;
+    }
+    Atomics.store(sab, 1, resultType);
     // payload goes after the 16-byte header
-    const writeLen = Math.min(encoded.byteLength, maxPayload);
+    const writeLen = encoded.byteLength;
     const payloadView = new Uint8Array(sab.buffer, 16, writeLen);
     payloadView.set(encoded.subarray(0, writeLen));
 
@@ -660,21 +575,18 @@ function WORKER_PREAMBLE(env: Record<string, string>): string {
   // one worker here; child-thread delegation remains owned by the parent.
   // rayon/tokio thread spawning goes via emnapi's child-thread delegation:
   // child posts 'spawn-thread' to main, main creates Worker, writes TID to SAB
-  const workerEnv = {
-    ...env,
-    UV_THREADPOOL_SIZE: "1",
-    NAPI_RS_ASYNC_WORK_POOL_SIZE: "1",
-    EMNAPI_WORKER_POOL_SIZE: "1",
-    // don't set RAYON_NUM_THREADS here - WASM reads environ from shared
-    // memory (set by the main thread's _initialize), not this process.env
-  };
+  const defaultPoolSize = String(Math.max(1, Math.min(4,
+    typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4,
+  )));
+  const workerEnv = { ...env };
+  workerEnv.UV_THREADPOOL_SIZE ??= defaultPoolSize;
+  workerEnv.NAPI_RS_ASYNC_WORK_POOL_SIZE ??= defaultPoolSize;
+  workerEnv.EMNAPI_WORKER_POOL_SIZE ??= defaultPoolSize;
   return `
 // === nodepod napi-rs WASI worker preamble ===
 "use strict";
 
-// Save reference to native postMessage BEFORE any override.
-// In a Web Worker, self === globalThis, so overriding globalThis.postMessage
-// would shadow self.postMessage causing infinite recursion.
+// retain the native sender before installing node-compatible globals
 const __nativePostMessage = self.postMessage.bind(self);
 
 // Bridge parentPort ↔ Web Worker message API
@@ -732,77 +644,26 @@ globalThis.process = process;
 // Web Worker globals that napi-rs wasi-worker expects.
 // self is already globalThis in a Web Worker (read-only getter, cannot set).
 
-// WASM THREADING: emnapi's child-thread delegation model
-//
-// In child-thread mode (childThread: true), emnapi's WASIThreads does NOT
-// create Workers directly. When WASM code calls wasi_thread_spawn, emnapi:
-//   1. Posts a 'spawn-thread' message to the main thread via postMessage
-//   2. Blocks with Atomics.wait() on the errorOrTid struct in shared memory
-//   3. Main thread receives the message, creates a new Worker, writes TID
-//   4. Atomics.notify() wakes the child, which returns the TID to WASM
-//
-// This means child workers don't need the Worker constructor. We keep it
-// disabled as a safety net (preventing accidental direct Worker creation).
-// But we do NOT neuter wasi.thread-spawn — that would break the delegation.
+// emnapi delegates child threads through parentPort while the caller waits
 const __DisabledWorker = class Worker {
   constructor() { throw new Error('Direct Worker creation not available in nodepod child worker (use emnapi child-thread delegation)'); }
 };
 try { Object.defineProperty(globalThis, 'Worker', { value: __DisabledWorker, writable: true, configurable: true }); } catch {}
 try { globalThis.Worker = __DisabledWorker; } catch {}
 
-// DO NOT intercept WebAssembly.Instance or WebAssembly.instantiate.
-// emnapi's WASIThreads provides the wasi.thread-spawn import function.
-// In child-thread mode, it delegates to the main thread via postMessage.
-// Neutering it would make rayon/tokio thread creation fail with EAGAIN,
-// causing "The global thread pool has not been initialized" panics.
-
 try { if (!globalThis.importScripts) globalThis.importScripts = function(f) {}; } catch {};
 
-// Message dispatch: route Web Worker messages to EXACTLY ONE handler path.
-//
-// CRITICAL: emnapi's ThreadMessageHandler._start(payload) has NO idempotence
-// guard — it calls wasi_thread_start(tid, arg) every time it's invoked. If a
-// 'start' message is dispatched twice, wasi_thread_start runs twice with the
-// same (tid, arg), which corrupts per-thread TLS / reuses the stack and
-// traps at "unreachable" or "memory access out of bounds".
-//
-// napi-rs ships TWO worker variants, each using a different delivery model:
-//
-//   1. wasi-worker.mjs (Node variant): registers parentPort.on('message',
-//      data => globalThis.onmessage({data})). This is a TRAMPOLINE — the
-//      parentPort listener re-dispatches to globalThis.onmessage.
-//
-//   2. wasi-worker-browser.mjs (browser variant): NO parentPort listener,
-//      only sets globalThis.onmessage = handler.handle directly.
-//
-// Native Web Worker dispatch uses the event handler internal slot (set when
-// the original prototype setter fired at line "self.onmessage = ...", before
-// we defined our accessor below). That internal slot points to THIS function.
-// Our accessor shadows JS reads/writes but does NOT update the internal slot.
-//
-// So: this function is the ONLY callback native dispatch invokes. We must
-// pick ONE path — parentPort trampoline OR direct globalThis.onmessage — but
-// never both.
+// node and browser worker variants use different handlers; dispatch once
 self.onmessage = function(e) {
   if (__parentPortListeners.length > 0) {
-    // Node variant: parentPort trampoline will call globalThis.onmessage
     for (const fn of __parentPortListeners) {
       try { fn(e.data); } catch (err) { console.error('[wasi-worker] parentPort listener error:', err); }
     }
   } else if (typeof globalThis.__userOnMessage === 'function') {
-    // Browser variant: no trampoline, invoke globalThis.onmessage directly
     globalThis.__userOnMessage(e);
   }
 };
 
-// Override globalThis.onmessage setter to capture user handler.
-// User code (wasi-worker.mjs/wasi-worker-browser.mjs) does:
-//   globalThis.onmessage = function(e) { handler.handle(e); };
-// We store the handler here. The native Web Worker dispatcher can't reach it
-// (its internal slot points to the function assigned at line "self.onmessage
-// = function(e)" above, which was stored via the prototype setter BEFORE this
-// defineProperty shadowed the property). So the stored handler is invoked
-// only by our dispatch above — exactly once per message.
 let __userOnMessageFn = null;
 Object.defineProperty(globalThis, 'onmessage', {
   get() { return __userOnMessageFn; },
@@ -824,8 +685,8 @@ const __builtinRequire = function(id) {
     return {
       parentPort: __parentPort,
       isMainThread: false,
-      workerData: null,
-      threadId: ${_nextWasiThreadId},
+      workerData: globalThis.__nodepodWorkerData ?? null,
+      threadId: __NODEPOD_THREAD_ID__,
       Worker: __DisabledWorker,
       MessageChannel: globalThis.MessageChannel || class MessageChannel {
         constructor() { this.port1 = {}; this.port2 = {}; }
@@ -903,30 +764,35 @@ __pathStub.posix = __pathStub;
 //   [3] = reserved
 const __FS_DEFAULT_SAB = 16 + 65536; // 16 header + 64KB payload (enough for most ops)
 
-// fs proxy: try dedicated MessagePort first (transferred from tab via the pool
-// init message, direct 1:1 channel, works in chrome where BC from blob workers
-// is broken). fall through to BC (firefox path) and parent postMessage (works
-// when parent isnt in sync wasm). first one to flip the SAB status wins.
-const __wasiFsPort = globalThis.__nodepodWasiFsPort || null;
-const __wasiFsBC = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('nodepod-wasi-fs') : null;
-if (__wasiFsBC && typeof __wasiFsBC.unref === 'function') {
-  try { __wasiFsBC.unref(); } catch {}
+let __fsRequestSequence = 0;
+let __fsReusableSab = null;
+
+function __nextFsCapacity(required) {
+  let capacity = __FS_DEFAULT_SAB;
+  while (capacity < required) capacity *= 2;
+  return capacity;
+}
+
+function __getFsSab(required) {
+  const capacity = __nextFsCapacity(required);
+  if (capacity > 4 * 1024 * 1024) return new SharedArrayBuffer(capacity);
+  if (!__fsReusableSab || __fsReusableSab.byteLength < capacity) {
+    __fsReusableSab = new SharedArrayBuffer(capacity);
+  }
+  return __fsReusableSab;
 }
 
 function __fsSyncCall(type, args, sabSize) {
   const size = sabSize || __FS_DEFAULT_SAB;
-  const sab = new SharedArrayBuffer(size);
+  const sab = __getFsSab(size);
   const ctrl = new Int32Array(sab, 0, 4);
+  const requestId = ++__fsRequestSequence;
   Atomics.store(ctrl, 0, -1); // pending
+  Atomics.store(ctrl, 1, 0);
+  Atomics.store(ctrl, 2, 0);
+  Atomics.store(ctrl, 3, requestId);
 
-  const message = { __fs__: { sab: ctrl, type: type, payload: args || [] } };
-
-  if (__wasiFsPort) {
-    try { __wasiFsPort.postMessage(message); } catch {}
-  }
-  if (__wasiFsBC) {
-    try { __wasiFsBC.postMessage(message); } catch {}
-  }
+  const message = { __fs__: { sab: ctrl, type: type, payload: args || [], requestId: requestId } };
   __nativePostMessage(message);
 
   const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
@@ -937,10 +803,16 @@ function __fsSyncCall(type, args, sabSize) {
   const status = Atomics.load(ctrl, 0);
   const resultType = Atomics.load(ctrl, 1);
   const payloadLen = Atomics.load(ctrl, 2);
+  if (status === 2) {
+    if (payloadLen > 256 * 1024 * 1024) {
+      throw Object.assign(new Error('fs.' + type + ' response exceeds 256 MB'), { code: 'EOVERFLOW' });
+    }
+    return __fsSyncCall(type, args, 16 + payloadLen);
+  }
 
   // Read payload bytes. The view is over a SharedArrayBuffer; TextDecoder
   // rejects shared views, so copy into a regular ArrayBuffer before decoding.
-  const maxPayload = size - 16;
+  const maxPayload = sab.byteLength - 16;
   const payloadView = payloadLen > 0 ? new Uint8Array(sab, 16, Math.min(payloadLen, maxPayload)) : null;
   const payloadCopy = payloadView ? new Uint8Array(payloadView.length) : null;
   if (payloadView && payloadCopy) payloadCopy.set(payloadView);
@@ -1203,457 +1075,14 @@ globalThis.Buffer = __BufferStub;
 
 // Real WASI preview1 implementation for worker threads.
 // Provides all required syscalls so WASM modules can initialize.
-const __wasiStub = { WASI: class WASI {
-  constructor(opts) {
-    this._opts = opts || {};
-    // Merge process.env into WASI env. The wasi-worker.mjs may pass env: {} or
-    // omit it entirely — either way we need process.env to be visible.
-    // Note: for child threads, _initialize is a no-op (emnapi proxy), so the
-    // WASM code never re-reads environ — it uses the main thread's values
-    // from shared memory. This env is only used by this WASI instance's JS.
-    const _procEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
-    const _optsEnv = this._opts.env || {};
-    this._env = { ..._procEnv, ..._optsEnv };
-    this._args = this._opts.args || [];
-    this._preopens = [];
-    this._memory = null;
-    this._instance = null;
-    this._nextFd = 3;
-    this._fds = new Map([[0, 'stdin'], [1, 'stdout'], [2, 'stderr']]);
-    const po = this._opts.preopens || {};
-    for (const [virt, real] of Object.entries(po)) {
-      const fd = this._nextFd++;
-      this._preopens.push({ fd, virtualPath: virt, realPath: real });
-      this._fds.set(fd, { kind: 'dir', path: virt });
-    }
-  }
-  initialize(inst) {
-    this._instance = inst;
-    this._memory = inst.exports.memory;
-    const _init = inst.exports._initialize;
-    // emnapi's @emnapi/wasi-threads wraps child thread instances in a Proxy
-    // that returns a no-op for _initialize. So calling _init() is safe for both
-    // main thread (real _initialize) and child threads (no-op).
-    // IMPORTANT: Do NOT write guard values to WASM shared memory — it corrupts
-    // the stack/data segment.
-    if (typeof _init === 'function') _init();
-  }
-  start(inst) { this.initialize(inst); return 0; }
-  getImportObject() { return { wasi_snapshot_preview1: this._buildImports() }; }
-  get wasiImport() { return this._buildImports(); }
-  _view() { return new DataView(this._memory.buffer); }
-  _bytes() { return new Uint8Array(this._memory.buffer); }
-  // Read a string from WASM memory, handling SharedArrayBuffer.
-  // TextDecoder.decode() rejects SharedArrayBuffer-backed views,
-  // so we must copy to a non-shared buffer first.
-  // Resolve a WASI path relative to a directory entry, normalizing . and ..
-  _resolvePath(dirPath, rel) {
-    const base = dirPath || '/';
-    const raw = rel.startsWith('/') ? rel : (base.endsWith('/') ? base + rel : base + '/' + rel);
-    const segs = raw.split('/');
-    const out = [];
-    for (const s of segs) { if (s === '.' || s === '') continue; if (s === '..') { out.pop(); continue; } out.push(s); }
-    return '/' + out.join('/');
-  }
-  _readStr(ptr, len) {
-    const src = new Uint8Array(this._memory.buffer, ptr, len);
-    if (this._memory.buffer instanceof SharedArrayBuffer) {
-      const copy = new Uint8Array(len);
-      copy.set(src);
-      return new TextDecoder().decode(copy);
-    }
-    return new TextDecoder().decode(src);
-  }
-  // Flush an fd's accumulated in-memory data back to the filesystem.
-  // Called from fd_close / fd_sync / fd_datasync. Without this, every
-  // WASI file write via fd_write would be silently lost.
-  // Mirrors the pattern in src/polyfills/wasi.ts's flushFile().
-  _flushFile(entry) {
-    if (!entry || entry.kind !== 'file' || !entry.dirty || !entry.path) return;
-    const data = entry.data || new Uint8Array(0);
-    __fsStub.writeFileSync(entry.path, data);
-    entry.dirty = false;
-  }
-  _buildImports() {
-    const E = { SUCCESS: 0, BADF: 8, INVAL: 28, NOENT: 44, NOSYS: 52, IO: 29, ISDIR: 31, NOTDIR: 54, NOTEMPTY: 55, ACCES: 2, EXIST: 20 };
-    const self = this;
-    const enc = new TextEncoder();
-    return {
-      args_get(argv, buf) { const dv = self._view(); const b = self._bytes(); let off = buf; for (let i = 0; i < self._args.length; i++) { dv.setUint32(argv + i * 4, off, true); const a = enc.encode(self._args[i] + '\\0'); b.set(a, off); off += a.length; } return E.SUCCESS; },
-      args_sizes_get(argc_out, bufsz_out) { const dv = self._view(); dv.setUint32(argc_out, self._args.length, true); let sz = 0; for (const a of self._args) sz += enc.encode(a).length + 1; dv.setUint32(bufsz_out, sz, true); return E.SUCCESS; },
-      environ_get(env_ptr, buf) { const dv = self._view(); const b = self._bytes(); let off = buf; let i = 0; for (const [k, v] of Object.entries(self._env)) { dv.setUint32(env_ptr + i * 4, off, true); const e = enc.encode(k + '=' + v + '\\0'); b.set(e, off); off += e.length; i++; } return E.SUCCESS; },
-      environ_sizes_get(count_out, bufsz_out) { const dv = self._view(); const entries = Object.entries(self._env); dv.setUint32(count_out, entries.length, true); let sz = 0; for (const [k, v] of entries) sz += enc.encode(k + '=' + v).length + 1; dv.setUint32(bufsz_out, sz, true); return E.SUCCESS; },
-      clock_time_get(id, precision, time_out) { const dv = self._view(); const now = BigInt(Math.round(performance.now() * 1e6)); dv.setBigUint64(time_out, now, true); return E.SUCCESS; },
-      clock_res_get(id, res_out) { const dv = self._view(); dv.setBigUint64(res_out, BigInt(1000000), true); return E.SUCCESS; },
-      fd_prestat_get(fd, buf) { const p = self._preopens.find(x => x.fd === fd); if (!p) return E.BADF; const dv = self._view(); dv.setUint8(buf, 0); dv.setUint32(buf + 4, enc.encode(p.virtualPath).length, true); return E.SUCCESS; },
-      fd_prestat_dir_name(fd, path, len) { const p = self._preopens.find(x => x.fd === fd); if (!p) return E.BADF; const e = enc.encode(p.virtualPath); self._bytes().set(e.subarray(0, Math.min(e.length, len)), path); return E.SUCCESS; },
-      fd_fdstat_get(fd, buf) { const dv = self._view(); dv.setUint8(buf, fd <= 2 ? 2 : 3); dv.setUint16(buf + 2, 0, true); dv.setBigUint64(buf + 8, BigInt(0), true); dv.setBigUint64(buf + 16, BigInt(0), true); return E.SUCCESS; },
-      fd_fdstat_set_flags() { return E.SUCCESS; },
-      fd_fdstat_set_rights() { return E.SUCCESS; },
-      fd_write(fd, iovs, iovs_len, nwritten) {
-        let total = 0;
-        for (let i = 0; i < iovs_len; i++) {
-          // Re-acquire views each iteration (memory.grow() safety)
-          const dv = self._view(); const b = self._bytes();
-          const ptr = dv.getUint32(iovs + i * 8, true);
-          const len = dv.getUint32(iovs + i * 8 + 4, true);
-          if (ptr + len > b.length) break; // bounds check
-          // Explicit copy into a non-shared buffer. TextDecoder rejects
-          // SharedArrayBuffer-backed views, and while .slice() should
-          // produce a non-shared copy per spec, being explicit avoids
-          // any engine-specific surprises.
-          const chunk = new Uint8Array(len);
-          chunk.set(b.subarray(ptr, ptr + len));
-          if (fd === 1 || fd === 2) {
-            const txt = new TextDecoder().decode(chunk);
-            if (fd === 1) console.log(txt); else console.error(txt);
-          } else {
-            // File fd: write to fd data at current offset (positional write).
-            // WASI fd_write is positional — it uses entry.offset and advances
-            // it by len. Simply appending would lose data if the app seeks.
-            // If the fd was opened with FDFLAGS_APPEND, all writes go to EOF.
-            const entry = self._fds.get(fd);
-            if (entry) {
-              if (!entry.data) entry.data = new Uint8Array(0);
-              const off = entry.append ? entry.data.length : (entry.offset || 0);
-              const end = off + len;
-              if (end > entry.data.length) {
-                const newData = new Uint8Array(end);
-                newData.set(entry.data);
-                entry.data = newData;
-              }
-              entry.data.set(chunk, off);
-              entry.offset = end;
-              entry.dirty = true;
-            }
-          }
-          total += len;
-        }
-        self._view().setUint32(nwritten, total, true);
-        return E.SUCCESS;
-      },
-      fd_read(fd, iovs, iovs_len, nread) {
-        const entry = self._fds.get(fd);
-        if (!entry || !entry.data) { self._view().setUint32(nread, 0, true); return E.SUCCESS; }
-        let total = 0;
-        for (let i = 0; i < iovs_len; i++) {
-          // Re-acquire views each iteration — WASM memory.grow() can resize
-          // the underlying buffer, invalidating previous TypedArray views.
-          const dv = self._view();
-          const b = self._bytes();
-          const ptr = dv.getUint32(iovs + i * 8, true);
-          const len = dv.getUint32(iovs + i * 8 + 4, true);
-          const avail = Math.min(len, entry.data.length - (entry.offset || 0));
-          if (avail <= 0) break;
-          // Bounds check: don't write beyond WASM memory
-          if (ptr + avail > b.length) break;
-          b.set(entry.data.subarray(entry.offset || 0, (entry.offset || 0) + avail), ptr);
-          entry.offset = (entry.offset || 0) + avail;
-          total += avail;
-        }
-        self._view().setUint32(nread, total, true);
-        return E.SUCCESS;
-      },
-      fd_close(fd) {
-        const entry = self._fds.get(fd);
-        // CRITICAL: flush accumulated write data before closing. Without this,
-        // rolldown-wasm's bundle.write() pipeline (which uses WASI fd_write +
-        // fd_close) would silently drop every byte of every binary file.
-        try { self._flushFile(entry); } catch {}
-        self._fds.delete(fd);
-        return E.SUCCESS;
-      },
-      fd_seek(fd, offset, whence, newoff) {
-        const entry = self._fds.get(fd);
-        const dv = self._view();
-        if (!entry) { dv.setBigUint64(newoff, BigInt(0), true); return E.BADF; }
-        const size = entry.data ? entry.data.length : 0;
-        let pos = entry.offset || 0;
-        const off = Number(offset);
-        if (whence === 0) pos = off;       // SEEK_SET
-        else if (whence === 1) pos += off;  // SEEK_CUR
-        else if (whence === 2) pos = size + off; // SEEK_END
-        entry.offset = Math.max(0, pos);
-        dv.setBigUint64(newoff, BigInt(entry.offset), true);
-        return E.SUCCESS;
-      },
-      fd_tell(fd, off) {
-        const dv = self._view();
-        const entry = self._fds.get(fd);
-        dv.setBigUint64(off, BigInt(entry ? (entry.offset || 0) : 0), true);
-        return E.SUCCESS;
-      },
-      fd_sync(fd) { try { self._flushFile(self._fds.get(fd)); } catch {} return E.SUCCESS; },
-      fd_datasync(fd) { try { self._flushFile(self._fds.get(fd)); } catch {} return E.SUCCESS; },
-      fd_advise() { return E.SUCCESS; },
-      fd_allocate() { return E.SUCCESS; },
-      fd_filestat_get(fd, buf) {
-        const dv = self._view();
-        const entry = self._fds.get(fd);
-        const now = BigInt(Date.now()) * BigInt(1000000);
-        for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
-        if (entry && entry.data) {
-          dv.setUint8(buf + 16, 4); // FILETYPE_REGULAR_FILE
-          dv.setBigUint64(buf + 32, BigInt(entry.data.length), true); // size
-        } else if (entry && entry.kind === 'dir') {
-          dv.setUint8(buf + 16, 3); // FILETYPE_DIRECTORY
-        } else {
-          dv.setUint8(buf + 16, fd <= 2 ? 2 : 4);
-        }
-        dv.setBigUint64(buf + 48, now, true);
-        dv.setBigUint64(buf + 56, now, true);
-        return E.SUCCESS;
-      },
-      fd_filestat_set_size(fd, size) {
-        const entry = self._fds.get(fd);
-        if (!entry || entry.kind !== 'file') return E.BADF;
-        const newLen = Number(size);
-        const cur = entry.data || new Uint8Array(0);
-        if (newLen === cur.length) return E.SUCCESS;
-        const newData = new Uint8Array(newLen);
-        newData.set(cur.subarray(0, Math.min(cur.length, newLen)));
-        entry.data = newData;
-        entry.dirty = true;
-        if ((entry.offset || 0) > newLen) entry.offset = newLen;
-        return E.SUCCESS;
-      },
-      fd_filestat_set_times() { return E.SUCCESS; },
-      fd_pread(fd, iovs, iovs_len, offset, nread) {
-        const entry = self._fds.get(fd);
-        if (!entry || !entry.data) { self._view().setUint32(nread, 0, true); return E.SUCCESS; }
-        let pos = Number(offset);
-        let total = 0;
-        for (let i = 0; i < iovs_len; i++) {
-          const dv = self._view();
-          const b = self._bytes();
-          const ptr = dv.getUint32(iovs + i * 8, true);
-          const len = dv.getUint32(iovs + i * 8 + 4, true);
-          const avail = Math.min(len, entry.data.length - pos);
-          if (avail <= 0) break;
-          if (ptr + avail > b.length) break;
-          b.set(entry.data.subarray(pos, pos + avail), ptr);
-          pos += avail;
-          total += avail;
-        }
-        self._view().setUint32(nread, total, true);
-        return E.SUCCESS;
-      },
-      fd_pwrite(fd, iovs, iovs_len, offset, nwritten) {
-        const entry = self._fds.get(fd);
-        if (!entry || entry.kind !== 'file') { self._view().setUint32(nwritten, 0, true); return E.BADF; }
-        if (!entry.data) entry.data = new Uint8Array(0);
-        let pos = Number(offset);
-        let total = 0;
-        for (let i = 0; i < iovs_len; i++) {
-          const dv = self._view();
-          const b = self._bytes();
-          const ptr = dv.getUint32(iovs + i * 8, true);
-          const len = dv.getUint32(iovs + i * 8 + 4, true);
-          if (ptr + len > b.length) break;
-          const end = pos + len;
-          if (end > entry.data.length) {
-            const newData = new Uint8Array(end);
-            newData.set(entry.data);
-            entry.data = newData;
-          }
-          // Copy non-shared (chunk) to avoid SAB view issues
-          const chunk = new Uint8Array(len);
-          chunk.set(b.subarray(ptr, ptr + len));
-          entry.data.set(chunk, pos);
-          pos += len;
-          total += len;
-        }
-        entry.dirty = true;
-        self._view().setUint32(nwritten, total, true);
-        return E.SUCCESS;
-      },
-      fd_readdir(fd, buf, buf_len, cookie, used) {
-        const dv = self._view(); const b = self._bytes();
-        const entry = self._fds.get(fd);
-        if (!entry || !entry.path) { dv.setUint32(used, 0, true); return E.SUCCESS; }
-        try {
-          // Ask for Dirent objects so we can populate d_type accurately.
-          // d_type values per WASI: 3=DIRECTORY, 4=REGULAR_FILE, 7=SYMBOLIC_LINK.
-          const items = __fsStub.readdirSync(entry.path, { withFileTypes: true });
-          let offset = 0;
-          const cookieNum = Number(cookie);
-          for (let i = cookieNum; i < items.length; i++) {
-            const item = items[i];
-            const itemName = (item && typeof item === 'object') ? item.name : item;
-            const isDir = item && typeof item.isDirectory === 'function' ? item.isDirectory() : false;
-            const isSym = item && typeof item.isSymbolicLink === 'function' ? item.isSymbolicLink() : false;
-            const dType = isDir ? 3 : (isSym ? 7 : 4);
-            // d_ino must be unique per (parent, name) for walkdir cycle
-            // detection to work correctly. statSync goes through MemoryVolume
-            // which assigns stable per-path inos.
-            var dino = BigInt(i + 1);
-            try {
-              var fullChild = entry.path === '/' ? '/' + itemName : entry.path + '/' + itemName;
-              var st = __fsStub.statSync(fullChild);
-              if (st && st.ino) dino = BigInt(st.ino);
-            } catch (_) {}
-            const name = enc.encode(itemName);
-            // Stop when we cant fit the next FULL entry. Caller refills with
-            // cookie = last d_next written. Don't write partial headers --
-            // Rust's ReadDir gets confused by them.
-            if (offset + 24 + name.length > buf_len) break;
-            dv.setBigUint64(buf + offset, BigInt(i + 1), true); // d_next
-            dv.setBigUint64(buf + offset + 8, dino, true); // d_ino
-            dv.setUint32(buf + offset + 16, name.length, true); // d_namlen
-            dv.setUint8(buf + offset + 20, dType); // d_type
-            b.set(name, buf + offset + 24);
-            offset += 24 + name.length;
-          }
-          dv.setUint32(used, offset, true);
-        } catch (e) { dv.setUint32(used, 0, true); }
-        return E.SUCCESS;
-      },
-      fd_renumber() { return E.NOSYS; },
-      path_create_directory(fd, path_ptr, path_len) {
-        const dirEntry = self._fds.get(fd);
-        if (!dirEntry) return E.BADF;
-        const rel = self._readStr(path_ptr, path_len);
-        const full = self._resolvePath(dirEntry.path, rel);
-        try { __fsStub.mkdirSync(full, { recursive: true }); return E.SUCCESS; } catch { return E.IO; }
-      },
-      path_filestat_get(fd, flags, path_ptr, path_len, buf) {
-        const dv = self._view();
-        const dirEntry = self._fds.get(fd);
-        if (!dirEntry) return E.BADF;
-        const rel = self._readStr(path_ptr, path_len);
-        const full = self._resolvePath(dirEntry.path, rel);
-        try {
-          const stat = __fsStub.statSync(full);
-          for (let i = 0; i < 64; i++) dv.setUint8(buf + i, 0);
-          // ino at offset 8 -- walkdir uses (dev,ino) for cycle detection
-          // when follow_links is on, so we need a unique value per path or
-          // every file looks like the same identity and gets dropped.
-          if (stat && stat.ino) dv.setBigUint64(buf + 8, BigInt(stat.ino), true);
-          dv.setUint8(buf + 16, stat.isDirectory() ? 3 : 4);
-          dv.setBigUint64(buf + 32, BigInt(stat.size || 0), true);
-          dv.setBigUint64(buf + 48, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
-          dv.setBigUint64(buf + 56, BigInt(stat.mtimeMs || Date.now()) * BigInt(1000000), true);
-          return E.SUCCESS;
-        } catch (e) {
-          return E.NOENT;
-        }
-      },
-      path_filestat_set_times() { return E.SUCCESS; },
-      path_link() { return E.NOSYS; },
-      path_open(fd, dirflags, path_ptr, path_len, oflags, fs_rights_base, fs_rights_inheriting, fdflags, fd_out) {
-        const dv = self._view();
-        const dirEntry = self._fds.get(fd);
-        if (!dirEntry) return E.BADF;
-        const rel = self._readStr(path_ptr, path_len);
-        const full = self._resolvePath(dirEntry.path, rel);
-        const wantDir = (oflags & 0x0002) !== 0;
-        const wantCreate = (oflags & 0x0001) !== 0;
-        const wantTrunc = (oflags & 0x0008) !== 0;
-        let exists;
-        try { exists = __fsStub.existsSync(full); } catch { exists = false; }
-        if (wantDir) {
-          if (!exists && !wantCreate) return E.NOENT;
-          if (!exists) try { __fsStub.mkdirSync(full, { recursive: true }); } catch {}
-          const newFd = self._nextFd++;
-          self._fds.set(newFd, { kind: 'dir', path: full });
-          dv.setUint32(fd_out, newFd, true);
-          return E.SUCCESS;
-        }
-        // Regular file
-        if (!exists && !wantCreate) return E.NOENT;
-        const wantAppend = (fdflags & 0x0001) !== 0;
-        let data;
-        let dirty = false;
-        try {
-          if (exists && !wantTrunc) {
-            const raw = __fsStub.readFileSync(full);
-            // MUST copy — raw may be a view into a SharedArrayBuffer from the fs proxy.
-            // new Uint8Array(sharedView) creates another VIEW, not a copy!
-            if (raw instanceof Uint8Array) {
-              data = new Uint8Array(raw.length);
-              data.set(raw);
-            } else if (typeof raw === 'string') {
-              data = new TextEncoder().encode(raw);
-            } else if (raw && ArrayBuffer.isView(raw)) {
-              const v = new Uint8Array(raw.buffer, raw.byteOffset || 0, raw.byteLength);
-              data = new Uint8Array(v.byteLength);
-              data.set(v);
-            } else if (raw instanceof ArrayBuffer) {
-              data = new Uint8Array(raw.slice(0));
-            } else {
-              data = new TextEncoder().encode(String(raw));
-            }
-          } else {
-            data = new Uint8Array(0);
-            if (!exists && wantCreate) {
-              try { __fsStub.writeFileSync(full, data); } catch {}
-            } else if (exists && wantTrunc) {
-              // Truncating an existing file → mark dirty so the empty content
-              // (or whatever gets written next) is flushed on fd_close, even
-              // if no fd_write calls follow.
-              dirty = true;
-            }
-          }
-        } catch { return E.NOENT; }
-        const newFd = self._nextFd++;
-        // FDFLAGS_APPEND → start at end of existing data
-        const initialOffset = wantAppend ? data.length : 0;
-        self._fds.set(newFd, {
-          kind: 'file',
-          path: full,
-          data: data,
-          offset: initialOffset,
-          dirty: dirty,
-          append: wantAppend,
-        });
-        dv.setUint32(fd_out, newFd, true);
-        return E.SUCCESS;
-      },
-      path_readlink() { return E.NOSYS; },
-      path_remove_directory(fd, path_ptr, path_len) {
-        const dirEntry = self._fds.get(fd);
-        if (!dirEntry) return E.BADF;
-        const rel = self._readStr(path_ptr, path_len);
-        const full = self._resolvePath(dirEntry.path, rel);
-        try { __fsStub.rmdirSync(full); return E.SUCCESS; } catch { return E.IO; }
-      },
-      path_rename(fd, old_ptr, old_len, new_fd, new_ptr, new_len) {
-        const dirEntry = self._fds.get(fd);
-        const newDirEntry = self._fds.get(new_fd);
-        if (!dirEntry || !newDirEntry) return E.BADF;
-        const oldRel = self._readStr(old_ptr, old_len);
-        const newRel = self._readStr(new_ptr, new_len);
-        const oldFull = self._resolvePath(dirEntry.path, oldRel);
-        const newFull = self._resolvePath(newDirEntry.path, newRel);
-        try { __fsStub.renameSync(oldFull, newFull); return E.SUCCESS; } catch { return E.IO; }
-      },
-      path_symlink() { return E.NOSYS; },
-      path_unlink_file(fd, path_ptr, path_len) {
-        const dirEntry = self._fds.get(fd);
-        if (!dirEntry) return E.BADF;
-        const rel = self._readStr(path_ptr, path_len);
-        const full = self._resolvePath(dirEntry.path, rel);
-        try { __fsStub.unlinkSync(full); return E.SUCCESS; } catch { return E.IO; }
-      },
-      poll_oneoff(in_ptr, out_ptr, nsubs, nevents_out) { const dv = self._view(); let n = 0; for (let i = 0; i < nsubs; i++) { const sp = in_ptr + i * 48; const ep = out_ptr + n * 32; const ud = dv.getBigUint64(sp, true); const ty = dv.getUint8(sp + 8); dv.setBigUint64(ep, ud, true); dv.setUint16(ep + 8, 0, true); dv.setUint8(ep + 10, ty); n++; } dv.setUint32(nevents_out, n, true); return E.SUCCESS; },
-      proc_exit(code) { throw new Error('proc_exit(' + code + ')'); },
-      proc_raise() { return E.NOSYS; },
-      sched_yield() { return E.SUCCESS; },
-      random_get(buf_ptr, buf_len) {
-        const mem = self._memory;
-        if (mem.buffer instanceof SharedArrayBuffer) {
-          const tmp = new Uint8Array(buf_len); crypto.getRandomValues(tmp);
-          new Uint8Array(mem.buffer).set(tmp, buf_ptr);
-        } else {
-          crypto.getRandomValues(new Uint8Array(mem.buffer, buf_ptr, buf_len));
-        }
-        return E.SUCCESS;
-      },
-      sock_recv() { return E.NOSYS; },
-      sock_send() { return E.NOSYS; },
-      sock_shutdown() { return E.NOSYS; },
-      sock_accept() { return E.NOSYS; },
-    };
+let __wasiStub;
+${getWasiRuntimeSource("__nodepodSharedWasi")}
+const __SharedWASI = globalThis.__nodepodSharedWasi.WASI;
+__wasiStub = { WASI: class WASI extends __SharedWASI {
+  constructor(options) {
+    const opts = options || {};
+    const inheritedEnv = typeof process !== 'undefined' && process.env ? process.env : {};
+    super({ ...opts, env: { ...inheritedEnv, ...(opts.env || {}) }, fs: __fsStub });
   }
 } };
 

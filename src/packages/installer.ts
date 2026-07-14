@@ -458,60 +458,71 @@ export class DependencyInstaller {
     const WORKER_COUNT = 6;
     onProgress?.(`Downloading ${pending.length} package(s)...`);
 
-    let nextPackage = 0;
-    const runLane = async () => {
-      while (nextPackage < pending.length) {
-        const { depName, dep, targetDir } = pending[nextPackage++];
-        onProgress?.(`  Fetching ${depName}@${dep.version}...`);
+    const byDepth = new Map<number, typeof pending>();
+    for (const item of pending) {
+      const depth = item.depName.split("/node_modules/").length - 1;
+      const group = byDepth.get(depth) ?? [];
+      group.push(item);
+      byDepth.set(depth, group);
+    }
 
-        let extracted = false;
-        for (let attempt = 0; attempt < 2 && !extracted; attempt++) {
-          if (attempt > 0) {
-            onProgress?.(`  Retrying ${depName}@${dep.version} after incomplete extraction...`);
-            if (this.vol.existsSync(targetDir)) this.vol.removeTreeSync(targetDir);
-          }
-          try {
-            await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
-              stripComponents: 1,
-              expectedShasum: dep.shasum,
-            });
-            const manifestPath = path.join(targetDir, "package.json");
-            if (!this.vol.existsSync(manifestPath)) {
-              throw new Error(`Package archive did not contain ${manifestPath}`);
+    for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
+      const group = byDepth.get(depth)!;
+      let nextPackage = 0;
+      const runLane = async () => {
+        while (nextPackage < group.length) {
+          const { depName, dep, targetDir } = group[nextPackage++];
+          onProgress?.(`  Fetching ${depName}@${dep.version}...`);
+
+          let extracted = false;
+          for (let attempt = 0; attempt < 2 && !extracted; attempt++) {
+            if (attempt > 0) {
+              onProgress?.(`  Retrying ${depName}@${dep.version} after incomplete extraction...`);
+              if (this.vol.existsSync(targetDir)) this.vol.removeTreeSync(targetDir);
             }
-            extracted = true;
-          } catch (error) {
-            if (attempt === 1) throw error;
+            try {
+              await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
+                stripComponents: 1,
+                expectedShasum: dep.shasum,
+              });
+              const manifestPath = path.join(targetDir, "package.json");
+              if (!this.vol.existsSync(manifestPath)) {
+                throw new Error(`Package archive did not contain ${manifestPath}`);
+              }
+              extracted = true;
+            } catch (error) {
+              if (attempt === 1) throw error;
+            }
           }
-        }
 
-        if (shouldTransform) {
-          try {
-            const transformed = await convertPackage(
-              this.vol,
-              targetDir,
-              onProgress,
-            );
-            if (transformed > 0) {
+          if (shouldTransform) {
+            try {
+              const transformed = await convertPackage(
+                this.vol,
+                targetDir,
+                onProgress,
+              );
+              if (transformed > 0) {
+                onProgress?.(
+                  `  Transformed ${transformed} file(s) in ${depName}`,
+                );
+              }
+            } catch (err) {
               onProgress?.(
-                `  Transformed ${transformed} file(s) in ${depName}`,
+                `  Warning: transformation failed for ${depName}: ${err}`,
               );
             }
-          } catch (err) {
-            onProgress?.(
-              `  Warning: transformation failed for ${depName}: ${err}`,
-            );
           }
+
+          this.createBinStubs(nmRoot, depName, targetDir);
+
+          additions.push(depName);
         }
-
-        this.createBinStubs(nmRoot, depName, targetDir);
-
-        additions.push(depName);
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(WORKER_COUNT, pending.length) }, () => runLane()),
-    );
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(WORKER_COUNT, group.length) }, () => runLane()),
+      );
+    }
 
     const incomplete = [...tree.keys()].filter((depName) =>
       !this.vol.existsSync(path.join(nmRoot, depName, "package.json")),

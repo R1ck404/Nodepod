@@ -35,8 +35,6 @@ import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
 import { openSnapshotCache } from "../persistence/idb-cache";
 import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
-import { handleFsProxy } from "../helpers/napi-wasm-worker";
-import { buildFileSystemBridge } from "../polyfills/fs";
 import { getEsbuild } from "../helpers/esbuild-engine";
 import { disposeEsbuild } from "../helpers/esbuild-engine";
 import { disposePool, poolStats } from "../threading/offload";
@@ -116,7 +114,6 @@ export class Nodepod {
   private _unwatchVFS: (() => void) | null = null;
   private _handler: MemoryHandler;
   private _sabEnabled: boolean;
-  private _wasiFsChannel: BroadcastChannel | null = null;
   private _sharedVFSBufferSize: number;
   private _disposed = false;
   private _unsubscribePressure: (() => void) | null = null;
@@ -268,28 +265,6 @@ export class Nodepod {
     handler.startMonitoring();
     const volume = new MemoryVolume(handler);
 
-    // fs bridge for napi-rs WASI workers (tailwind v4 oxide, rolldown, etc).
-    // they call fs from inside a Web Worker which would normally route
-    // through the spawned process, but that process is often in sync WASM
-    // and cant drain its message queue. listen on the same channel here
-    // (browser tab is idle) and service the request against MemoryVolume.
-    let wasiFsChannel: BroadcastChannel | null = null;
-    if (typeof BroadcastChannel !== "undefined") {
-      try {
-        const tabFsBridge = buildFileSystemBridge(volume, () => "/");
-        wasiFsChannel = new BroadcastChannel("nodepod-wasi-fs");
-        wasiFsChannel.onmessage = (e: MessageEvent) => {
-          const data = e.data;
-          if (!data || typeof data !== "object" || !data.__fs__) return;
-          handleFsProxy(data.__fs__, tabFsBridge);
-        };
-      } catch (err) {
-        if (typeof console !== "undefined") {
-          console.warn("[Nodepod] WASI fs broadcast bridge setup failed:", err);
-        }
-      }
-    }
-
     // Open IDB snapshot cache for faster re-boots (opt-out via enableSnapshotCache: false)
     let snapshotCache = null;
     if (opts.enableSnapshotCache !== false && opts.packageStore !== "memory") {
@@ -337,7 +312,6 @@ export class Nodepod {
       makeInstanceId(),
       performanceTracker,
     );
-    nodepod._wasiFsChannel = wasiFsChannel;
 
     if (opts.spawnSnapshot) {
       // ProcessManager double-checks SAB availability per spawn and falls
@@ -843,10 +817,6 @@ export class Nodepod {
     } catch {
       /* */
     }
-    if (this._wasiFsChannel) {
-      try { this._wasiFsChannel.close(); } catch { /* */ }
-      this._wasiFsChannel = null;
-    }
     this._processManager.teardown();
     this._vfsBridge.clearSharedVFS();
     this._sharedVFS = null;
@@ -920,7 +890,7 @@ export class Nodepod {
       heap,
       runtime: {
         processes: resources.processes,
-        workers: resources.processes + pool.total,
+        workers: resources.workers + pool.total,
         messagePorts: resources.messagePorts,
         pendingHttp: resources.pendingHttp,
         sharedFSAllocated: !!shared,

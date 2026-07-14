@@ -321,7 +321,7 @@ async function run() {
     if (e.stack) console.error(e.stack.split('\\n').slice(0, 5).join('\\n'));
   }
 }
-run();
+await run();
 </script>
 
   <script id="test-rolldown-minify" type="text/plain">
@@ -359,7 +359,7 @@ async function run() {
     if (e.stack) console.error(e.stack.split('\\n').slice(0, 5).join('\\n'));
   }
 }
-run();
+await run();
 </script>
 
   <script type="module">
@@ -383,6 +383,8 @@ run();
 
     var nodepod = await Nodepod.boot({
       workdir: '/project',
+      enableSnapshotCache: false,
+      packageStore: 'memory',
       files: {
         '/project/test-lightningcss.js': testLightningcss,
         '/project/test-nesting.js': testNesting,

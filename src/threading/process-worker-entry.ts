@@ -26,6 +26,7 @@ import type {
   MainToWorkerMessage,
   MainToWorker_Init,
   MainToWorker_Exec,
+  VFSSnapshotEntry,
   WorkerToMainMessage,
 } from "./worker-protocol";
 
@@ -318,14 +319,6 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   // if main had SAB off, neither buffer was sent
   _sabEnabled = !!msg.syncBuffer;
 
-  // fs proxy ports from the tab, hand them to napi-wasm-worker for WASI
-  // workers to grab when they spawn. chrome BC workaround (#54 follow-up)
-  if (msg.wasiFsPorts && msg.wasiFsPorts.length > 0) {
-    import("../helpers/napi-wasm-worker").then((m) => {
-      m.setWasiFsPortPool(msg.wasiFsPorts!);
-    }).catch(() => {});
-  }
-
   installSqliteHostBridge();
 
   if (msg.sqliteStartup === "bytes") {
@@ -611,33 +604,29 @@ function handleVFSSync(msg: { path: string; content: ArrayBuffer | null; isDirec
   }
 }
 
-let _vfsChunks: Array<{ data: ArrayBuffer; manifest: Array<{ path: string; offset: number; length: number; isDirectory: boolean }> } | null> = [];
+let _vfsChunks: Array<{ data: ArrayBuffer; manifest: VFSSnapshotEntry[] } | null> = [];
 
-function handleVFSChunk(msg: { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: Array<{ path: string; offset: number; length: number; isDirectory: boolean }> }): void {
+function handleVFSChunk(msg: { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }): void {
   _vfsChunks[msg.chunkIndex] = { data: msg.data, manifest: msg.manifest };
   const received = _vfsChunks.filter(Boolean).length;
   if (received === msg.totalChunks) {
-    // all chunks received, apply to volume
     _suppressVFSWatch = true;
     try {
       if (_volume) {
+        const totalBytes = _vfsChunks.reduce((sum, chunk) => sum + (chunk?.data.byteLength ?? 0), 0);
+        const combined = new ArrayBuffer(totalBytes);
+        const combinedView = new Uint8Array(combined);
+        const manifest: VFSSnapshotEntry[] = [];
+        let baseOffset = 0;
         for (const chunk of _vfsChunks) {
           if (!chunk) continue;
-          const data = new Uint8Array(chunk.data);
+          combinedView.set(new Uint8Array(chunk.data), baseOffset);
           for (const entry of chunk.manifest) {
-            if (entry.isDirectory) {
-              if (!_volume.existsSync(entry.path)) {
-                _volume.mkdirSync(entry.path, { recursive: true });
-              }
-            } else {
-              const parentDir = entry.path.substring(0, entry.path.lastIndexOf("/")) || "/";
-              if (parentDir !== "/" && !_volume.existsSync(parentDir)) {
-                _volume.mkdirSync(parentDir, { recursive: true });
-              }
-              _volume.writeFileSync(entry.path, data.slice(entry.offset, entry.offset + entry.length));
-            }
+            manifest.push({ ...entry, offset: entry.isDirectory ? 0 : entry.offset + baseOffset });
           }
+          baseOffset += chunk.data.byteLength;
         }
+        _volume.mountBinarySnapshot({ data: combined, manifest }, false);
       }
     } finally {
       _suppressVFSWatch = false;
@@ -936,11 +925,13 @@ function workerThreadFork(
     workerData: unknown;
     threadId: number;
     isEval?: boolean;
+    rawWasi?: boolean;
     cwd: string;
     env: Record<string, string>;
     onMessage: (data: unknown) => void;
     onError: (err: Error) => void;
     onExit: (code: number) => void;
+    onOnline?: () => void;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
@@ -948,6 +939,14 @@ function workerThreadFork(
   const requestId = _nextRequestId++;
 
   _ipcCallbacks.set(requestId, (data: unknown) => {
+    if (data && typeof data === "object" && "__nodepod_broker_ready__" in data) {
+      opts.onOnline?.();
+      return;
+    }
+    if (data && typeof data === "object" && "__nodepod_worker_error__" in data) {
+      opts.onError(new Error(String((data as any).__nodepod_worker_error__)));
+      return;
+    }
     opts.onMessage(data);
   });
 
@@ -972,17 +971,27 @@ function workerThreadFork(
     });
   });
 
-  post({
-    type: "workerthread-request",
-    requestId,
-    modulePath,
-    isEval: opts.isEval,
-    args: [],
-    cwd: opts.cwd,
-    env: opts.env,
-    workerData: opts.workerData,
-    threadId: opts.threadId,
-  } as any);
+  if (opts.rawWasi) {
+    post({
+      type: "wasiworker-request",
+      requestId,
+      source: modulePath,
+      name: `napi-wasi-${opts.threadId}`,
+      workerData: opts.workerData,
+    } as any);
+  } else {
+    post({
+      type: "workerthread-request",
+      requestId,
+      modulePath,
+      isEval: opts.isEval,
+      args: [],
+      cwd: opts.cwd,
+      env: opts.env,
+      workerData: opts.workerData,
+      threadId: opts.threadId,
+    } as any);
+  }
 
   return {
     requestId,
@@ -994,6 +1003,7 @@ function workerThreadFork(
       });
     },
     terminate: () => {
+      if (opts.rawWasi) post({ type: "wasiworker-terminate", requestId } as any);
       _ipcCallbacks.delete(requestId);
       _childOutputCallbacks.delete(requestId);
       _childExitCallbacks.delete(requestId);

@@ -2,6 +2,87 @@ import { describe, it, expect, vi } from "vitest";
 import { MemoryVolume } from "../memory-volume";
 
 describe("MemoryVolume", () => {
+  it("keeps hard links attached to one inode across writes and truncation", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/original", "one");
+    volume.linkSync("/original", "/linked");
+    expect(volume.statSync("/original").nlink).toBe(2);
+    expect(volume.statSync("/linked").ino).toBe(volume.statSync("/original").ino);
+
+    volume.writeFileSync("/linked", "shared");
+    expect(volume.readFileSync("/original", "utf8")).toBe("shared");
+    volume.truncateSync("/original", 3);
+    expect(volume.readFileSync("/linked", "utf8")).toBe("sha");
+
+    volume.unlinkSync("/original");
+    expect(volume.statSync("/linked").nlink).toBe(1);
+    expect(volume.readFileSync("/linked", "utf8")).toBe("sha");
+  });
+
+  it("updates link counts when rename replaces files or trees", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/source", "source");
+    volume.writeFileSync("/target", "target");
+    volume.linkSync("/target", "/target-link");
+    volume.renameSync("/source", "/target");
+    expect(volume.statSync("/target-link").nlink).toBe(1);
+    expect(volume.readFileSync("/target", "utf8")).toBe("source");
+
+    volume.linkSync("/target", "/same-inode");
+    volume.renameSync("/target", "/same-inode");
+    expect(volume.statSync("/target").nlink).toBe(2);
+    expect(volume.statSync("/same-inode").nlink).toBe(2);
+
+    volume.mkdirSync("/tree", { recursive: true });
+    volume.linkSync("/target-link", "/tree/nested-link");
+    volume.removeTreeSync("/tree");
+    expect(volume.statSync("/target-link").nlink).toBe(1);
+  });
+
+  it("resolves relative symlinks and reports symlink loops", () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/root/dir", { recursive: true });
+    volume.writeFileSync("/root/target.txt", "target");
+    volume.symlinkSync("../target.txt", "/root/dir/link.txt");
+    expect(volume.readlinkSync("/root/dir/link.txt")).toBe("../target.txt");
+    expect(volume.readFileSync("/root/dir/link.txt", "utf8")).toBe("target");
+    expect(volume.realpathSync("/root/dir/link.txt")).toBe("/root/target.txt");
+    volume.writeFileSync("/root/dir/link.txt", "updated");
+    expect(volume.readFileSync("/root/target.txt", "utf8")).toBe("updated");
+
+    volume.symlinkSync("loop-b", "/root/loop-a");
+    volume.symlinkSync("loop-a", "/root/loop-b");
+    expect(() => volume.statSync("/root/loop-a")).toThrow(/ELOOP/);
+  });
+
+  it("preserves hard links, symlinks, modes, and timestamps in snapshots", () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/root", { recursive: true });
+    volume.writeFileSync("/root/original", "content");
+    volume.linkSync("/root/original", "/root/linked");
+    volume.symlinkSync("original", "/root/symlink");
+    volume.chmodSync("/root/original", 0o750);
+    volume.utimesSync("/root/original", 10, 20);
+
+    const restored = MemoryVolume.fromSnapshot(volume.toSnapshot());
+    expect(restored.statSync("/root/original").ino).toBe(restored.statSync("/root/linked").ino);
+    expect(restored.statSync("/root/original").mode).toBe(0o750);
+    expect(restored.statSync("/root/original").mtimeMs).toBe(20_000);
+    expect(restored.readlinkSync("/root/symlink")).toBe("original");
+    restored.writeFileSync("/root/linked", "changed");
+    expect(restored.readFileSync("/root/original", "utf8")).toBe("changed");
+  });
+
+  it("stores file modes and explicit timestamps", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/metadata", "data");
+    volume.chmodSync("/metadata", 0o750);
+    volume.utimesSync("/metadata", 10, 20);
+    const stat = volume.statSync("/metadata");
+    expect(stat.mode).toBe(0o750);
+    expect(stat.atimeMs).toBe(10_000);
+    expect(stat.mtimeMs).toBe(20_000);
+  });
   describe("writeFileSync / readFileSync", () => {
     it("writes and reads a string file", () => {
       const vol = new MemoryVolume();

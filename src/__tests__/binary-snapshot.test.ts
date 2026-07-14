@@ -100,6 +100,50 @@ describe("createFilteredBinarySnapshot / restoreBinarySnapshot", () => {
     expect(target.readFileSync("/node_modules/pkg/index.js", "utf8")).toBe("changed");
     watcher.close();
   });
+
+  it("preserves links, modes, and timestamps", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/node_modules/pkg", { recursive: true });
+    source.writeFileSync("/node_modules/pkg/data", "original");
+    source.linkSync("/node_modules/pkg/data", "/node_modules/pkg/hardlink");
+    source.symlinkSync("data", "/node_modules/pkg/symlink");
+    source.chmodSync("/node_modules/pkg/data", 0o640);
+    source.utimesSync("/node_modules/pkg/data", new Date(123_000), new Date(456_000));
+
+    const target = new MemoryVolume();
+    restoreBinarySnapshot(target, createFilteredBinarySnapshot(source, () => true));
+
+    expect(target.readlinkSync("/node_modules/pkg/symlink")).toBe("data");
+    expect(target.readFileSync("/node_modules/pkg/symlink", "utf8")).toBe("original");
+    expect(target.statSync("/node_modules/pkg/data").mode & 0o777).toBe(0o640);
+    expect(target.statSync("/node_modules/pkg/data").mtimeMs).toBe(456_000);
+    expect(target.statSync("/node_modules/pkg/data").ino).toBe(
+      target.statSync("/node_modules/pkg/hardlink").ino,
+    );
+    target.writeFileSync("/node_modules/pkg/hardlink", "changed");
+    expect(target.readFileSync("/node_modules/pkg/data", "utf8")).toBe("changed");
+  });
+
+  it("replaces incompatible node kinds while merging the overlay", () => {
+    const source = new MemoryVolume();
+    source.mkdirSync("/node_modules/pkg/dir", { recursive: true });
+    source.writeFileSync("/node_modules/pkg/file", "file");
+    source.symlinkSync("file", "/node_modules/pkg/link");
+    const snapshot = createFilteredBinarySnapshot(source, () => true);
+
+    const target = new MemoryVolume();
+    target.mkdirSync("/node_modules/pkg/file/old", { recursive: true });
+    target.writeFileSync("/node_modules/pkg/dir", "wrong kind");
+    target.writeFileSync("/node_modules/pkg/other", "keep");
+    target.writeFileSync("/elsewhere", "elsewhere");
+    target.symlinkSync("/elsewhere", "/node_modules/pkg/link");
+    restoreBinarySnapshot(target, snapshot);
+
+    expect(target.statSync("/node_modules/pkg/dir").isDirectory()).toBe(true);
+    expect(target.readFileSync("/node_modules/pkg/file", "utf8")).toBe("file");
+    expect(target.readlinkSync("/node_modules/pkg/link")).toBe("file");
+    expect(target.readFileSync("/node_modules/pkg/other", "utf8")).toBe("keep");
+  });
 });
 
 describe("installer snapshot cache (binary format)", () => {

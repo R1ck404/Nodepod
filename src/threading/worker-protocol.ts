@@ -16,6 +16,13 @@ export interface VFSSnapshotEntry {
   offset: number;
   length: number;
   isDirectory: boolean;
+  symlinkTarget?: string;
+  inode?: number;
+  mode?: number;
+  atimeMs?: number;
+  mtimeMs?: number;
+  ctimeMs?: number;
+  nlink?: number;
 }
 
 // --- Main -> Worker messages ---
@@ -273,6 +280,19 @@ export interface WorkerToMain_WorkerThreadRequest {
   threadId: number;
 }
 
+export interface WorkerToMain_WasiWorkerRequest {
+  type: "wasiworker-request";
+  requestId: number;
+  source: string;
+  name: string;
+  workerData: unknown;
+}
+
+export interface WorkerToMain_WasiWorkerTerminate {
+  type: "wasiworker-terminate";
+  requestId: number;
+}
+
 export interface WorkerToMain_SpawnSync {
   type: "spawn-sync";
   requestId: number;
@@ -389,6 +409,8 @@ export type WorkerToMainMessage =
   | WorkerToMain_SpawnRequest
   | WorkerToMain_ForkRequest
   | WorkerToMain_WorkerThreadRequest
+  | WorkerToMain_WasiWorkerRequest
+  | WorkerToMain_WasiWorkerTerminate
   | WorkerToMain_SpawnSync
   | WorkerToMain_ServerListen
   | WorkerToMain_ServerClose

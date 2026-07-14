@@ -26,17 +26,38 @@ export function createFilteredBinarySnapshot(
     }
     for (const name of entries) {
       const fullPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
-      let isDir = false;
+      let stat;
       try {
-        isDir = vol.statSync(fullPath).isDirectory();
+        stat = vol.lstatSync(fullPath);
       } catch {
         continue;
       }
-      if (isDir) {
+      if (stat.isDirectory()) {
         if (filter(fullPath)) {
-          manifest.push({ path: fullPath, offset: 0, length: 0, isDirectory: true });
+          manifest.push({
+            path: fullPath,
+            offset: 0,
+            length: 0,
+            isDirectory: true,
+            inode: stat.ino,
+            mode: stat.mode,
+            atimeMs: stat.atimeMs,
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+            nlink: stat.nlink,
+          });
         }
         walk(fullPath);
+      } else if (stat.isSymbolicLink()) {
+        if (filter(fullPath)) {
+          manifest.push({
+            path: fullPath,
+            offset: totalSize,
+            length: 0,
+            isDirectory: false,
+            symlinkTarget: vol.readlinkSync(fullPath),
+          });
+        }
       } else if (filter(fullPath)) {
         let content: Uint8Array;
         try {
@@ -49,6 +70,12 @@ export function createFilteredBinarySnapshot(
           offset: totalSize,
           length: content.byteLength,
           isDirectory: false,
+          inode: stat.ino,
+          mode: stat.mode,
+          atimeMs: stat.atimeMs,
+          mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+          nlink: stat.nlink,
         });
         chunks.push(content);
         totalSize += content.byteLength;

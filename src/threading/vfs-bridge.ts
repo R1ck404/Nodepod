@@ -53,23 +53,27 @@ export class VFSBridge {
         ? new Set(opts.excludeDirNames)
         : null;
 
-    this._walkVolume("/", (path, isDirectory, content) => {
+    this._walkVolume("/", (path, isDirectory, content, metadata) => {
       if (isDirectory) {
         manifest.push({
           path,
           offset: 0,
           length: 0,
           isDirectory: true,
+          ...metadata,
         });
-      } else if (content) {
+      } else if (content || metadata?.symlinkTarget !== undefined) {
         manifest.push({
           path,
           offset: totalSize,
-          length: content.byteLength,
+          length: content?.byteLength ?? 0,
           isDirectory: false,
+          ...metadata,
         });
-        chunks.push(content);
-        totalSize += content.byteLength;
+        if (content) {
+          chunks.push(content);
+          totalSize += content.byteLength;
+        }
       }
     }, exclude);
 
@@ -100,38 +104,45 @@ export class VFSBridge {
       }];
     }
 
-    const chunks: { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] = [];
+    const pending: Array<{ data: ArrayBuffer; manifest: VFSSnapshotEntry[] }> = [];
     const fullData = new Uint8Array(fullSnapshot.data);
-    const totalChunks = Math.ceil(totalSize / VFS_CHUNK_SIZE);
 
-    let currentOffset = 0;
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkEnd = Math.min(currentOffset + VFS_CHUNK_SIZE, totalSize);
-      const chunkData = fullData.slice(currentOffset, chunkEnd);
+    const metadata = fullSnapshot.manifest.filter(entry => entry.isDirectory || entry.symlinkTarget !== undefined);
+    let entries: VFSSnapshotEntry[] = [...metadata];
+    let dataParts: Uint8Array[] = [];
+    let chunkBytes = 0;
 
-      const chunkManifest = fullSnapshot.manifest.filter(entry => {
-        if (entry.isDirectory) return i === 0;
-        return entry.offset >= currentOffset && entry.offset < chunkEnd;
-      }).map(entry => ({
-        ...entry,
-        offset: entry.isDirectory ? 0 : entry.offset - currentOffset,
-      }));
+    const flush = (): void => {
+      if (entries.length === 0) return;
+      const data = new ArrayBuffer(chunkBytes);
+      const view = new Uint8Array(data);
+      let offset = 0;
+      for (const part of dataParts) {
+        view.set(part, offset);
+        offset += part.byteLength;
+      }
+      pending.push({ data, manifest: entries });
+      entries = [];
+      dataParts = [];
+      chunkBytes = 0;
+    };
 
-      // defensive copy — fullSnapshot.data is a plain ArrayBuffer today, but this keeps chunks transferable if the source ever becomes SAB-backed
-      const chunkBuffer = new ArrayBuffer(chunkData.byteLength);
-      new Uint8Array(chunkBuffer).set(chunkData);
+    for (const entry of fullSnapshot.manifest) {
+      if (entry.isDirectory || entry.symlinkTarget !== undefined) continue;
+      if (chunkBytes > 0 && chunkBytes + entry.length > VFS_CHUNK_SIZE) flush();
+      const content = fullData.subarray(entry.offset, entry.offset + entry.length);
+      entries.push({ ...entry, offset: chunkBytes });
+      dataParts.push(content);
+      chunkBytes += content.byteLength;
 
-      chunks.push({
-        chunkIndex: i,
-        totalChunks,
-        data: chunkBuffer,
-        manifest: chunkManifest,
-      });
-
-      currentOffset = chunkEnd;
     }
 
-    return chunks;
+    flush();
+    return pending.map((chunk, chunkIndex) => ({
+      ...chunk,
+      chunkIndex,
+      totalChunks: pending.length,
+    }));
   }
 
   handleWorkerWrite(path: string, content: Uint8Array): void {
@@ -303,7 +314,7 @@ export class VFSBridge {
 
   private _walkVolume(
     dir: string,
-    visitor: (path: string, isDirectory: boolean, content: Uint8Array | null) => void,
+    visitor: (path: string, isDirectory: boolean, content: Uint8Array | null, metadata?: Partial<VFSSnapshotEntry>) => void,
     excludeDirNames?: Set<string> | null,
   ): void {
     try {
@@ -312,15 +323,28 @@ export class VFSBridge {
         const fullPath = dir === "/" ? `/${name}` : `${dir}/${name}`;
         if (isInternalVfsPath(fullPath)) continue;
         try {
+          const lstat = this._volume.lstatSync(fullPath);
+          if (lstat.isSymbolicLink()) {
+            visitor(fullPath, false, null, { symlinkTarget: this._volume.readlinkSync(fullPath) });
+            continue;
+          }
           const stat = this._volume.statSync(fullPath);
+          const metadata = {
+            inode: stat.ino,
+            mode: stat.mode,
+            atimeMs: stat.atimeMs,
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+            nlink: stat.nlink,
+          };
           if (stat.isDirectory()) {
-            visitor(fullPath, true, null);
+            visitor(fullPath, true, null, metadata);
             // record the dir itself but don't descend — worker fetches lazily
             if (excludeDirNames?.has(name)) continue;
             this._walkVolume(fullPath, visitor, excludeDirNames);
           } else {
             const content = this._volume.readFileSync(fullPath);
-            visitor(fullPath, false, content);
+            visitor(fullPath, false, content, metadata);
           }
         } catch (e) {
           console.warn(`[VFSBridge] Failed to stat/read "${fullPath}":`, e);

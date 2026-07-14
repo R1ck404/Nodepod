@@ -6,6 +6,7 @@ import type {
   FileWatchHandle,
   WatchCallback,
   WatchEventKind,
+  VolumeFileHandle,
 } from "../memory-volume";
 import { makeSystemError } from "../memory-volume";
 import { bytesToBase64, bytesToHex } from "../helpers/byte-encoding";
@@ -312,6 +313,7 @@ interface FsPromisesShape {
 
 
 export interface FsBridge {
+  __openFileHandleSync(target: PathArg): VolumeFileHandle;
   readFileSync(target: PathArg): Buffer;
   readFileSync(target: PathArg, enc: "utf8" | "utf-8"): string;
   readFileSync(target: PathArg, opts: { encoding: "utf8" | "utf-8" }): string;
@@ -819,8 +821,15 @@ export function buildFileSystemBridge(
       return Promise.resolve();
     }
 
-    utimes(_atime: unknown, _mtime: unknown): Promise<void> {
-      return Promise.resolve();
+    utimes(atime: unknown, mtime: unknown): Promise<void> {
+      const entry = openFiles.get(this.fd);
+      if (!entry) return Promise.reject(makeBadfError("futimes"));
+      try {
+        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error);
+      }
     }
 
     write(
@@ -1109,9 +1118,13 @@ export function buildFileSystemBridge(
         }
       });
     },
-    utimes(_target: unknown, _atime: unknown, _mtime: unknown): Promise<void> {
-      // VFS doesn't track timestamps
-      return Promise.resolve();
+    utimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
+      try {
+        volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error);
+      }
     },
     lchown(_target: unknown, _uid: number, _gid: number): Promise<void> {
       // VFS doesn't track symlink ownership
@@ -1360,6 +1373,9 @@ export function buildFileSystemBridge(
   };
 
   const bridge: FsBridge = {
+    __openFileHandleSync(target: PathArg): VolumeFileHandle {
+      return volume.openFileHandleSync(abs(target));
+    },
     readFileSync(
       target: unknown,
       encOrOpts?: string | { encoding?: string | null },
@@ -1525,16 +1541,18 @@ export function buildFileSystemBridge(
       // VFS doesn't track symlink ownership — no-op
     },
 
-    utimesSync(_target: unknown, _atime: unknown, _mtime: unknown): void {
-      // VFS doesn't track timestamps — no-op
+    utimesSync(target: unknown, atime: unknown, mtime: unknown): void {
+      volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
     },
 
     lutimesSync(_target: unknown, _atime: unknown, _mtime: unknown): void {
       // VFS doesn't track timestamps — no-op
     },
 
-    futimesSync(_fd: number, _atime: unknown, _mtime: unknown): void {
-      // VFS doesn't track timestamps — no-op
+    futimesSync(fd: number, atime: unknown, mtime: unknown): void {
+      const entry = openFiles.get(fd);
+      if (!entry) throw makeBadfError("futimes");
+      volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
     },
 
     fchownSync(_fd: number, _uid: number, _gid: number): void {
@@ -2054,21 +2072,24 @@ export function buildFileSystemBridge(
 
     utimes(
       target: unknown,
-      _atime: number | string | Date,
-      _mtime: number | string | Date,
+      atime: number | string | Date,
+      mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track timestamps — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      try {
+        volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (error) {
+        if (cb) setTimeout(() => cb(error as Error), 0);
+      }
     },
 
     lutimes(
-      target: unknown,
+      _target: unknown,
       _atime: number | string | Date,
       _mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track timestamps — succeed silently
       if (cb) setTimeout(() => cb(null), 0);
     },
     open(
@@ -2271,12 +2292,21 @@ export function buildFileSystemBridge(
 
     futimes(
       fd: number,
-      _atime: number | string | Date,
-      _mtime: number | string | Date,
+      atime: number | string | Date,
+      mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      // VFS doesn't track timestamps — succeed silently
-      if (cb) setTimeout(() => cb(null), 0);
+      const entry = openFiles.get(fd);
+      if (!entry) {
+        if (cb) setTimeout(() => cb(makeBadfError("futimes")), 0);
+        return;
+      }
+      try {
+        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+        if (cb) setTimeout(() => cb(null), 0);
+      } catch (error) {
+        if (cb) setTimeout(() => cb(error as Error), 0);
+      }
     },
 
     fchown(

@@ -45,6 +45,12 @@ export function buildCdnWasmUrl(volume: MemoryVolume, vfsPath: string): string |
 
 const _inflight = new Map<string, Promise<boolean>>();
 
+export function isRecoverableWasmPath(vfsPath: unknown): vfsPath is string {
+  return typeof vfsPath === "string"
+    && vfsPath.endsWith(".wasm")
+    && vfsPath.includes("/node_modules/");
+}
+
 /**
  * Fetch a missing node_modules .wasm from the CDN, write it to the VFS, and
  * warm the compile caches. Deduplicated per path; never throws.

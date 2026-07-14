@@ -14,6 +14,7 @@ const HEADER_BYTES = 16;
 const DEFAULT_PAYLOAD = 256 * 1024;
 const MAX_RETAINED_PAYLOAD = 4 * 1024 * 1024;
 const CALL_TIMEOUT_MS = 5000;
+const WASM_RECOVERY_TIMEOUT_MS = 120000;
 
 interface ProxyResult {
   ok: boolean;
@@ -66,7 +67,13 @@ function call(
     return null;
   }
 
-  const waited = Atomics.wait(ctrl, 0, -1, CALL_TIMEOUT_MS);
+  const target = payload[0];
+  const timeout = typeof target === "string"
+    && target.endsWith(".wasm")
+    && target.includes("/node_modules/")
+    ? WASM_RECOVERY_TIMEOUT_MS
+    : CALL_TIMEOUT_MS;
+  const waited = Atomics.wait(ctrl, 0, -1, timeout);
   if (waited === "timed-out") {
     if (retained && state.sab === sab) {
       state.sab = null;

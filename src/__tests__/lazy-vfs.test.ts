@@ -88,6 +88,25 @@ describe("VFSBridge.createSnapshot lean mode", () => {
     expect(worker.existsSync("/project/node_modules")).toBe(true);
     expect(worker.readdirSync("/project/node_modules")).toEqual([]);
   });
+
+  it("keeps files intact across chunk boundaries", () => {
+    const main = new MemoryVolume();
+    main.writeFileSync("/large.bin", new Uint8Array(5 * 1024 * 1024).fill(7));
+    main.writeFileSync("/small.bin", new Uint8Array(1024).fill(9));
+    const chunks = new VFSBridge(main).createChunkedSnapshots();
+
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      for (const entry of chunk.manifest) {
+        expect(entry.offset + entry.length).toBeLessThanOrEqual(chunk.data.byteLength);
+      }
+    }
+    const large = chunks.flatMap(chunk =>
+      chunk.manifest.map(entry => ({ chunk, entry })),
+    ).find(({ entry }) => entry.path === "/large.bin")!;
+    expect(large.entry.length).toBe(5 * 1024 * 1024);
+    expect(new Uint8Array(large.chunk.data)[large.entry.offset]).toBe(7);
+  });
 });
 
 describe("MemoryVolume lazy hydration", () => {

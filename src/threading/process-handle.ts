@@ -245,6 +245,14 @@ export class ProcessHandle extends EventEmitter {
           this.emit("workerthread-request", msg);
           break;
 
+        case "wasiworker-request":
+          this.emit("wasiworker-request", msg);
+          break;
+
+        case "wasiworker-terminate":
+          this.emit("wasiworker-terminate", msg);
+          break;
+
         case "ipc-message":
           this.emit("ipc-message", msg);
           break;
