@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nodepod preview inspector</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #10151f; color: #e7edf8; }
+    body { margin: 0; min-height: 100vh; display: grid; grid-template-columns: minmax(360px, 1fr) minmax(320px, .8fr); }
+    main, aside { min-width: 0; padding: 18px; }
+    aside { border-left: 1px solid #283345; background: #141b27; display: flex; flex-direction: column; gap: 12px; }
+    h1 { margin: 0 0 8px; font-size: 20px; } p { color: #aebcd0; line-height: 1.45; }
+    iframe { display: block; width: 100%; height: min(62vh, 620px); border: 1px solid #3b4b65; border-radius: 10px; background: white; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+    button { cursor: pointer; color: #eff6ff; background: #2563eb; border: 0; border-radius: 7px; padding: 8px 11px; font: inherit; }
+    button:hover { background: #3b82f6; } button:disabled { opacity: .55; cursor: wait; }
+    pre { margin: 0; flex: 1; min-height: 0; overflow: auto; border: 1px solid #283345; border-radius: 8px; background: #0c111a; padding: 12px; color: #c6d6ee; font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+    #screenshot-preview { display: none; width: 100%; max-height: 42vh; object-fit: contain; border: 1px solid #283345; border-radius: 8px; background: white; }
+    #status { font: 13px ui-monospace, monospace; color: #93c5fd; }
+    @media (max-width: 780px) { body { display: block; } aside { border: 0; border-top: 1px solid #283345; min-height: 42vh; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Preview Inspector</h1>
+    <p>This example attaches Nodepod’s inspector before it loads the preview iframe. Use the buttons to query the live DOM, buffered browser diagnostics, accessibility rules, and a best-effort screenshot.</p>
+    <div class="toolbar">
+      <button id="snapshot" disabled>Snapshot</button>
+      <button id="a11y" disabled>Accessibility rules</button>
+      <button id="screenshot" disabled>Capture screenshot</button>
+    </div>
+    <div id="status">Booting Nodepod…</div>
+    <iframe id="preview" title="Nodepod preview" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+  </main>
+  <aside>
+    <strong>Inspector output</strong>
+    <pre id="output">Waiting for preview agent…</pre>
+    <img id="screenshot-preview" alt="Captured preview screenshot">
+  </aside>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const port = 3000;
+    const frame = document.querySelector("#preview");
+    const output = document.querySelector("#output");
+    const screenshotPreview = document.querySelector("#screenshot-preview");
+    const status = document.querySelector("#status");
+    const buttons = [...document.querySelectorAll("button")];
+    const show = (label, value) => output.textContent = `${label}\n\n${JSON.stringify(value, null, 2)}`;
+    const setReady = () => buttons.forEach((button) => button.disabled = false);
+    let screenshotUrl = null;
+    function showScreenshot(result) {
+      if (screenshotUrl) URL.revokeObjectURL(screenshotUrl);
+      screenshotUrl = URL.createObjectURL(result.data.blob);
+      screenshotPreview.src = screenshotUrl;
+      screenshotPreview.style.display = "block";
+      show("Screenshot captured", { width: result.data.width, height: result.data.height, mimeType: result.data.mimeType, bytes: result.data.blob.size });
+    }
+
+    const appHtml = `<!doctype html>
+      <html lang="en"><head><meta charset="utf-8"><title>Inspectable app</title>
+      <style>body{font-family:system-ui;max-width:720px;margin:48px auto;padding:0 20px} .wide{width:calc(100vw + 80px);height:10px;background:#f97316} button{padding:8px 12px}</style>
+      </head><body><main><h1>Live preview</h1><p>This text, the overflowing bar, console warning, and unlabeled input are deliberate inspector targets.</p><div class="wide"></div><p><input placeholder="No label"><img src="/missing-image.png"><button id="throw">Throw an error</button></p></main>
+      <script>console.warn("Preview warning captured by nodepod.inspect");document.querySelector("#throw").onclick=()=>{throw Error("Preview button error")};<\/script>
+      </body></html>`;
+
+    const nodepod = await Nodepod.boot({
+      swUrl: "/__sw__.js",
+      workdir: "/app",
+      files: {
+        "/app/server.js": [
+          'const http = require("http");',
+          'const html = ' + JSON.stringify(appHtml) + ';',
+          'http.createServer((req, res) => {',
+          '  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });',
+          '  res.end(html);',
+          '}).listen(3000);',
+        ].join("\n"),
+      },
+      onServerReady(readyPort, url) {
+        if (readyPort !== port) return;
+        status.textContent = `Preview running at ${url}`;
+        frame.src = url;
+      },
+    });
+
+    // The order matters: enable and attach before frame.src is assigned.
+    await nodepod.inspect.enable();
+    nodepod.inspect.attach({ port, iframe: frame });
+    nodepod.inspect.on("console", { port }, (entry) => show("Console event", entry));
+    nodepod.inspect.on("error", { port }, (entry) => show("Preview error event", entry));
+
+    frame.addEventListener("load", () => {
+      setReady();
+      nodepod.inspect.snapshot({ port, include: ["viewport", "documentSize", "overflow", "errors"] })
+        .then((result) => show("Initial snapshot", result));
+    }, { once: true });
+    await nodepod.spawn("node", ["server.js"]);
+
+    document.querySelector("#snapshot").onclick = async () => {
+      const result = await nodepod.inspect.snapshot({
+        port,
+        include: ["viewport", "documentSize", "text", "overflow", "console", "errors", "navigation"],
+      });
+      show("Snapshot", result);
+    };
+    document.querySelector("#a11y").onclick = async () => show("Accessibility rule violations", await nodepod.inspect.a11y({ port, mode: "violations" }));
+    document.querySelector("#screenshot").onclick = async () => {
+      try {
+        const result = await nodepod.inspect.screenshot({ port, fullPage: true });
+        showScreenshot(result);
+      } catch (error) {
+        show("Screenshot unavailable", { message: error.message });
+      }
+    };
+  </script>
+</body>
+</html>

@@ -66,4 +66,5 @@ createServer((req, res) => {
   console.log(`  Scelar auth template: http://localhost:${port}/examples/scelar-auth-template/`);
   console.log(`  Scelar Vite repro:    http://localhost:${port}/examples/scelar-vite-config-repro/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
+  console.log(`  Preview inspector:     http://localhost:${port}/examples/preview-inspector/`);
 });

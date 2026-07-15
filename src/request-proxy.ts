@@ -81,6 +81,8 @@ export interface ServiceWorkerConfig {
 interface InstanceState {
   processManager: any | null;
   previewScript: string | null;
+  /** Internal SDK script injected independently from user preview scripts. */
+  previewInspectorScript: string | null;
   wsBridgeToken: string | null;
   registry: Map<number, RegisteredServer>;
   workerWsConns: Map<string, { pid: number }>;
@@ -150,6 +152,7 @@ export class RequestProxy extends EventEmitter {
       inst = {
         processManager: null,
         previewScript: null,
+        previewInspectorScript: null,
         wsBridgeToken: null,
         registry: new Map(),
         workerWsConns: new Map(),
@@ -354,6 +357,20 @@ export class RequestProxy extends EventEmitter {
     this._sendPreviewScriptToSW(instanceId);
   }
 
+  // Reserved for SDK instrumentation. This deliberately does not share the
+  // user-facing previewScript slot, so setPreviewScript() remains composable.
+  setPreviewInspectorScript(instanceId: string, script: string | null): void {
+    const inst = this._getOrCreateInstance(instanceId);
+    inst.previewInspectorScript = script;
+    if (typeof navigator === "undefined" || !navigator.serviceWorker?.controller) return;
+    navigator.serviceWorker.controller.postMessage({
+      type: "set-preview-inspector-script",
+      instanceId,
+      script,
+      token: this._swAuthToken,
+    });
+  }
+
   setWatermark(enabled: boolean): void {
     this._watermarkEnabled = enabled;
     if (
@@ -381,6 +398,18 @@ export class RequestProxy extends EventEmitter {
       type: "set-preview-script",
       instanceId,
       script: inst.previewScript,
+      token: this._swAuthToken,
+    });
+  }
+
+  private _sendPreviewInspectorScriptToSW(instanceId: string): void {
+    if (typeof navigator === "undefined" || !navigator.serviceWorker?.controller) return;
+    const inst = this._instances.get(instanceId);
+    if (!inst) return;
+    navigator.serviceWorker.controller.postMessage({
+      type: "set-preview-inspector-script",
+      instanceId,
+      script: inst.previewInspectorScript,
       token: this._swAuthToken,
     });
   }
@@ -634,6 +663,7 @@ export class RequestProxy extends EventEmitter {
       for (const id of this._instances.keys()) {
         const inst = this._instances.get(id)!;
         if (inst.previewScript !== null) this._sendPreviewScriptToSW(id);
+        if (inst.previewInspectorScript !== null) this._sendPreviewInspectorScriptToSW(id);
         if (inst.wsBridgeToken) this._sendWsTokenToSW(id);
       }
       navigator.serviceWorker.controller.postMessage({

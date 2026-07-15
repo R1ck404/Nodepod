@@ -184,6 +184,7 @@ await nodepod.restore(snapshot);
 | `port(num)` | Get preview URL for a port |
 | `setPreviewScript(js)` | Inject JS into preview iframes |
 | `clearPreviewScript()` | Remove injected script |
+| `inspect` | Opt-in live-DOM, layout, console, error, a11y, and best-effort screenshot inspection for an attached preview iframe |
 | `memoryStats()` | Current VFS, process, worker, port, cache, SharedFS, and heap counters |
 | `teardown()` | Terminal, idempotent cleanup of the pod and all owned resources |
 
@@ -191,6 +192,33 @@ Keep one pod for each genuinely active preview and reuse it when project files
 change. Call `teardown()` when a preview is discarded; operational calls after
 teardown throw. Nodepod performs SQLite, esbuild, package extraction, and lazy
 filesystem preparation automatically, so application code needs no warm-up API.
+
+### Preview inspection
+
+Enable and attach before navigating a host-owned iframe. The inspector observes
+the rendered document after JavaScript executes and does not replace a script
+installed through `setPreviewScript()`.
+
+```ts
+await nodepod.inspect.enable();
+nodepod.inspect.attach({ port: 3000, iframe: previewIframe });
+previewIframe.src = nodepod.port(3000)!;
+
+const page = await nodepod.inspect.snapshot({
+  port: 3000,
+  include: ["viewport", "errors", "console", "overflow", "a11y"],
+});
+const stop = nodepod.inspect.on("error", { port: 3000 }, console.error);
+```
+
+Available one-shot methods are `viewport`, `documentSize`, `overflow`, `text`,
+`dom`, `query`, `console`, `errors`, `navigation`, `a11y`, `screenshot`, and
+`snapshot`. `waitUntil: "networkidle"` means no instrumented `fetch` or XHR
+requests for 500ms; it is not a browser DevTools network-idle signal. Screenshot
+returns an `InspectResult` whose `data.blob` is a PNG `Blob`, ready for
+`URL.createObjectURL(result.data.blob)`. It uses DOM-to-SVG/canvas serialization
+and is best-effort: unsupported CSS, canvas, or cross-origin assets can produce
+`PreviewScreenshotUnavailableError`.
 
 ### Process events
 

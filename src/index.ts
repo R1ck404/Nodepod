@@ -168,6 +168,14 @@ export { NodepodTerminal } from "./sdk/nodepod-terminal";
 export { NodepodProcess } from "./sdk/nodepod-process";
 export { NodepodFS } from "./sdk/nodepod-fs";
 export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client";
+export {
+  PreviewInspector,
+  PreviewInspectorError,
+  PreviewNotAttachedError,
+  PreviewAgentUnavailableError,
+  PreviewInspectionTimeoutError,
+  PreviewScreenshotUnavailableError,
+} from "./sdk/preview-inspector";
 export type {
   NodepodOptions,
   TerminalOptions,
@@ -178,6 +186,22 @@ export type {
   PerformanceStats,
   PerformanceTiming,
 } from "./sdk/types";
+export type {
+  InspectWaitUntil,
+  InspectTarget,
+  InspectResult,
+  InspectAttachOptions,
+  InspectRect,
+  InspectConsoleEntry,
+  InspectErrorEntry,
+  InspectDomNode,
+  InspectQueryNode,
+  InspectA11yNode,
+  InspectA11yViolation,
+  InspectScreenshot,
+  InspectEvent,
+  InspectSnapshot,
+} from "./sdk/preview-inspector";
 export { MemoryHandler, LRUCache } from "./memory-handler";
 export type { MemoryHandlerOptions } from "./memory-handler";
 

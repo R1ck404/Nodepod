@@ -23,7 +23,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 13;
+const SW_VERSION = 14;
 const DEFAULT_INSTANCE = "default";
 
 let nextId = 1;
@@ -137,6 +137,9 @@ function resolvePodFromLiveInstances() {
 
 // per-instance script injected into preview iframe HTML
 const previewScripts = new Map();
+// SDK-owned instrumentation scripts. Kept separate from previewScripts so a
+// host's setPreviewScript() can never disable first-party diagnostics.
+const previewInspectorScripts = new Map();
 
 // global watermark toggle, last writer across tabs wins
 let watermarkEnabled = true;
@@ -352,6 +355,7 @@ function releaseInstance(mp, instanceId) {
   if (instancePorts.get(instanceId) === mp) {
     instancePorts.delete(instanceId);
     previewScripts.delete(instanceId);
+    previewInspectorScripts.delete(instanceId);
     wsTokens.delete(instanceId);
   }
   const info = ports.get(mp);
@@ -366,6 +370,7 @@ function cleanupPort(mp) {
       if (instancePorts.get(id) === mp) {
         instancePorts.delete(id);
         previewScripts.delete(id);
+        previewInspectorScripts.delete(id);
         wsTokens.delete(id);
       }
     }
@@ -589,6 +594,16 @@ self.addEventListener("message", (event) => {
       previewScripts.delete(id);
     } else {
       previewScripts.set(id, data.script);
+    }
+    return;
+  }
+  if (data.type === "set-preview-inspector-script") {
+    const id = data.instanceId || DEFAULT_INSTANCE;
+    if (!isValidTokenForInstance(data.token, id)) return;
+    if (data.script === null || data.script === undefined) {
+      previewInspectorScripts.delete(id);
+    } else {
+      previewInspectorScripts.set(id, data.script);
     }
     return;
   }
@@ -1444,6 +1459,11 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
         getNavTimingPatchScript(responseBody.byteLength) +
         getLocationPatchScript(instanceId, serverPort) +
         getWsShimScript(instanceId, serverPort);
+      const inspectorScript = previewInspectorScripts.get(instanceId);
+      if (inspectorScript) {
+        const safeInspector = String(inspectorScript).replace(/<\/script/gi, "<\\/script");
+        injection += `<script>window.__nodepodInspectConfig=${JSON.stringify({ instanceId, port: serverPort })};<` + `/script><script>${safeInspector}<` + `/script>`;
+      }
       const previewScript = previewScripts.get(instanceId);
       if (previewScript) {
         const safe = String(previewScript).replace(/<\/script/gi, "<\\/script");

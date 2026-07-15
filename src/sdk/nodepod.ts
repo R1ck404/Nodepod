@@ -49,6 +49,7 @@ import {
   PerformanceTracker,
   type PerformanceStats,
 } from "../performance-tracker";
+import { PreviewInspector } from "./preview-inspector";
 
 let activeNodepodCount = 0;
 
@@ -96,6 +97,8 @@ function parseSimpleCommand(
 
 export class Nodepod {
   readonly fs: NodepodFS;
+  /** Opt-in inspection of a host-owned preview iframe. */
+  readonly inspect: PreviewInspector;
 
   /** unique id used by RequestProxy + SW to route back to this Nodepod when
    *  multiple coexist on one page */
@@ -150,6 +153,7 @@ export class Nodepod {
     this._sharedVFSBufferSize =
       sharedVFSBufferSize ?? DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE;
     this.instanceId = instanceId;
+    this.inspect = new PreviewInspector(proxy, instanceId, () => this._assertActive());
     this._performance = performanceTracker;
     this.fs = new NodepodFS(volume);
     activeNodepodCount++;
@@ -807,6 +811,7 @@ export class Nodepod {
   teardown(): void {
     if (this._disposed) return;
     this._disposed = true;
+    this.inspect.dispose();
     if (this._unwatchVFS) {
       this._unwatchVFS();
       this._unwatchVFS = null;
