@@ -31,4 +31,6 @@ jobs:
         run: pnpm run build:publish
 
       - name: Test
-        run: pnpm test
+        # The WASI/native test worker can be terminated under the runner's
+        # default fork fan-out. Two forks keep memory and teardown stable.
+        run: pnpm run test -- --maxWorkers=2
