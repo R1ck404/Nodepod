@@ -25,6 +25,13 @@ describe("Buffer", () => {
       expect(buf.toString()).toBe("hello");
     });
 
+    it("creates buffer from utf16le string", () => {
+      const buf = Buffer.from("A\u{1f642}", "utf16le");
+      expect(Array.from(buf)).toEqual([0x41, 0x00, 0x3d, 0xd8, 0x42, 0xde]);
+      expect(buf.toString("utf16le")).toBe("A\u{1f642}");
+      expect(Buffer.byteLength("A\u{1f642}", "utf16le")).toBe(6);
+    });
+
     it("creates buffer from base64url", () => {
       const buf = Buffer.from("SGVsbG8", "base64url");
       expect(buf.toString()).toBe("Hello");
@@ -55,6 +62,20 @@ describe("Buffer", () => {
     it("creates buffer filled with specified value", () => {
       const buf = Buffer.alloc(5, 0xff);
       expect(buf.every((b: number) => b === 255)).toBe(true);
+    });
+  });
+
+  describe("Buffer.write", () => {
+    it("writes utf16le into a shared ArrayBuffer view", () => {
+      const memory = new ArrayBuffer(16);
+      const view = Buffer.from(memory, 4, 8);
+
+      expect(view.write("react", "utf16le")).toBe(8);
+      expect(Array.from(new Uint8Array(memory))).toEqual([
+        0, 0, 0, 0,
+        0x72, 0, 0x65, 0, 0x61, 0, 0x63, 0,
+        0, 0, 0, 0,
+      ]);
     });
   });
 

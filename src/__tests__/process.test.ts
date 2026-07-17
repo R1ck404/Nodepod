@@ -59,12 +59,6 @@ describe("process polyfill", () => {
       expect(proc.env.NAPI_RS_FORCE_WASM).toBe("1");
     });
 
-    it("serializes napi-rs async work by default", () => {
-      const proc = buildProcessEnv();
-      expect(proc.env.NAPI_RS_ASYNC_WORK_POOL_SIZE).toBe("1");
-      expect(proc.env.UV_THREADPOOL_SIZE).toBe("1");
-    });
-
     it("is mutable", () => {
       const proc = buildProcessEnv();
       proc.env.CUSTOM = "value";

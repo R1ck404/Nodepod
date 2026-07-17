@@ -6,6 +6,30 @@ import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1 } from '../help
 const textEnc = new TextEncoder();
 const textDec = new TextDecoder('utf-8');
 
+function encodeUtf16Le(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length * 2);
+  for (let i = 0; i < value.length; i++) {
+    const codeUnit = value.charCodeAt(i);
+    bytes[i * 2] = codeUnit & 0xff;
+    bytes[i * 2 + 1] = codeUnit >>> 8;
+  }
+  return bytes;
+}
+
+function decodeUtf16Le(bytes: Uint8Array): string {
+  let result = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset + 1 < bytes.length; offset += chunkSize * 2) {
+    const count = Math.min(chunkSize, (bytes.length - offset) >>> 1);
+    const codeUnits = new Array<number>(count);
+    for (let i = 0; i < count; i++) {
+      codeUnits[i] = bytes[offset + i * 2] | (bytes[offset + i * 2 + 1] << 8);
+    }
+    result += String.fromCharCode(...codeUnits);
+  }
+  return result;
+}
+
 // Pre-computed hex char → nibble value lookup (0-255 for valid hex chars, 0 for invalid)
 const HEX_DECODE = new Uint8Array(128);
 for (let i = 0; i < 10; i++) HEX_DECODE[48 + i] = i;         // '0'-'9'
@@ -60,6 +84,10 @@ class BufferPolyfill extends Uint8Array {
           octets[i] = source.charCodeAt(i) & 0xff;
         }
         return new BufferPolyfill(octets);
+      }
+
+      if (enc === 'utf16le' || enc === 'utf-16le' || enc === 'ucs2' || enc === 'ucs-2') {
+        return new BufferPolyfill(encodeUtf16Le(source));
       }
 
       // utf-8 default
@@ -118,7 +146,10 @@ class BufferPolyfill extends Uint8Array {
 
   static isEncoding(enc: string): boolean {
     const lower = enc.toLowerCase();
-    return ['utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'base64', 'base64url', 'hex'].includes(lower);
+    return [
+      'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'base64', 'base64url', 'hex',
+      'utf16le', 'utf-16le', 'ucs2', 'ucs-2',
+    ].includes(lower);
   }
 
   static byteLength(text: string, enc?: string): number {
@@ -129,6 +160,9 @@ class BufferPolyfill extends Uint8Array {
     }
     if (lower === 'hex') {
       return text.length >>> 1;
+    }
+    if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
+      return text.length * 2;
     }
     return textEnc.encode(text).length;
   }
@@ -156,6 +190,10 @@ class BufferPolyfill extends Uint8Array {
     if (lower === 'hex') return bytesToHex(view);
 
     if (lower === 'latin1' || lower === 'binary') return bytesToLatin1(view);
+
+    if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
+      return decodeUtf16Le(view);
+    }
 
     // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
     if (typeof SharedArrayBuffer !== "undefined" && view.buffer instanceof SharedArrayBuffer) {
