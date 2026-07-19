@@ -10,6 +10,7 @@ import type {
 } from "./engine-types";
 import type { PackageManifest } from "./types/manifest";
 import { quickDigest } from "./helpers/digest";
+import { createImportMeta } from "./helpers/import-meta";
 import { LRUCache as _LRUCache } from "./memory-handler";
 import { bytesToBase64, bytesToHex } from "./helpers/byte-encoding";
 import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
@@ -515,18 +516,136 @@ ${code}
 })`;
 }
 
+/**
+ * Replace import.meta references without touching string/template/comment
+ * contents. The naive /\bimport\.meta\b/g fallback corrupts Vite's own
+ * guards like code.includes("import.meta.glob"), which then skips the
+ * compile-time glob expand and leaves a runtime .glob() call.
+ */
+function replaceImportMetaOutsideLiterals(
+  source: string,
+  replace: (matched: string) => string,
+): string {
+  let out = "";
+  let i = 0;
+  const len = source.length;
+  while (i < len) {
+    const ch = source[i];
+    const next = i + 1 < len ? source[i + 1] : "";
+
+    // line comment
+    if (ch === "/" && next === "/") {
+      const end = source.indexOf("\n", i);
+      const stop = end === -1 ? len : end;
+      out += source.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    // block comment
+    if (ch === "/" && next === "*") {
+      const end = source.indexOf("*/", i + 2);
+      const stop = end === -1 ? len : end + 2;
+      out += source.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    // string / template literal
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      let j = i + 1;
+      while (j < len) {
+        if (source[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (source[j] === quote) {
+          j++;
+          break;
+        }
+        // template: skip ${ ... } with naive depth so nested braces in
+        // expressions don't truncate the literal early
+        if (quote === "`" && source[j] === "$" && source[j + 1] === "{") {
+          j += 2;
+          let depth = 1;
+          while (j < len && depth > 0) {
+            if (source[j] === "\\") {
+              j += 2;
+              continue;
+            }
+            if (source[j] === '"' || source[j] === "'") {
+              const q = source[j++];
+              while (j < len) {
+                if (source[j] === "\\") {
+                  j += 2;
+                  continue;
+                }
+                if (source[j] === q) {
+                  j++;
+                  break;
+                }
+                j++;
+              }
+              continue;
+            }
+            if (source[j] === "{") depth++;
+            else if (source[j] === "}") depth--;
+            j++;
+          }
+          continue;
+        }
+        j++;
+      }
+      out += source.slice(i, j);
+      i = j;
+      continue;
+    }
+
+    if (
+      ch === "i" &&
+      source.startsWith("import.meta", i) &&
+      (i === 0 || !/[\w$]/.test(source[i - 1]!))
+    ) {
+      const after = i + "import.meta".length;
+      if (after >= len || !/[\w$]/.test(source[after]!)) {
+        // longest suffix first
+        if (source.startsWith("import.meta.filename", i)) {
+          out += replace("import.meta.filename");
+          i += "import.meta.filename".length;
+          continue;
+        }
+        if (source.startsWith("import.meta.dirname", i)) {
+          out += replace("import.meta.dirname");
+          i += "import.meta.dirname".length;
+          continue;
+        }
+        if (source.startsWith("import.meta.url", i)) {
+          out += replace("import.meta.url");
+          i += "import.meta.url".length;
+          continue;
+        }
+        out += replace("import.meta");
+        i += "import.meta".length;
+        continue;
+      }
+    }
+
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 function convertViaRegex(source: string, filePath: string): string {
   let output = source;
-  output = output.replace(/\bimport\.meta\.url\b/g, `"file://${filePath}"`);
-  output = output.replace(
-    /\bimport\.meta\.dirname\b/g,
-    `"${pathPolyfill.dirname(filePath)}"`,
-  );
-  output = output.replace(/\bimport\.meta\.filename\b/g, `"${filePath}"`);
-  output = output.replace(
-    /\bimport\.meta\b/g,
-    `({ url: "file://${filePath}", dirname: "${pathPolyfill.dirname(filePath)}", filename: "${filePath}" })`,
-  );
+  const dir = pathPolyfill.dirname(filePath);
+  output = replaceImportMetaOutsideLiterals(output, (matched) => {
+    if (matched === "import.meta.url") return `"file://${filePath}"`;
+    if (matched === "import.meta.dirname") return `"${dir}"`;
+    if (matched === "import.meta.filename") return `"${filePath}"`;
+    // Keep the identifier form so the module wrapper's $importMeta binding
+    // (url/dirname/filename/resolve/main) is what user code sees — same as AST.
+    return "import_meta";
+  });
   output = rewriteDynamicImportsRegex(output);
 
   const hasImport = /\bimport\s+[\w{*'"]/m.test(source);
@@ -979,6 +1098,22 @@ export interface ResolverFn {
   extensions: Record<string, unknown>;
   main: ModuleRecord | null;
   _ownerRecord?: ModuleRecord;
+}
+
+/** Build the Node-compatible import.meta object for a module under `resolver`. */
+function importMetaForModule(
+  resolver: ResolverFn,
+  filename: string,
+  dirname: string,
+) {
+  return createImportMeta({
+    filename,
+    dirname,
+    isMain: resolver.main != null && resolver.main.filename === filename,
+    isBuiltin: moduleSysPolyfill.isBuiltin,
+    resolvePath: (specifier, fromDir) =>
+      resolver.resolve(specifier, { paths: [fromDir] }),
+  });
 }
 
 // Mutable copy so packages can monkey-patch frozen polyfill namespaces
@@ -1699,11 +1834,8 @@ function buildResolver(
               node.meta?.name === "import" &&
               node.property?.name === "meta"
             ) {
-              cjsPatches.push([
-                node.start,
-                node.end,
-                `({ url: "file://${resolved}", dirname: "${pathPolyfill.dirname(resolved)}", filename: "${resolved}" })`,
-              ]);
+              // Use the wrapper's $importMeta binding (resolve/main included)
+              cjsPatches.push([node.start, node.end, "import_meta"]);
             }
             for (const key of Object.keys(node)) {
               if (key === "type" || key === "start" || key === "end") continue;
@@ -1760,7 +1892,6 @@ function buildResolver(
     const wrappedConsole = wrapConsole(opts.onConsole);
 
     try {
-      const metaUrl = "file://" + resolved;
       const wrapper = buildModuleWrapper(processedCode);
 
       let fn;
@@ -1788,7 +1919,7 @@ function buildResolver(
         dir,
         proc,
         wrappedConsole,
-        { url: metaUrl, dirname: dir, filename: resolved },
+        importMetaForModule(childResolver, resolved, dir),
         asyncLoader,
         syncAwait,
         SyncPromiseClass,
@@ -1837,7 +1968,7 @@ function buildResolver(
             dir,
             proc,
             wrappedConsole,
-            { url: "file://" + resolved, dirname: dir, filename: resolved },
+            importMetaForModule(childResolver, resolved, dir),
             asyncLoader,
             syncAwait,
             SyncPromiseClass,
@@ -1866,7 +1997,9 @@ function buildResolver(
     return record;
   };
 
-  const resolver: ResolverFn = (id: string): unknown => {
+  // Typed as ResolverFn only after resolve/cache/extensions/main are attached
+  // below — defineProperty(main) is invisible to the checker at declaration.
+  const resolver = ((id: string): unknown => {
     if (typeof id !== "string") {
       // Match real Node.js error: TypeError with ERR_INVALID_ARG_TYPE code
       const err: any = new TypeError(
@@ -2139,7 +2272,7 @@ function buildResolver(
       });
     }
     return rec.exports;
-  };
+  }) as ResolverFn;
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
     if (id === "fs" || id === "process" || CORE_MODULES[id]) return id;
@@ -2165,8 +2298,21 @@ function buildResolver(
     ".mjs": () => {},
     ".cjs": () => {},
   };
-  resolver.main = null;
+  // Share the process entry module across child resolvers (require.main /
+  // import.meta.main). Set via markResolverMain() from execute/runFileTLA.
+  Object.defineProperty(resolver, "main", {
+    configurable: true,
+    enumerable: true,
+    get: () => ((cache as any).__mainModule as ModuleRecord | null) ?? null,
+    set: (mod: ModuleRecord | null) => {
+      (cache as any).__mainModule = mod;
+    },
+  });
   return resolver;
+}
+
+function markResolverMain(resolver: ResolverFn, mod: ModuleRecord): void {
+  if (resolver.main == null) resolver.main = mod;
 }
 
 // ── ScriptEngine class ──
@@ -2758,11 +2904,7 @@ export class ScriptEngine {
             node.meta?.name === "import" &&
             node.property?.name === "meta"
           ) {
-            cjsPatches.push([
-              node.start,
-              node.end,
-              `({ url: "file://${filename}", dirname: "${pathPolyfill.dirname(filename)}", filename: "${filename}" })`,
-            ]);
+            cjsPatches.push([node.start, node.end, "import_meta"]);
           }
           for (const key of Object.keys(node)) {
             if (key === "type" || key === "start" || key === "end") continue;
@@ -2801,9 +2943,9 @@ export class ScriptEngine {
       fileHasTLA,
     );
     resolver._ownerRecord = mod;
+    markResolverMain(resolver, mod);
 
     try {
-      const metaUrl = "file://" + filename;
       const wrapper = buildModuleWrapper(processed);
 
       const asyncLoader = makeDynamicLoader(resolver);
@@ -2822,7 +2964,7 @@ export class ScriptEngine {
         dir,
         this.proc,
         consoleProxy,
-        { url: metaUrl, dirname: dir, filename },
+        importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
         SyncPromiseClass,
@@ -2884,14 +3026,7 @@ export class ScriptEngine {
     let tla = false;
     if (filename.endsWith(".cjs")) {
       processed = rewriteDynamicImportsRegex(processed);
-      processed = processed.replace(
-        /\bimport\.meta\.url\b/g,
-        `"file://${filename}"`,
-      );
-      processed = processed.replace(
-        /\bimport\.meta\b/g,
-        `({ url: "file://${filename}" })`,
-      );
+      processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
     } else {
       const converted = convertModuleSyntaxDetailed(processed, filename);
       processed = converted.code;
@@ -2912,6 +3047,7 @@ export class ScriptEngine {
       false,
     );
     resolver._ownerRecord = mod;
+    markResolverMain(resolver, mod);
 
     if (!tla) {
       try {
@@ -2928,7 +3064,7 @@ export class ScriptEngine {
           dir,
           this.proc,
           consoleProxy,
-          { url: "file://" + filename, dirname: dir, filename },
+          importMetaForModule(resolver, filename, dir),
           asyncLoader,
           syncAwait,
           SyncPromiseClass,
@@ -2942,7 +3078,6 @@ export class ScriptEngine {
     }
 
     try {
-      const metaUrl = "file://" + filename;
       const wrapper = buildModuleWrapper(processed, { async: true });
       const asyncLoader = makeDynamicLoader(resolver);
       const fn = (0, eval)(wrapper);
@@ -2954,7 +3089,7 @@ export class ScriptEngine {
         dir,
         this.proc,
         consoleProxy,
-        { url: metaUrl, dirname: dir, filename },
+        importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
         SyncPromiseClass,
@@ -2978,6 +3113,7 @@ export class ScriptEngine {
     (this.moduleRegistry as any).__resolveCache?.clear();
     (this.moduleRegistry as any).__manifestCache?.clear();
     delete (this.moduleRegistry as any).__pkgIdentityMap;
+    delete (this.moduleRegistry as any).__mainModule;
     this.transformCache.clear();
   }
 

@@ -65,6 +65,7 @@ createServer((req, res) => {
   console.log(`  Vite dev exit 1:      http://localhost:${port}/examples/vite-dev-exit-1/  (auth+sqlite repro)`);
   console.log(`  Scelar auth template: http://localhost:${port}/examples/scelar-auth-template/`);
   console.log(`  Scelar Vite repro:    http://localhost:${port}/examples/scelar-vite-config-repro/`);
+  console.log(`  import.meta.glob:     http://localhost:${port}/examples/import-meta-glob-test/`);
   console.log(`  Terminal + preview:   http://localhost:${port}/examples/terminal/`);
   console.log(`  Preview inspector:     http://localhost:${port}/examples/preview-inspector/`);
 });
