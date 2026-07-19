@@ -1997,7 +1997,9 @@ function buildResolver(
     return record;
   };
 
-  const resolver: ResolverFn = (id: string): unknown => {
+  // Typed as ResolverFn only after resolve/cache/extensions/main are attached
+  // below — defineProperty(main) is invisible to the checker at declaration.
+  const resolver = ((id: string): unknown => {
     if (typeof id !== "string") {
       // Match real Node.js error: TypeError with ERR_INVALID_ARG_TYPE code
       const err: any = new TypeError(
@@ -2270,7 +2272,7 @@ function buildResolver(
       });
     }
     return rec.exports;
-  };
+  }) as ResolverFn;
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
     if (id === "fs" || id === "process" || CORE_MODULES[id]) return id;
