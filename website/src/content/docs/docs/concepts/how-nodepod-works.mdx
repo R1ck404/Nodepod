@@ -24,7 +24,7 @@ const pod = await Nodepod.boot({
 const process = await pod.spawn('node', ['index.js']);
 await process.completion;
 
-pod.teardown();
+await pod.teardown();
 ```
 
 [`src/sdk/nodepod.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod.ts) is the coordinator. It initializes the engine and host adapters, exposes public subsystems, tracks workers and virtual servers, and releases them during teardown. [`src/sdk/nodepod-fs.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-fs.ts), [`src/sdk/nodepod-process.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-process.ts), and [`src/sdk/nodepod-terminal.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-terminal.ts) provide the focused filesystem, process, and terminal surfaces.

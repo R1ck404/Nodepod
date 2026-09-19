@@ -257,11 +257,23 @@ export function installFetchHeadersSetCookieParity(): void {
   ): Generator<[string, string], void, unknown> {
     const cookies =
       typeof this.getSetCookie === "function" ? this.getSetCookie() : [];
-    for (const cookie of cookies) {
-      yield ["set-cookie", cookie];
+    if (cookies.length > 0) {
+      for (const cookie of cookies) {
+        yield ["set-cookie", cookie];
+      }
     }
     for (const [key, value] of origEntries.call(this)) {
-      if (key.toLowerCase() === "set-cookie") continue;
+      if (key.toLowerCase() === "set-cookie") {
+        // Browser Headers has no getSetCookie(), but the guard-free Headers
+        // objects used by NodePod can still contain Set-Cookie values. Keep
+        // those values visible to server code instead of dropping them.
+        if (cookies.length === 0) {
+          for (const cookie of splitCookiesString(value)) {
+            yield ["set-cookie", cookie];
+          }
+        }
+        continue;
+      }
       yield [key, value];
     }
   }
@@ -291,7 +303,10 @@ export function installFetchHeadersSetCookieParity(): void {
     if (name.toLowerCase() === "set-cookie") {
       const cookies =
         typeof this.getSetCookie === "function" ? this.getSetCookie() : [];
-      return cookies.length > 0 ? cookies.join(", ") : null;
+      if (cookies.length > 0) return cookies.join(", ");
+      // Fall back to the native Headers store for browser realms where
+      // getSetCookie() is unavailable but NodePod created a guard-free list.
+      return origGet.call(this, name);
     }
     return origGet.call(this, name);
   };

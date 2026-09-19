@@ -137,6 +137,11 @@ export function createLocalHttpIngress(
       if (!s) return;
       await new Promise<void>((resolve) => {
         s.close(() => resolve());
+        // Teardown is called after the owning browser session closes. Force any
+        // remaining keep-alive connections out of the local ingress so a large
+        // sequence of headless previews cannot accumulate stale sockets.
+        s.closeIdleConnections?.();
+        s.closeAllConnections?.();
       });
     },
   };

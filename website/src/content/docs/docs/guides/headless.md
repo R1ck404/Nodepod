@@ -25,4 +25,4 @@ const pod = await Nodepod.boot();
 
 The headless entry uses worker threads and exposes virtual server ingress on loopback. It does not need a browser DOM, xterm.js, or service-worker setup.
 
-Always call `pod.teardown()` in application shutdown and test cleanup.
+Always call `pod.teardown()` in application shutdown and test cleanup. It resolves once the loopback ingress has closed its listening socket and any keep-alive connections, so `await` it before binding the same port again or ending a test.

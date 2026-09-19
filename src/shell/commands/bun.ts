@@ -1,5 +1,5 @@
 import type { ShellCommand } from "../shell-types";
-import type { PmDeps } from "./pm-types";
+import { splitLeadingSilentFlags, type PmDeps } from "./pm-types";
 import { VERSIONS } from "../../constants/config";
 
 const A_RESET = "\x1b[0m";
@@ -10,7 +10,8 @@ const A_DIM = "\x1b[2m";
 export function createBunCommand(deps: PmDeps): ShellCommand {
   return {
     name: "bun",
-    async execute(params, ctx) {
+    async execute(rawParams, ctx) {
+      const { silent, params } = splitLeadingSilentFlags(rawParams);
       if (!deps.hasFile("/"))
         return { stdout: "", stderr: "Volume unavailable\n", exitCode: 1 };
 
@@ -43,13 +44,13 @@ export function createBunCommand(deps: PmDeps): ShellCommand {
           if (/\.(js|mjs|cjs|ts|tsx|jsx)$/.test(target) || target.startsWith("/")) {
             return deps.executeNodeBinary(target, params.slice(2), ctx);
           }
-          return deps.runScript(params.slice(1), ctx);
+          return deps.runScript([...silent, ...params.slice(1)], ctx);
         }
         case "start":
-          return deps.runScript(["start"], ctx);
+          return deps.runScript([...silent, "start"], ctx);
         case "test":
         case "t":
-          return deps.runScript(["test"], ctx);
+          return deps.runScript([...silent, "test"], ctx);
         case "install":
         case "i": {
           const rejected = deps.rejectGlobal(params.slice(1), "bun");
@@ -118,7 +119,7 @@ export function createBunCommand(deps: PmDeps): ShellCommand {
             if (deps.hasFile(filePath)) {
               return deps.executeNodeBinary(params[0], params.slice(1), ctx);
             }
-            return deps.runScript(params, ctx);
+            return deps.runScript([...silent, ...params], ctx);
           }
           return {
             stdout: "",

@@ -52,5 +52,16 @@ export interface PmDeps {
   rejectGlobal: (args: string[], pm: PkgManager) => ShellResult | null;
 }
 
+// `npm -s run build` / `pnpm --silent run build`: the global flag precedes
+// the subcommand. Split it off so the dispatcher sees the subcommand first
+// and can forward the flag to run-script, its only consumer.
+export function splitLeadingSilentFlags(params: string[]): {
+  silent: string[];
+  params: string[];
+} {
+  let i = 0;
+  while (i < params.length && (params[i] === "-s" || params[i] === "--silent")) i++;
+  return { silent: params.slice(0, i), params: params.slice(i) };
+}
 // re-export so factories can import ShellCommand from one place if needed
 export type { ShellCommand };

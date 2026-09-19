@@ -990,7 +990,14 @@ export class Nodepod {
 
   /* ---- teardown ---- */
 
-  teardown(): void {
+  /**
+   * Release workers, servers, the SW slot and (headless) the loopback
+   * ingress. Everything synchronous happens before the first await, so
+   * un-awaited callers still get the old fire-and-forget behaviour; awaiting
+   * additionally waits for the ingress socket and its keep-alive
+   * connections to close.
+   */
+  async teardown(): Promise<void> {
     if (this._disposed) return;
     this._disposed = true;
     if (this._rewriteTerminalUrls) {
@@ -1008,9 +1015,7 @@ export class Nodepod {
     }
     const ingress = this._httpIngress;
     this._httpIngress = null;
-    if (ingress?.stop) {
-      void ingress.stop().catch(() => {});
-    }
+    const ingressStopped = ingress?.stop?.();
     // release our slot so sibling Nodepods on the same page keep working
     try {
       this._proxy.detach(this.instanceId);
@@ -1033,6 +1038,7 @@ export class Nodepod {
       getWorkerTransformCache().clear();
       ProcessManager.disposeGlobalResources();
     }
+    await ingressStopped?.catch(() => {});
   }
 
   /* ---- Performance stats ---- */

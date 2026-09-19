@@ -30,7 +30,7 @@ const process = await nodepod.spawn('node', ['hello.js']);
 process.on('output', (text) => console.log(text));
 await process.completion;
 
-nodepod.teardown();
+await nodepod.teardown();
 ```
 
 The browser entry enables Nodepod's preview service worker by default. If your
