@@ -1,0 +1,42 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>probe4</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from "/dist/index.mjs";
+  const log = (...a) => { document.querySelector("#log").textContent += a.join(" ") + "\n"; };
+  window.__results = {};
+  const pod = await Nodepod.boot({ swUrl: "/__sw__.js", watermark: false, workdir: "/workspace", files: {} });
+  window.pod = pod;
+  const cases = {
+    a_respjson_alone: "console.log('x', await Response.json({ok:true}).json())",
+    b_respjson_text: "console.log('x', await Response.json({ok:true}).text())",
+    c_newresp_json: "console.log('x', await new Response('{\"ok\":true}').json())",
+    d_two_reads: "console.log('1', await new Response('a').text()); console.log('2', await new Response('b').text())",
+    e_blob_then: "new Blob(['hi']).text().then(v => console.log('x', v), e => console.log('err', e))",
+    f_filereadersync: "console.log('x', new FileReaderSync().readAsText(new Blob(['hi'])))",
+    g_messagechannel: "await new Promise(r => { const mc = new MessageChannel(); mc.port1.onmessage = () => r(); mc.port2.postMessage(1); }); console.log('x', 'mc ok')",
+    h_blob_arraybuffer: "console.log('x', (await new Blob(['hi']).arrayBuffer()).byteLength)",
+    i_blob_stream: "console.log('x', JSON.stringify(await new Blob(['hi']).stream().getReader().read()))",
+    j_resp_blob: "const b = await new Response('hi').blob(); console.log('x1', b.size); console.log('x2', await b.text())",
+    k_fetch_blob_url: "const u = URL.createObjectURL(new Blob(['hi'])); console.log('x', await (await fetch(u)).text())",
+    l_native_promise: "const NP = (async()=>{})().constructor; console.log('x', NP === Promise, Promise.name, Object.getPrototypeOf(Promise) === Function.prototype ? 'root' : Object.getPrototypeOf(Promise).name)",
+    m_blob_setTimeout_poll: "const p = new Blob(['hi']).text(); let done=false; p.then(()=>{done=true}); for (let i=0;i<20;i++){ await new Promise(r=>setTimeout(r,50)); if(done) break; } console.log('x', done)",
+    n_respjson_headers_after_req: "const q = new Request('http://l/x', {method:'POST', body:'{}'}); console.log('1', await q.json()); console.log('2', await Response.json({ok:true}).json())",
+  };
+  for (const [name, code] of Object.entries(cases)) {
+    const proc = await pod.spawn("node", ["-e", code], { cwd: "/workspace" });
+    let out = "", err = "";
+    proc.on("output", c => { out += c; });
+    proc.on("error", c => { err += c; });
+    const result = await Promise.race([
+      proc.completion.then(r => ({ ...r, timedOut: false })),
+      new Promise(r => setTimeout(() => r({ timedOut: true, stdout: out, stderr: err }), 3000)),
+    ]);
+    if (result.timedOut) proc.kill();
+    window.__results[name] = result;
+    log(name, JSON.stringify(result));
+  }
+  window.__done = true;
+</script>
+</body></html>

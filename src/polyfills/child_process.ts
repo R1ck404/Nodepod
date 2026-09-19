@@ -427,13 +427,23 @@ async function executeShellNodeBinary(filePath: string, args: string[], ctx: She
   }
 }
 
+// `node -e` sources are staged as a root-level file so the child worker that
+// runs them can see it through the VFS sync. The name marks it as an [eval]
+// module: executeNodeBinary resolves its relative imports from the cwd rather
+// than from `/`, matching node.
+const EVAL_SCRIPT_PREFIX = "/<eval-";
+
+function isEvalScriptPath(path: string): boolean {
+  return path.startsWith(EVAL_SCRIPT_PREFIX) && path.lastIndexOf("/") === 0;
+}
+
 function evalNodeCode(
   code: string,
   ctx: ShellContext,
   executor: typeof executeNodeBinary = executeNodeBinary,
 ): Promise<ShellResult> {
   if (!_vol) return Promise.resolve({ stdout: "", stderr: "Volume unavailable\n", exitCode: 1 });
-  const evalPath = `/<eval-${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
+  const evalPath = `${EVAL_SCRIPT_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
   _vol.writeFileSync(evalPath, code);
   return executor(evalPath, [], ctx).finally(() => {
     try {
@@ -1457,7 +1467,10 @@ export async function executeNodeBinary(
   const tlaDonePromise = new Promise<void>((r) => { tlaResolve = r; });
 
   try {
-    const tlaPromise = sandbox.runFileTLA(resolved);
+    const tlaPromise = sandbox.runFileTLA(
+      resolved,
+      isEvalScriptPath(resolved) ? { resolveDir: ctx.cwd } : undefined,
+    );
     tlaPromise
       .catch((e) => {
         if (isExitSentinel(e)) {
@@ -1667,12 +1680,20 @@ export async function executeNodeBinary(
     while (!didExit && !executionSignal.aborted) {
       // TLA still pending, wait for it (or drain/halt/exit).
       if (!tlaSettled) {
-        const racers: Promise<unknown>[] = [
-          tlaDonePromise,
-          registry.drainPromise(),
-          exitPromise,
-        ];
+        const racers: Promise<unknown>[] = [tlaDonePromise, exitPromise];
         if (haltPromise) racers.push(haltPromise);
+        if (registry.activeRefedCount() > 0) {
+          racers.push(registry.drainPromise());
+        } else {
+          // nothing tracked is refed but the TLA is still pending on a
+          // promise we can't see (Blob/Response body reads, fetch bodies,
+          // WebAssembly compiles, ...). those settle from browser tasks, so
+          // yield a real macrotask before re-checking. drainPromise() is
+          // already resolved here, and racing it would spin this loop on
+          // microtasks forever, starving every task in the worker: body
+          // reads never complete and the kill/abort message is never seen.
+          racers.push(new Promise<void>((r) => _nativeSetTimeout(r, 4)));
+        }
         await Promise.race(racers);
         continue;
       }

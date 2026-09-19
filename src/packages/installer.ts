@@ -32,6 +32,8 @@ import {
 } from "./workspace";
 
 const RESOLVER_CACHE_VERSION = 2;
+const MATERIALIZE_ATTEMPTS = 3;
+const MATERIALIZE_RETRY_DELAY_MS = 750;
 const SNAPSHOT_CACHE_VERSION = 4;
 const TRANSFORMER_CACHE_VERSION = `esbuild-wasm@${PINNED_ESBUILD_WASM}:cjs-esnext-neutral-v1`;
 
@@ -778,33 +780,6 @@ export class DependencyInstaller {
     const nmRoot = path.join(this.workingDir, "node_modules");
     this.vol.mkdirSync(nmRoot, { recursive: true });
 
-    const pending: Array<{
-      depName: string;
-      dep: ResolvedDependency;
-      targetDir: string;
-    }> = [];
-
-    for (const [depName, dep] of tree) {
-      const targetDir = path.join(nmRoot, depName);
-      const existingManifest = path.join(targetDir, "package.json");
-
-      if (this.vol.existsSync(existingManifest)) {
-        try {
-          const current = JSON.parse(
-            this.vol.readFileSync(existingManifest, "utf8"),
-          );
-          if (current.version === dep.version) {
-            onProgress?.(`Skipping ${depName}@${dep.version} (up to date)`);
-            continue;
-          }
-        } catch {
-          // corrupt manifest, reinstall
-        }
-      }
-
-      pending.push({ depName, dep, targetDir });
-    }
-
     // Only need main-thread transformer as fallback when workers aren't available
     const shouldTransform = isEagerTransform(flags.transformModules);
     if (shouldTransform && !transformerReady) {
@@ -815,72 +790,62 @@ export class DependencyInstaller {
       transformerReady = true;
     }
 
+    const isUpToDate = (depName: string, dep: ResolvedDependency): boolean => {
+      const existingManifest = path.join(nmRoot, depName, "package.json");
+      if (!this.vol.existsSync(existingManifest)) return false;
+      try {
+        const current = JSON.parse(this.vol.readFileSync(existingManifest, "utf8"));
+        return current.version === dep.version;
+      } catch {
+        return false; // corrupt manifest, reinstall
+      }
+    };
+
     // Safe to batch aggressively since extract + transform are offloaded to workers
     // downloads stay work-conserving while archive inflation is serialized
     const WORKER_COUNT = 6;
-    onProgress?.(`Downloading ${pending.length} package(s)...`);
-
-    const byDepth = new Map<number, typeof pending>();
-    for (const item of pending) {
-      const depth = item.depName.split("/node_modules/").length - 1;
+    const byDepth = new Map<number, Array<{ depName: string; dep: ResolvedDependency }>>();
+    for (const [depName, dep] of tree) {
+      const depth = depName.split("/node_modules/").length - 1;
       const group = byDepth.get(depth) ?? [];
-      group.push(item);
+      group.push({ depName, dep });
       byDepth.set(depth, group);
     }
+    onProgress?.(`Downloading up to ${tree.size} package(s)...`);
+
+    // One failed package must not abort the whole install: every other
+    // package is still materialized, and the failures are reported together
+    // at the end so the tree is as complete as it can be.
+    const failures: Array<{ depName: string; version: string; error: unknown }> = [];
 
     for (const depth of [...byDepth.keys()].sort((a, b) => a - b)) {
-      const group = byDepth.get(depth)!;
+      // Decide what is up to date only now: a shallower package that was just
+      // re-extracted replaced its whole directory, so nested entries that
+      // looked installed when the install started may be gone.
+      const group = byDepth.get(depth)!.filter(({ depName, dep }) => {
+        if (isUpToDate(depName, dep)) {
+          onProgress?.(`Skipping ${depName}@${dep.version} (up to date)`);
+          return false;
+        }
+        return true;
+      });
       let nextPackage = 0;
       const runLane = async () => {
         while (nextPackage < group.length) {
-          const { depName, dep, targetDir } = group[nextPackage++];
+          const { depName, dep } = group[nextPackage++];
+          const targetDir = path.join(nmRoot, depName);
           onProgress?.(`  Fetching ${depName}@${dep.version}...`);
-
-          let extracted = false;
-          for (let attempt = 0; attempt < 2 && !extracted; attempt++) {
-            if (attempt > 0) {
-              onProgress?.(`  Retrying ${depName}@${dep.version} after incomplete extraction...`);
-              if (this.vol.existsSync(targetDir)) this.vol.removeTreeSync(targetDir);
-            }
-            try {
-              await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
-                stripComponents: 1,
-                expectedShasum: dep.shasum,
-                expectedIntegrity: dep.integrity,
-                profiler: this._profiler,
-              });
-              const manifestPath = path.join(targetDir, "package.json");
-              if (!this.vol.existsSync(manifestPath)) {
-                throw new Error(`Package archive did not contain ${manifestPath}`);
-              }
-              extracted = true;
-            } catch (error) {
-              if (attempt === 1) throw error;
-            }
-          }
-
-          if (shouldTransform) {
-            try {
-              const transformed = await convertPackage(
-                this.vol,
-                targetDir,
-                onProgress,
-                this._profiler,
-              );
-              if (transformed > 0) {
-                onProgress?.(
-                  `  Transformed ${transformed} file(s) in ${depName}`,
-                );
-              }
-            } catch (err) {
-              onProgress?.(
-                `  Warning: transformation failed for ${depName}: ${err}`,
-              );
-            }
+          try {
+            await this.materializeOne(depName, dep, targetDir, flags);
+          } catch (error) {
+            failures.push({ depName, version: dep.version, error });
+            onProgress?.(
+              `  Failed ${depName}@${dep.version}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            continue;
           }
 
           this.createBinStubs(nmRoot, depName, targetDir);
-
           additions.push(depName);
         }
       };
@@ -889,11 +854,20 @@ export class DependencyInstaller {
       );
     }
 
-    const incomplete = [...tree.keys()].filter((depName) =>
-      !this.vol.existsSync(path.join(nmRoot, depName, "package.json")),
-    );
-    if (incomplete.length > 0) {
-      throw new Error(`Installation incomplete: missing ${incomplete.join(", ")}`);
+    // Validate the whole tree, not just this run's downloads: anything the
+    // resolver expects must be present with the resolved version.
+    const incomplete = [...tree].filter(([depName, dep]) => !isUpToDate(depName, dep));
+    if (failures.length > 0 || incomplete.length > 0) {
+      const detail = failures.map(({ depName, version, error }) =>
+        `${depName}@${version}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const missing = incomplete
+        .map(([depName]) => depName)
+        .filter((depName) => !failures.some((f) => f.depName === depName));
+      const parts: string[] = [];
+      if (detail.length > 0) parts.push(`failed: ${detail.join("; ")}`);
+      if (missing.length > 0) parts.push(`missing: ${missing.join(", ")}`);
+      throw new Error(`Installation incomplete (${parts.join(" | ")})`);
     }
 
     this.writeLockFile(tree);
@@ -906,6 +880,95 @@ export class DependencyInstaller {
     }
 
     return additions;
+  }
+
+  // Download + extract one package into targetDir, replacing whatever version
+  // is there while keeping its nested node_modules (installed children of the
+  // previous copy) so they don't have to be fetched again. The archive is
+  // staged in /.nodepod/install and moved into place in one rename, so a
+  // failed attempt leaves the previous copy untouched.
+  private async materializeOne(
+    depName: string,
+    dep: ResolvedDependency,
+    targetDir: string,
+    flags: InstallFlags,
+  ): Promise<void> {
+    const { onProgress } = flags;
+    const nestedDir = path.join(targetDir, "node_modules");
+    const parkedNested = this.vol.existsSync(nestedDir)
+      ? `/.nodepod/install/nested-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      : null;
+    if (parkedNested) {
+      this.vol.mkdirSync(path.dirname(parkedNested), { recursive: true });
+      this.vol.renameSync(nestedDir, parkedNested);
+    }
+
+    let lastError: unknown = null;
+    let extracted = false;
+    try {
+      for (let attempt = 0; attempt < MATERIALIZE_ATTEMPTS && !extracted; attempt++) {
+        if (attempt > 0) {
+          onProgress?.(
+            `  Retrying ${depName}@${dep.version} (attempt ${attempt + 1}/${MATERIALIZE_ATTEMPTS})...`,
+          );
+          await new Promise<void>((r) => setTimeout(r, MATERIALIZE_RETRY_DELAY_MS * attempt));
+        }
+        try {
+          await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
+            stripComponents: 1,
+            expectedShasum: dep.shasum,
+            expectedIntegrity: dep.integrity,
+            profiler: this._profiler,
+          });
+          const manifestPath = path.join(targetDir, "package.json");
+          if (!this.vol.existsSync(manifestPath)) {
+            throw new Error(`Package archive did not contain ${manifestPath}`);
+          }
+          let installedVersion: string | undefined;
+          try {
+            installedVersion = JSON.parse(this.vol.readFileSync(manifestPath, "utf8")).version;
+          } catch {
+            throw new Error(`Package archive contained an unreadable ${manifestPath}`);
+          }
+          if (installedVersion !== dep.version) {
+            throw new Error(
+              `Package archive contained ${depName}@${installedVersion ?? "?"}, expected ${dep.version}`,
+            );
+          }
+          extracted = true;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!extracted) throw lastError;
+    } finally {
+      // put the children back under whichever copy is now in place
+      if (parkedNested && this.vol.existsSync(parkedNested)) {
+        try {
+          if (!this.vol.existsSync(targetDir)) this.vol.mkdirSync(targetDir, { recursive: true });
+          if (this.vol.existsSync(nestedDir)) this.vol.removeTreeSync(nestedDir);
+          this.vol.renameSync(parkedNested, nestedDir);
+        } catch {
+          /* leave the parked copy for the tree validation to report */
+        }
+      }
+    }
+
+    if (isEagerTransform(flags.transformModules)) {
+      try {
+        const transformed = await convertPackage(
+          this.vol,
+          targetDir,
+          onProgress,
+          this._profiler,
+        );
+        if (transformed > 0) {
+          onProgress?.(`  Transformed ${transformed} file(s) in ${depName}`);
+        }
+      } catch (err) {
+        onProgress?.(`  Warning: transformation failed for ${depName}: ${err}`);
+      }
+    }
   }
 
   private createBinStubs(

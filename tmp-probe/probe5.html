@@ -1,0 +1,41 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>probe5</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from "/dist/index.mjs";
+  const log = (...a) => { document.querySelector("#log").textContent += a.join(" ") + "\n"; };
+  window.__results = {};
+  const pod = await Nodepod.boot({ swUrl: "/__sw__.js", watermark: false, workdir: "/workspace", files: {} });
+  window.pod = pod;
+  const cases = {
+    interval_kill: "setInterval(()=>{}, 1000); console.log('started')",
+    busy_kill: "console.log('busy'); while(true){}",
+    pending_blob_kill: "console.log('x'); await new Blob(['hi']).text(); await new Promise(()=>{})",
+    fetch_then_chain: "fetch('data:text/plain,chain').then(r => r.text()).then(t => console.log('got', t))",
+    blob_then_chain: "new Blob(['b']).text().then(t => console.log('got', t))",
+  };
+  for (const [name, code] of Object.entries(cases)) {
+    const proc = await pod.spawn("node", ["-e", code], { cwd: "/workspace" });
+    let out = "";
+    proc.on("output", c => { out += c; });
+    const t0 = Date.now();
+    const result = await Promise.race([
+      proc.completion.then(r => ({ ...r, timedOut: false })),
+      new Promise(r => setTimeout(() => r({ timedOut: true, stdout: out }), 1500)),
+    ]);
+    let killSettled = null;
+    if (result.timedOut) {
+      const tk = Date.now();
+      proc.kill();
+      killSettled = await Promise.race([
+        proc.completion.then(r => ({ settled: true, exitCode: r.exitCode, ms: Date.now() - tk })),
+        new Promise(r => setTimeout(() => r({ settled: false }), 3000)),
+      ]);
+    }
+    window.__results[name] = { ...result, killSettled, ms: Date.now() - t0 };
+    log(name, JSON.stringify(window.__results[name]));
+  }
+  window.__done = true;
+</script>
+</body></html>

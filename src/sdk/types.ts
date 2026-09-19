@@ -64,6 +64,15 @@ export interface NodepodOptions {
    */
   previewOrigin?: PreviewOriginOption;
   /**
+   * Same-origin paths that belong to the host application and must never be
+   * served by a pod, even when a preview has claimed an enclosing path such
+   * as `/`. Use this for host documents embedded alongside previews (a
+   * runtime host page, its module URLs). Entries ending in `/` are prefixes;
+   * others match exactly. Requests issued by a document at a reserved path
+   * bypass pod routing as well.
+   */
+  reservedHostPaths?: string[];
+  /**
    * Visually rewrite loopback URLs in Nodepod-owned terminals to their real
    * preview URLs. Raw process stdout/stderr remain unchanged. Defaults to
    * `true`.

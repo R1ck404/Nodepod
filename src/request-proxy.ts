@@ -163,6 +163,7 @@ export class RequestProxy extends EventEmitter {
   private _swInitPromise: Promise<void> | null = null;
   /** global, not per-instance. last writer wins across tabs */
   private _watermarkEnabled = true;
+  private _reservedHostPaths = new Set<string>();
   /** guards pagehide/beforeunload listener registration so reinit doesn't stack them */
   private _farewellInstalled = false;
   /** server-registered etc. that fire before swReady; flushed once the port is up */
@@ -553,6 +554,20 @@ export class RequestProxy extends EventEmitter {
       script,
       token: this._swAuthToken,
     });
+  }
+
+  /**
+   * Same-origin paths the host keeps for itself: the SW never routes them
+   * (or requests made by documents at them) to a pod, even when a preview
+   * claimed an enclosing path. Entries ending in "/" are prefixes.
+   */
+  reserveHostPaths(paths: string[]): void {
+    for (const raw of paths) {
+      if (typeof raw !== "string" || !raw.startsWith("/")) continue;
+      this._reservedHostPaths.add(raw);
+    }
+    if (this._reservedHostPaths.size === 0) return;
+    this.notifySW("reserve-host-paths", { paths: [...this._reservedHostPaths] });
   }
 
   setWatermark(enabled: boolean): void {
@@ -1309,6 +1324,9 @@ export class RequestProxy extends EventEmitter {
       );
       for (const id of this._instances.keys()) {
         this.notifySW("claim-instance", { instanceId: id });
+      }
+      if (this._reservedHostPaths.size > 0) {
+        this.notifySW("reserve-host-paths", { paths: [...this._reservedHostPaths] });
       }
       for (const id of this._instances.keys()) {
         const inst = this._instances.get(id)!;

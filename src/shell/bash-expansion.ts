@@ -345,12 +345,16 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
   return { value: out, split, glob, preserveEmpty };
 }
 
-async function expandInner(text: string, ctx: BashExpansionContext, allowSplit: boolean): Promise<string> {
-  const result = await expandPart(text, ctx);
-  if (result.value.length > ctx.limits.maxExpansionBytes) {
+// Body of a double-quoted string. Only $-expansions, command substitution
+// and the backslash escapes for $ ` " \ <newline> are special; single
+// quotes, globs, tildes and process substitution are literal text, so
+// `node -e "console.log('x')"` hands the program its quotes intact.
+async function expandInner(text: string, ctx: BashExpansionContext, _allowSplit: boolean): Promise<string> {
+  const value = await expandQuotedText(text, ctx, { doubleQuoted: true });
+  if (value.length > ctx.limits.maxExpansionBytes) {
     throw new ShellLimitError("maxExpansionBytes", "shell: expansion limit exceeded");
   }
-  return result.value;
+  return value;
 }
 
 export async function expandWord(raw: string, ctx: BashExpansionContext): Promise<string[]> {
@@ -403,12 +407,28 @@ export async function expandWords(words: string[], ctx: BashExpansionContext): P
 
 /** Expand an unquoted here-document body without word splitting or globbing. */
 export async function expandHereDocument(text: string, ctx: BashExpansionContext): Promise<string> {
+  return expandQuotedText(text, ctx, { doubleQuoted: false });
+}
+
+// Shared expansion for the two contexts with the same rules: here-document
+// bodies and double-quoted strings (which additionally treat \" as ").
+async function expandQuotedText(
+  text: string,
+  ctx: BashExpansionContext,
+  opts: { doubleQuoted: boolean },
+): Promise<string> {
   let out = "";
   for (let i = 0; i < text.length;) {
     const ch = text[i];
     if (ch === "\\") {
       const next = text[i + 1];
-      if (next === "\\" || next === "$" || next === "`" || next === "\n") {
+      if (
+        next === "\\" ||
+        next === "$" ||
+        next === "`" ||
+        next === "\n" ||
+        (opts.doubleQuoted && next === '"')
+      ) {
         if (next !== "\n") out += next;
         i += 2;
       } else {

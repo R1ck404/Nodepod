@@ -43,7 +43,7 @@ import * as osPolyfill from "./polyfills/os";
 import * as hashingPolyfill from "./polyfills/crypto";
 import * as compressionPolyfill from "./polyfills/zlib";
 import * as dnsPolyfill from "./polyfills/dns";
-import bufferPolyfill from "./polyfills/buffer";
+import bufferPolyfill, { Buffer as NodeBuffer } from "./polyfills/buffer";
 // child_process is lazy-loaded to avoid pulling in the shell at import time
 let _shellExecPolyfill: any = null;
 let _initShellExec: ((vol: any) => void) | null = null;
@@ -592,6 +592,214 @@ function convertViaRegex(
   return output;
 }
 
+// ── fetch body lifetime ──
+// A fetch() Handle covers the request until headers arrive. Reading the body
+// afterwards (`await r.text()`, `.json()`, a reader loop) completes from
+// browser tasks that no tracked Handle refs, so a script whose last live work
+// is a body read would be judged drained and exit before the bytes land.
+// Node keeps the socket alive until the body is consumed; mirror that by
+// holding a Handle for the duration of each body-consuming call. Nothing is
+// registered while the body sits unread, so a script that only inspects
+// `r.status` still exits promptly.
+const BODY_CONSUMERS = ["text", "json", "arrayBuffer", "blob", "bytes", "formData"] as const;
+
+function trackFetchBodyConsumption(resp: Response): Response {
+  if (!resp || typeof resp !== "object" || !resp.body) return resp;
+  const define = (target: object, name: string, value: unknown) => {
+    try {
+      Object.defineProperty(target, name, {
+        configurable: true,
+        writable: true,
+        value,
+      });
+    } catch {
+      /* frozen/exotic response: leave native behavior */
+    }
+  };
+  const holdUntilSettled = <T>(p: Promise<T>): Promise<T> => {
+    const handle = getRegistry().register("FetchRequest");
+    return p.then(
+      (v) => {
+        handle.close();
+        return v;
+      },
+      (e) => {
+        handle.close();
+        throw e;
+      },
+    );
+  };
+  for (const name of BODY_CONSUMERS) {
+    const orig = (resp as unknown as Record<string, unknown>)[name];
+    if (typeof orig !== "function") continue;
+    define(resp, name, function (this: Response, ...args: unknown[]) {
+      return holdUntilSettled(
+        (orig as (...a: unknown[]) => Promise<unknown>).apply(this, args),
+      );
+    });
+  }
+  // clone(): the copy gets its own tracking.
+  const origClone = resp.clone;
+  if (typeof origClone === "function") {
+    define(resp, "clone", function (this: Response) {
+      return trackFetchBodyConsumption(origClone.call(this));
+    });
+  }
+  // Manual streaming: a reader or pipe holds the Handle until the stream
+  // closes, errors, or is cancelled.
+  const body = resp.body;
+  const origGetReader = body.getReader;
+  if (typeof origGetReader === "function") {
+    define(body, "getReader", function (this: ReadableStream, ...args: unknown[]) {
+      const reader = (origGetReader as (...a: unknown[]) => ReadableStreamDefaultReader).apply(this, args);
+      const handle = getRegistry().register("FetchRequest");
+      const release = () => handle.close();
+      reader.closed.then(release, release);
+      return reader;
+    });
+  }
+  const origPipeTo = body.pipeTo;
+  if (typeof origPipeTo === "function") {
+    define(body, "pipeTo", function (this: ReadableStream, ...args: unknown[]) {
+      return holdUntilSettled(
+        (origPipeTo as (...a: unknown[]) => Promise<void>).apply(this, args),
+      );
+    });
+  }
+  return resp;
+}
+
+// ── fetch() → virtual server ──
+
+interface LoopbackTarget {
+  port: number;
+  path: string;
+}
+
+function parseLoopbackHttpUrl(url: string): LoopbackTarget | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!httpPolyfill.isLoopbackHostname(parsed.hostname)) return null;
+  const port = parsed.port
+    ? Number(parsed.port)
+    : parsed.protocol === "https:"
+      ? 443
+      : 80;
+  if (!Number.isFinite(port) || port <= 0) return null;
+  return { port, path: parsed.pathname + parsed.search };
+}
+
+const MAX_LOCAL_REDIRECTS = 20;
+
+/**
+ * Serve a fetch() aimed at a loopback port from the virtual server bound to
+ * it. Resolves `null` when nothing listens there so the caller can fall back
+ * to the network. Follows same-loopback redirects like a real fetch would.
+ */
+async function fetchVirtualServer(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  target: LoopbackTarget,
+): Promise<Response | null> {
+  const request = new Request(input as RequestInfo, init);
+  const method = request.method.toUpperCase();
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  let body: Buffer | undefined;
+  if (method !== "GET" && method !== "HEAD") {
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength > 0) body = NodeBuffer.from(bytes);
+  }
+  const redirectMode = request.redirect ?? "follow";
+
+  let current = target;
+  let currentMethod = method;
+  let currentBody = body;
+  for (let hop = 0; hop <= MAX_LOCAL_REDIRECTS; hop++) {
+    if (!headers.host) headers.host = `localhost:${current.port}`;
+    const result = await httpPolyfill.dispatchLocalRequest(
+      current.port,
+      currentMethod,
+      current.path,
+      headers,
+      currentBody,
+    );
+    if (!result) return hop === 0 ? null : Response.error();
+
+    const responseHeaders = new Headers();
+    for (const [key, value] of Object.entries(result.headers ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) responseHeaders.append(key, String(item));
+      } else if (value != null) {
+        responseHeaders.append(key, String(value));
+      }
+    }
+    // Response() rejects statuses outside 200-599; anything else from a
+    // virtual server is a protocol error, report it as a bad gateway
+    const rawStatus = result.statusCode || 200;
+    const status = rawStatus >= 200 && rawStatus <= 599 ? rawStatus : 502;
+    const location = responseHeaders.get("location");
+    const isRedirect = [301, 302, 303, 307, 308].includes(status) && !!location;
+    if (isRedirect && redirectMode === "follow") {
+      let next: LoopbackTarget | null = null;
+      try {
+        next = parseLoopbackHttpUrl(
+          new URL(location, `http://localhost:${current.port}${current.path}`).href,
+        );
+      } catch {
+        next = null;
+      }
+      // redirect off the loopback: hand the rest to the network
+      if (!next) return null;
+      if (status === 303 || ((status === 301 || status === 302) && currentMethod === "POST")) {
+        currentMethod = "GET";
+        currentBody = undefined;
+        delete headers["content-length"];
+        delete headers["content-type"];
+      }
+      delete headers.host;
+      current = next;
+      continue;
+    }
+    if (isRedirect && redirectMode === "error") {
+      throw new TypeError("Failed to fetch: redirect not allowed");
+    }
+
+    // null-body statuses cannot carry a body in a Response
+    const nullBody = status === 204 || status === 205 || status === 304 || currentMethod === "HEAD";
+    const payload = result.body;
+    const bodyInit =
+      nullBody || !payload || payload.byteLength === 0
+        ? null
+        : (payload.buffer.slice(
+            payload.byteOffset,
+            payload.byteOffset + payload.byteLength,
+          ) as ArrayBuffer);
+    const response = new Response(bodyInit, {
+      status,
+      statusText: result.statusMessage || "",
+      headers: responseHeaders,
+    });
+    try {
+      Object.defineProperty(response, "url", {
+        configurable: true,
+        value: `http://localhost:${current.port}${current.path}`,
+      });
+    } catch {
+      /* url stays "" */
+    }
+    return response;
+  }
+  throw new TypeError("Failed to fetch: too many redirects");
+}
+
 // ── Sync promise infrastructure ──
 // SyncThenable and SyncPromise let __syncAwait unwrap values without hitting
 // the microtask queue. This is how require() can work synchronously even when
@@ -1002,6 +1210,11 @@ function makeDynamicLoader(
 }
 
 // ── Types ──
+export interface RunFileOptions {
+  /** Directory relative specifiers resolve from (default: dirname(filename)). */
+  resolveDir?: string;
+}
+
 export interface ModuleRecord {
   id: string;
   filename: string;
@@ -2513,9 +2726,28 @@ export class ScriptEngine {
               }
             }
           }
+          // http://localhost:PORT/... from inside a pod: deliver to the
+          // virtual server on that port (this worker's or a sibling's), the
+          // way node's fetch reaches a local socket. falls through to the
+          // network when nothing listens there.
+          const local = url ? parseLoopbackHttpUrl(url) : null;
+          if (local) {
+            return fetchVirtualServer(input, init, local).then((resp) =>
+              resp ?? origFetch(input, init),
+            );
+          }
           return origFetch(input, init);
         };
-        return doFetch().finally(() => handle.close());
+        return doFetch().then(
+          (resp) => {
+            handle.close();
+            return trackFetchBodyConsumption(resp);
+          },
+          (err) => {
+            handle.close();
+            throw err;
+          },
+        );
       };
       (globalThis as any).fetch = Object.assign(patchedFetch, {
         __nodepodPatched: true,
@@ -3021,11 +3253,17 @@ export class ScriptEngine {
   runFileSync = this.runFile;
 
   // Wraps in async IIFE when TLA is detected, falls back to sync otherwise
-  async runFileTLA(filename: string): Promise<{ exports: unknown; module: ModuleRecord }> {
+  //
+  // `resolveDir` overrides the directory used for relative require/import
+  // resolution, __dirname and import.meta (default: the file's directory).
+  async runFileTLA(
+    filename: string,
+    opts?: RunFileOptions,
+  ): Promise<{ exports: unknown; module: ModuleRecord }> {
     let retries = 0;
     while (true) {
       try {
-        return await this.runFileTLAOnce(filename);
+        return await this.runFileTLAOnce(filename, opts);
       } catch (err) {
         if (!(err instanceof AsyncModuleInitializationRequired) || retries++ >= 1) {
           throw err;
@@ -3040,9 +3278,12 @@ export class ScriptEngine {
 
   private async runFileTLAOnce(
     filename: string,
+    opts?: RunFileOptions,
   ): Promise<{ exports: unknown; module: ModuleRecord }> {
     const source = this.vol.readFileSync(filename, "utf8");
-    const dir = pathPolyfill.dirname(filename);
+    // `node -e` scripts live outside the project tree but must resolve
+    // relative specifiers from the cwd, exactly like node's [eval] module.
+    const dir = opts?.resolveDir ?? pathPolyfill.dirname(filename);
     // No need to write — source was just read from the same volume.
     // Writing it back triggers file watchers (nodemon restart loops).
 

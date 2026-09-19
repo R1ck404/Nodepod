@@ -3,7 +3,7 @@
 
 import pako from "pako";
 import { MemoryVolume } from "../memory-volume";
-import { proxiedFetch } from "../cross-origin";
+import { downloadTarball } from "./registry-client";
 import * as path from "../polyfills/path";
 import { offload, profiledOffload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
@@ -291,11 +291,7 @@ async function downloadAndExtractInternal(
   }
 
   if (!cachedBytes) {
-    const response = await proxiedFetch(url);
-    if (!response.ok) {
-      throw new Error(`Archive download failed (HTTP ${response.status}): ${url}`);
-    }
-    cachedBytes = await response.arrayBuffer();
+    cachedBytes = await downloadTarball(url);
   }
 
   if (opts.expectedIntegrity) {
@@ -399,14 +395,7 @@ export async function downloadAndExtractDirect(
     cache = null;
   }
 
-  const response = await proxiedFetch(url);
-  if (!response.ok) {
-    throw new Error(
-      `Archive download failed (HTTP ${response.status}): ${url}`,
-    );
-  }
-
-  const rawBytes = await response.arrayBuffer();
+  const rawBytes = await downloadTarball(url);
   if (cache && rawBytes.byteLength > 0 && rawBytes.byteLength <= TARBALL_CACHE_MAX_BYTES) {
     cache.put(url, rawBytes, opts.expectedShasum).catch(() => {});
   }

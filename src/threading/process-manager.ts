@@ -529,6 +529,21 @@ export class ProcessManager extends EventEmitter {
     clientHandle: ProcessHandle,
     msg: WorkerToMain_HttpClientRequest,
   ): void {
+    const ownerPid = this._serverPorts.get(msg.port);
+    const owner = ownerPid === undefined ? undefined : this._processes.get(ownerPid);
+    if (!owner || owner.state === "exited") {
+      if (ownerPid !== undefined) this._serverPorts.delete(msg.port);
+      clientHandle.postMessage({
+        type: "http-client-response",
+        requestId: msg.requestId,
+        statusCode: 0,
+        statusMessage: "",
+        headers: {},
+        body: "",
+        connectionRefused: true,
+      });
+      return;
+    }
     this.dispatchHttpRequest(
       msg.port,
       msg.method,

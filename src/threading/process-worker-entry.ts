@@ -780,11 +780,20 @@ function handleHttpClientResponse(msg: {
   statusMessage: string;
   headers: Record<string, string | string[]>;
   body: string | ArrayBuffer;
+  connectionRefused?: boolean;
 }): void {
   const entry = _httpClientCallbacks.get(msg.requestId);
   if (!entry) return;
   _httpClientCallbacks.delete(msg.requestId);
   clearTimeout(entry.timer);
+  if (msg.connectionRefused) {
+    const err = new Error("connect ECONNREFUSED") as NodeJS.ErrnoException;
+    err.code = "ECONNREFUSED";
+    err.errno = -111;
+    (err as any).syscall = "connect";
+    entry.reject(err);
+    return;
+  }
   void (async () => {
     const { Buffer } = await import("../polyfills/buffer");
     let bodyVal: Buffer | string | null = null;

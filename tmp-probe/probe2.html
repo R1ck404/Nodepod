@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>probe2</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from "/dist/index.mjs";
+  const log = (...a) => { document.querySelector("#log").textContent += a.join(" ") + "\n"; };
+  window.__results = {};
+  const pod = await Nodepod.boot({ swUrl: "/__sw__.js", watermark: false, workdir: "/workspace", files: {} });
+  window.pod = pod;
+  const cases = {
+    a_text: "console.log('x', await new Response('hi').text())",
+    b_arraybuffer: "console.log('x', (await new Response('hi').arrayBuffer()).byteLength)",
+    c_reader: "const r = new Response('hi'); const rd = r.body.getReader(); console.log('x', JSON.stringify(await rd.read()))",
+    d_blob: "console.log('x', await new Blob(['hi']).text())",
+    e_timer: "await Promise.resolve(1); await new Promise(r=>setTimeout(r,10)); console.log('x', 'ok')",
+    f_bytes: "console.log('x', await new Response(new Uint8Array([104,105])).text())",
+    g_stream: "console.log('x', JSON.stringify(await new ReadableStream({start(c){c.enqueue('x');c.close()}}).getReader().read()))",
+    h_datafetch: "console.log('x', await (await fetch('data:text/plain,hi')).text())",
+    i_reqtext: "console.log('x', await new Request('http://localhost/x', {method:'POST', body:'hi'}).text())",
+    j_resp_then: "new Response('hi').text().then(v => console.log('x', v))",
+    k_sync_only: "const p = new Response('hi').text(); console.log('x', typeof p.then, p instanceof Promise, Object.prototype.toString.call(p))",
+    l_native_resp: "const NR = Object.getPrototypeOf(Response); console.log('x', NR === Function.prototype ? 'no-parent' : NR.name); const R2 = NR === Function.prototype ? Response : NR; console.log('y', await new R2('hi').text())",
+  };
+  for (const [name, code] of Object.entries(cases)) {
+    const proc = await pod.spawn("node", ["-e", code], { cwd: "/workspace" });
+    let out = "", err = "";
+    proc.on("output", c => { out += c; });
+    proc.on("error", c => { err += c; });
+    const result = await Promise.race([
+      proc.completion.then(r => ({ ...r, timedOut: false })),
+      new Promise(r => setTimeout(() => r({ timedOut: true, stdout: out, stderr: err }), 4000)),
+    ]);
+    if (result.timedOut) proc.kill();
+    window.__results[name] = result;
+    log(name, JSON.stringify(result));
+  }
+  window.__done = true;
+</script>
+</body></html>

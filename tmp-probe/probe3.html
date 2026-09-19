@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>probe3</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+  window.__results = {};
+  const log = (n, v) => { window.__results[n] = v; document.querySelector("#log").textContent += n + " " + JSON.stringify(v) + "\n"; };
+  const withTimeout = (p, ms=3000) => Promise.race([p.then(v => ({ok:true, v})).catch(e => ({ok:false, e:String(e)})), new Promise(r => setTimeout(() => r({timedOut:true}), ms))]);
+  log("main_blob", await withTimeout(new Blob(['hi']).text()));
+  log("main_datafetch", await withTimeout(fetch('data:text/plain,hi').then(r=>r.text())));
+  const src = `
+    self.onmessage = async (ev) => {
+      const withTimeout = (p, ms=3000) => Promise.race([p.then(v => ({ok:true, v})).catch(e => ({ok:false, e:String(e)})), new Promise(r => setTimeout(() => r({timedOut:true}), ms))]);
+      const r = {};
+      r.blob = await withTimeout(new Blob(['hi']).text());
+      r.datafetch = await withTimeout(fetch('data:text/plain,hi').then(r=>r.text()));
+      r.respjson = await withTimeout(Response.json({ok:true}).json());
+      r.timer = await withTimeout(new Promise(res => setTimeout(() => res('t'), 10)));
+      self.postMessage(r);
+    };
+  `;
+  const url = URL.createObjectURL(new Blob([src], {type: "application/javascript"}));
+  const w = new Worker(url);
+  const wr = await new Promise(res => { w.onmessage = ev => res(ev.data); w.postMessage(1); });
+  log("bloburl_worker", wr);
+  // now boot nodepod and try inside the pod worker *after* nodepod boot, in a raw worker
+  const w2 = new Worker(url);
+  const wr2 = await new Promise(res => { w2.onmessage = ev => res(ev.data); w2.postMessage(1); });
+  log("bloburl_worker2", wr2);
+  window.__done = true;
+</script>
+</body></html>

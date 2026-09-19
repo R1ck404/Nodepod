@@ -6,6 +6,15 @@ import {
 } from "../polyfills/fetch-response";
 
 describe("patchFetchNodeAdapterExports", () => {
+  it("leaves null, undefined and primitive module exports alone", () => {
+    // lodash/_coreJsData.js exports undefined; other CJS modules export
+    // null, numbers or strings. None of those may throw.
+    expect(() => patchFetchNodeAdapterExports(undefined)).not.toThrow();
+    expect(() => patchFetchNodeAdapterExports(null)).not.toThrow();
+    expect(() => patchFetchNodeAdapterExports(42 as unknown as Record<string, unknown>)).not.toThrow();
+    expect(() => patchFetchNodeAdapterExports("x" as unknown as Record<string, unknown>)).not.toThrow();
+  });
+
   it("replaces setResponse on getRequest + setResponse export pairs", async () => {
     const original = async () => {};
     const exports: Record<string, unknown> = {

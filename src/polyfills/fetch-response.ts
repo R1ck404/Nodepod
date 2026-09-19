@@ -187,8 +187,13 @@ export function installNodeFetchClassParity(): void {
  * realms even after Headers parity is installed.
  */
 export function patchFetchNodeAdapterExports(
-  exports: Record<string, unknown>,
+  exports: Record<string, unknown> | null | undefined,
 ): void {
+  // CommonJS modules may export null/undefined or a primitive
+  // (lodash/_coreJsData.js is one); there is nothing to patch on those.
+  if (exports == null || (typeof exports !== "object" && typeof exports !== "function")) {
+    return;
+  }
   if (
     typeof exports.getRequest === "function" &&
     typeof exports.setResponse === "function"

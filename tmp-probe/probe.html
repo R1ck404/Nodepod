@@ -1,0 +1,81 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>probe</title></head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from "/dist/index.mjs";
+  const log = (...a) => { document.querySelector("#log").textContent += a.join(" ") + "\n"; };
+  window.__results = {};
+  const pod = await Nodepod.boot({
+    swUrl: "/__sw__.js",
+    watermark: false,
+    workdir: "/workspace",
+    files: {
+      "/workspace/server.mjs": `
+        import http from "node:http";
+        http.createServer((req, res) => {
+          if (req.url === "/api/export") {
+            res.setHeader("content-type", "text/csv");
+            res.end(["a,b","1,2",""].join(String.fromCharCode(10)));
+            return;
+          }
+          if (req.url.startsWith("/api/")) {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ok:true, url:req.url}));
+            return;
+          }
+          res.setHeader("content-type", "text/html");
+          res.end('<!doctype html><html><head><title>t</title></head><body><h1>index</h1><a id="dl" href="/api/export" download="export.csv">dl</a></body></html>');
+        }).listen(3000);
+      `,
+      "/workspace/probe.mjs": "export const marker = 'probe-ok';\n",
+      "/workspace/resp.mjs": `
+console.log('request', await new Request('http://localhost/probe', { method: 'POST', body: JSON.stringify({ok:true}) }).json());
+console.log('before response body');
+console.log('response', await Response.json({ok:true}).json());
+console.log('text', await new Response('hi').text());
+console.log('before fetch');
+const r = await fetch('http://localhost:3000/api/probe');
+console.log('status', r.status);
+console.log('body', await r.text());
+const r2 = await fetch('/api/probe2');
+console.log('status2', r2.status);
+console.log('body2', await r2.text());
+`,
+    },
+  });
+  window.pod = pod;
+  const server = await pod.spawn("node", ["server.mjs"], { cwd: "/workspace" });
+  await new Promise(r => setTimeout(r, 1500));
+  log("server started");
+
+  async function run(name, cmd, args, timeoutMs = 10000) {
+    const proc = await pod.spawn(cmd, args, { cwd: "/workspace" });
+    let out = "", err = "";
+    proc.on("output", c => { out += c; });
+    proc.on("error", c => { err += c; });
+    const t0 = Date.now();
+    const result = await Promise.race([
+      proc.completion.then(r => ({ ...r, timedOut: false })),
+      new Promise(r => setTimeout(() => r({ timedOut: true, stdout: out, stderr: err }), timeoutMs)),
+    ]);
+    let killSettled = null;
+    if (result.timedOut) {
+      proc.kill();
+      killSettled = await Promise.race([
+        proc.completion.then(r => ({ settled: true, exitCode: r.exitCode })),
+        new Promise(r => setTimeout(() => r({ settled: false }), 3000)),
+      ]);
+    }
+    const rec = { ...result, killSettled, ms: Date.now() - t0 };
+    window.__results[name] = rec;
+    log(name, JSON.stringify(rec));
+  }
+
+  await run("response-body", "node", ["resp.mjs"]);
+  await run("eval-relative-import", "node", ["-e", "import('./probe.mjs').then(m=>console.log(m.marker))"]);
+  await run("eval-require-relative", "node", ["-e", "console.log(require('./probe.mjs').marker)"]);
+  window.__done = true;
+  log("done");
+</script>
+</body></html>

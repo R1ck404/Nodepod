@@ -150,6 +150,9 @@ export interface MainToWorker_HttpClientResponse {
   statusMessage: string;
   headers: Record<string, string | string[]>;
   body: string | ArrayBuffer;
+  // no virtual server listens on the requested port: the client should see
+  // ECONNREFUSED (node parity) rather than a synthetic HTTP status
+  connectionRefused?: boolean;
 }
 
 export interface MainToWorker_IPC {

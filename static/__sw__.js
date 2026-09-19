@@ -35,6 +35,25 @@ let nextId = 1;
 // id -> { resolve, reject, port }
 const pending = new Map();
 
+// Same-origin paths the host reserves for itself (its own pages, the module
+// URLs those pages load). Never proxied, whatever the claim map says: a
+// preview that claimed "/" must not capture the document that boots the
+// host's next runtime. Exact paths, or prefixes when they end with "/".
+// Union across tabs; a tab re-sends its set on every init.
+const reservedHostPaths = new Set();
+
+function isReservedHostPath(pathname) {
+  if (reservedHostPaths.size === 0) return false;
+  for (const reserved of reservedHostPaths) {
+    if (reserved.endsWith("/")) {
+      if (pathname === reserved || pathname.startsWith(reserved)) return true;
+    } else if (pathname === reserved) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // one entry per connected tab. MessagePort ->
 // { token, instances: Set<string>, relayPort?: MessagePort }
 const ports = new Map();
@@ -155,6 +174,33 @@ function lookupPodForClaimedPath(pathname) {
     const idx = path.lastIndexOf("/");
     path = idx <= 0 ? "/" : path.slice(0, idx);
   }
+}
+
+// pod owning the adopted preview document currently shown at `docUrl`
+// (origin + path + query, the shape a Referer header carries), or null when
+// no such client exists — e.g. the URL belongs to the host page.
+async function resolvePodForPreviewDocument(docUrl) {
+  let clients;
+  try {
+    clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  } catch {
+    return null;
+  }
+  const wanted = docUrl.origin + stripPreviewPrefix(docUrl.pathname) + docUrl.search;
+  for (const client of clients) {
+    const pod = previewClients.get(client.id);
+    if (!pod) continue;
+    let clientUrl;
+    try {
+      clientUrl = new URL(client.url);
+    } catch {
+      continue;
+    }
+    if (clientUrl.origin + stripPreviewPrefix(clientUrl.pathname) + clientUrl.search === wanted) {
+      return pod;
+    }
+  }
+  return null;
 }
 
 // A preview document navigated via an explicit /__virtual__/ or /__preview__/
@@ -415,6 +461,20 @@ function claimInstance(mp, instanceId) {
   ports.get(mp).instances.add(instanceId);
 }
 
+// forget every routing hint that points at an instance: its path claims,
+// adopted preview clients and last-active marker. a released or reloaded
+// instance must not keep capturing paths it used to serve.
+function forgetInstanceRouting(instanceId) {
+  for (const [path, pod] of [...pathClaims]) {
+    if (pod && pod.instanceId === instanceId) pathClaims.delete(path);
+  }
+  for (const [clientId, pod] of [...previewClients]) {
+    if (pod && pod.instanceId === instanceId) previewClients.delete(clientId);
+  }
+  if (lastActivePod && lastActivePod.instanceId === instanceId) lastActivePod = null;
+  instanceServers.delete(instanceId);
+}
+
 // only release if this port still owns it. a newer tab may have reclaimed it
 function releaseInstance(mp, instanceId) {
   if (instancePorts.get(instanceId) === mp) {
@@ -422,6 +482,7 @@ function releaseInstance(mp, instanceId) {
     previewScripts.delete(instanceId);
     previewInspectorScripts.delete(instanceId);
     wsTokens.delete(instanceId);
+    forgetInstanceRouting(instanceId);
     if (
       !registeredOriginPod &&
       originPod &&
@@ -444,6 +505,7 @@ function cleanupPort(mp) {
         previewScripts.delete(id);
         previewInspectorScripts.delete(id);
         wsTokens.delete(id);
+        forgetInstanceRouting(id);
         if (
           !registeredOriginPod &&
           originPod &&
@@ -835,6 +897,13 @@ function onPortMessage(event, mp) {
     cleanupPort(mp);
     return;
   }
+  if (msg.type === "reserve-host-paths" && msg.data && Array.isArray(msg.data.paths)) {
+    for (const raw of msg.data.paths) {
+      if (typeof raw !== "string" || raw.charAt(0) !== "/") continue;
+      reservedHostPaths.add(raw);
+    }
+    return;
+  }
 
   if (msg.type === "bind-origin" && msg.data) {
     const data = msg.data;
@@ -971,6 +1040,11 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // Host-reserved infrastructure documents are always served by the host.
+  if (url.origin === self.location.origin && isReservedHostPath(url.pathname)) {
+    return;
+  }
+
   // Dedicated hostname preview: the origin itself is the routing key, so all
   // same-origin app traffic can go straight to its bound virtual server.
   if (originPod && url.origin === self.location.origin) {
@@ -1009,6 +1083,22 @@ self.addEventListener("fetch", (event) => {
       proxyToVirtualServer(request, instanceId, serverPort, path),
     );
     return;
+  }
+
+  // Requests issued by a reserved host document (its referrer is the reserved
+  // path) are the host's own module/asset loads. Explicitly prefixed preview
+  // URLs already routed above, so an embedded preview inside such a document
+  // still works.
+  if (reservedHostPaths.size > 0 && request.referrer) {
+    try {
+      const referrer = new URL(request.referrer);
+      if (
+        referrer.origin === self.location.origin &&
+        isReservedHostPath(referrer.pathname)
+      ) {
+        return;
+      }
+    } catch {}
   }
 
   // 2. only same-origin (and localhost-alias) URLs can belong to a pod;
@@ -1110,10 +1200,32 @@ self.addEventListener("fetch", (event) => {
     return; // unattributed → host
   }
 
+  const dest = request.destination;
+
+  // 6a. download from a preview document (<a download>, or a navigation the
+  //     server answers with Content-Disposition). Chrome issues these as a
+  //     navigate-mode request with an empty destination and no client of
+  //     their own, so steps 3/5 cannot see the page. The Referer is the
+  //     preview document's stripped URL: attribute through the claim map so
+  //     the bytes come from the pod instead of the host's SPA fallback.
+  //     Only a document we adopted as a preview client qualifies; the host
+  //     page shares the origin and may sit on the very same path, and its
+  //     own downloads must keep going to the host.
+  if (dest === "" && refUrl && previewClients.size > 0) {
+    event.respondWith(
+      (async () => {
+        const pod = await resolvePodForPreviewDocument(refUrl);
+        if (!pod) return fetch(request);
+        const path = stripPreviewPrefix(url.pathname) + url.search;
+        return proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request);
+      })(),
+    );
+    return;
+  }
+
   // 6. iframe/frame document navigation at a stripped URL. top-level host
   //    navigations never match. when pathClaims is empty (SW update wiped
   //    state), fall back to resolvePodFromLiveInstances for preview reloads.
-  const dest = request.destination;
   if (dest === "iframe" || dest === "frame") {
     // live-instance recovery only when pathClaims is empty; if claims exist
     // and none match, the frame isn't a preview — let the host serve it.
@@ -1446,6 +1558,90 @@ function getLocationPatchScript(instanceId, serverPort) {
     });
   }
 
+  // <a download> — Chrome issues anchor downloads with service workers
+  // skipped, so the request reaches the physical host (whose SPA fallback
+  // answers with its own HTML) instead of this pod's server. Neither the
+  // virtual prefix nor the hostname SW can see it. Fetch the same-origin
+  // URL ourselves (fetch() is routed through the SW), then hand the bytes
+  // to the browser as an object URL. Applies to both preview modes.
+  var NATIVE_DL = 'data-nodepod-native-download';
+  var origClick = HTMLElement.prototype.click;
+  function downloadTarget(el) {
+    if (!el || el.nodeName !== 'A' || !el.hasAttribute('download')) return null;
+    if (el.hasAttribute(NATIVE_DL)) return null;
+    var raw = el.getAttribute('href');
+    if (!raw) return null;
+    var u;
+    try { u = new URL(raw, location.href); } catch (e) { return null; }
+    if (u.origin !== location.origin) return null;
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u;
+  }
+  function filenameFor(el, u, response) {
+    var name = el.getAttribute('download');
+    if (name) return name;
+    var cd = '';
+    try { cd = response.headers.get('content-disposition') || ''; } catch (e) {}
+    var m = /filename\\*=(?:UTF-8|utf-8)''([^;]+)/.exec(cd);
+    if (m) { try { return decodeURIComponent(m[1].trim()); } catch (e) {} }
+    m = /filename="?([^";]+)"?/.exec(cd);
+    if (m) return m[1].trim();
+    var seg = u.pathname.split('/').pop();
+    return seg ? decodeURIComponent(seg) : 'download';
+  }
+  function nativeDownload(el) {
+    // fall back to the browser's own download of the original href
+    try {
+      el.setAttribute(NATIVE_DL, '1');
+      origClick.call(el);
+    } finally {
+      el.removeAttribute(NATIVE_DL);
+    }
+  }
+  function podDownload(el, u) {
+    var href = strip(u.pathname) + u.search + u.hash;
+    fetch(href, { credentials: 'include' }).then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.blob().then(function(blob) {
+        var a = document.createElement('a');
+        a.setAttribute(NATIVE_DL, '1');
+        a.href = URL.createObjectURL(blob);
+        a.download = filenameFor(el, u, res);
+        document.body.appendChild(a);
+        origClick.call(a);
+        setTimeout(function() {
+          URL.revokeObjectURL(a.href);
+          if (a.parentNode) a.parentNode.removeChild(a);
+        }, 10000);
+      });
+    }).catch(function(err) {
+      console.warn('[nodepod] download via fetch failed, using native download:', err);
+      nativeDownload(el);
+    });
+  }
+  document.addEventListener('click', function(ev) {
+    if (ev.defaultPrevented || ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
+    var el = ev.target;
+    while (el && el.nodeName !== 'A') el = el.parentNode;
+    var u = downloadTarget(el);
+    if (!u) return;
+    ev.preventDefault();
+    podDownload(el, u);
+  });
+  // programmatic downloads usually click a detached anchor, which never
+  // bubbles to the document listener
+  try {
+    HTMLElement.prototype.click = function() {
+      var u = downloadTarget(this);
+      if (u) {
+        podDownload(this, u);
+        return;
+      }
+      return origClick.apply(this, arguments);
+    };
+  } catch (e) {}
+
   // A hostname preview already has a clean URL and its SW is explicitly bound
   // to one pod. Leave native history, links, and forms completely untouched.
   if (!PREFIX) {
@@ -1491,7 +1687,7 @@ function getLocationPatchScript(instanceId, serverPort) {
     while (el && el.nodeName !== 'A') el = el.parentNode;
     if (!el || !el.getAttribute) return;
     if (el.target && el.target !== '' && el.target !== '_self') return;
-    if (el.hasAttribute('download')) return;
+    if (el.hasAttribute('download')) return; // handled by the download interceptor above
     var raw = el.getAttribute('href');
     if (!raw || raw.charAt(0) !== '/' || raw.charAt(1) === '/') return;
     ev.preventDefault();
@@ -1641,6 +1837,19 @@ function errorPage(status, title, message) {
 }
 
 // ── Virtual server proxy ──
+
+const DOCUMENT_DESTINATIONS = new Set(["document", "iframe", "frame", "embed", "object"]);
+
+// true for requests whose response becomes a browsing-context document, i.e.
+// where the injected location/WebSocket/timing shims can and should run.
+// fetch()/XHR have an empty destination and mode "cors"/"same-origin".
+function isDocumentRequest(request) {
+  if (!request) return false;
+  if (DOCUMENT_DESTINATIONS.has(request.destination)) return true;
+  // navigate-mode with an empty destination is a download (<a download>,
+  // Content-Disposition): bytes go to disk, never into a document
+  return false;
+}
 
 async function proxyToVirtualServer(request, instanceId, serverPort, path, originalRequest) {
   // route to whichever tab owns this instanceId
@@ -1809,9 +2018,14 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     // Inject WebSocket shim + preview script into HTML responses so that
     // browser-side WebSocket connections are routed through nodepod, and
     // user-provided preview scripts run before any page content.
+    //
+    // Only documents get the injection. An app's fetch()/XHR that lands on
+    // the SPA fallback (an unregistered API route returning index.html)
+    // must see the server's bytes unchanged; otherwise every such error
+    // surfaces as kilobytes of shim instead of the HTML the route returned.
     let finalBody = responseBody;
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
-    if (ct.includes("text/html") && responseBody) {
+    if (ct.includes("text/html") && responseBody && isDocumentRequest(originalRequest || request)) {
       // location patch runs first so user scripts see the stripped URL
       let injection =
         getNavTimingPatchScript(responseBody.byteLength) +

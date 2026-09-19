@@ -422,6 +422,9 @@ export class Nodepod {
     } else if (opts.watermark === false) {
       proxy.setWatermark(false);
     }
+    if (opts.reservedHostPaths?.length) {
+      proxy.reserveHostPaths(opts.reservedHostPaths);
+    }
 
     if (host.createHttpIngress) {
       const ingress = host.createHttpIngress({
@@ -574,16 +577,24 @@ export class Nodepod {
     });
 
     proc._setSendStdin((data: string) => handle.sendStdin(data));
-    proc._setKillFn(() => handle.kill("SIGINT"));
+    // PM.kill() delivers SIGINT, escalates to SIGKILL (worker termination)
+    // when the worker does not exit on its own, kills descendants and frees
+    // server ports. A bare SIGINT is just a postMessage: if the worker's
+    // event loop is wedged the message is never read and `completion`
+    // would stay pending forever.
+    const killProcess = () => {
+      if (!this._processManager.kill(handle.pid, "SIGINT")) {
+        handle.kill("SIGKILL");
+      }
+    };
+    proc._setKillFn(killProcess);
 
     if (opts?.signal) {
-      opts.signal.addEventListener(
-        "abort",
-        () => {
-          handle.kill("SIGINT");
-        },
-        { once: true },
-      );
+      if (opts.signal.aborted) {
+        killProcess();
+      } else {
+        opts.signal.addEventListener("abort", killProcess, { once: true });
+      }
     }
 
     await new Promise<void>((resolve) => {
