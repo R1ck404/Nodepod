@@ -26,6 +26,20 @@ describe("Bash-compatible shell front-end", () => {
     expect(result.stdout).toBe("a\nb\n");
   });
 
+  it("keeps single quotes literal inside double quotes", async () => {
+    const { shell } = makeShell();
+    // bash: only $ ` \ " and <newline> are special inside "..."; the single
+    // quotes (and globs, tildes) are handed to the program untouched, so
+    // `node -e "console.log('a')"` receives a valid JS string literal.
+    const single = await shell.exec("x=1; echo \"it's $x '*' ~ \\\"q\\\"\"");
+    expect(single.exitCode).toBe(0);
+    expect(single.stdout).toBe("it's 1 '*' ~ \"q\"\n");
+
+    const nested = await shell.exec("sh -c \"printf %s '\\\"a b\\\"'\"");
+    expect(nested.exitCode).toBe(0);
+    expect(nested.stdout).toBe("\"a b\"");
+  });
+
   it("supports pipefail and PIPESTATUS", async () => {
     const { shell } = makeShell();
     const result = await shell.exec("set -o pipefail; false | true; echo $? $PIPESTATUS");

@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Nodepod host routing harness</title>
+  </head>
+  <body>
+    <p id="status">booting</p>
+    <iframe id="preview" style="width: 400px; height: 200px"></iframe>
+    <iframe id="hostframe" style="width: 400px; height: 200px"></iframe>
+    <script type="module">
+      // Boots a pod in /__virtual__/ preview mode (the mode where the service
+      // worker claims host paths for the preview client) next to a plain host
+      // iframe. `?reserve=1` passes `reservedHostPaths` so the host page and
+      // its requests stay out of pod routing while the pod is live; without
+      // it the spec checks that releasing the pod drops its claims.
+      import { Nodepod } from "/dist/index.mjs";
+
+      const status = document.querySelector("#status");
+      const preview = document.querySelector("#preview");
+      const reserve = new URLSearchParams(location.search).get("reserve") === "1";
+      const files = {
+        "/workspace/server.mjs": `
+          import http from "node:http";
+          http.createServer((req, res) => {
+            res.setHeader("content-type", "text/html");
+            res.end('<!doctype html><html><head><title>pod</title></head><body><h1>pod app</h1></body></html>');
+          }).listen(3000);
+        `,
+      };
+
+      async function bootPod() {
+        let readyUrl = null;
+        const pod = await Nodepod.boot({
+          swUrl: "/__sw__.js",
+          watermark: false,
+          previewOrigin: false,
+          workdir: "/workspace",
+          files,
+          reservedHostPaths: reserve ? ["/tests/browser/host-frame.html", "/tests/browser/"] : undefined,
+          onServerReady(port, url) {
+            if (port === 3000) readyUrl = url;
+          },
+        });
+        await pod.spawn("node", ["server.mjs"], { cwd: "/workspace" });
+        while (!readyUrl) await new Promise((r) => setTimeout(r, 50));
+        return { pod, url: readyUrl };
+      }
+
+      const first = await bootPod();
+      window.first = first;
+      preview.src = first.url;
+      status.textContent = first.url;
+      status.dataset.ready = "true";
+      window.disposeFirst = async () => {
+        first.pod.teardown();
+      };
+      window.bootSecond = async () => {
+        const second = await bootPod();
+        window.second = second;
+        return second.url;
+      };
+    </script>
+  </body>
+</html>

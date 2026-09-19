@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Nodepod runtime reliability harness</title>
+  </head>
+  <body>
+    <p id="status">booting</p>
+    <pre id="log"></pre>
+    <script type="module">
+      // Regression harness for the in-pod runtime behaviours that only show
+      // up in a real browser worker (body reads settle from browser tasks,
+      // kill() must terminate a wedged worker, ...). Each case is a spawn;
+      // results are collected on window.__results for the Playwright spec.
+      import { Nodepod } from "/dist/index.mjs";
+
+      const status = document.querySelector("#status");
+      const logEl = document.querySelector("#log");
+      const log = (...a) => {
+        logEl.textContent += a.join(" ") + "\n";
+      };
+      window.__results = {};
+
+      const pod = await Nodepod.boot({
+        swUrl: "/__sw__.js",
+        watermark: false,
+        workdir: "/workspace",
+        files: {
+          "/workspace/server.mjs": `
+            import http from "node:http";
+            http.createServer((req, res) => {
+              res.setHeader("content-type", "application/json");
+              res.end(JSON.stringify({ ok: true, url: req.url }));
+            }).listen(3000);
+          `,
+          "/workspace/lib.mjs": "export const marker = 'lib-ok';\n",
+          "/workspace/bodies.mjs": `
+            console.log('request', JSON.stringify(await new Request('http://localhost/x', { method: 'POST', body: '{"a":1}' }).json()));
+            console.log('response', JSON.stringify(await Response.json({ b: 2 }).json()));
+            console.log('text', await new Response('hi').text());
+            console.log('blob', await new Blob(['blob-text']).text());
+            const chunk = await new Response('rd').body.getReader().read();
+            console.log('reader', chunk.done, new TextDecoder().decode(chunk.value));
+            const r = await fetch('http://localhost:3000/api/probe');
+            console.log('status', r.status);
+            console.log('body', await r.text());
+          `,
+        },
+      });
+      window.pod = pod;
+
+      const server = await pod.spawn("node", ["server.mjs"], { cwd: "/workspace" });
+      await new Promise((resolve) => {
+        const seen = () => resolve();
+        // onServerReady is boot-scoped; poll the port table instead so the
+        // harness does not depend on callback ordering.
+        const tick = () => (pod.port(3000) ? seen() : setTimeout(tick, 50));
+        tick();
+      });
+      log("server ready on 3000");
+
+      async function run(name, cmd, args, { timeoutMs = 10_000, expectTimeout = false } = {}) {
+        const proc = await pod.spawn(cmd, args, { cwd: "/workspace" });
+        let stdout = "";
+        let stderr = "";
+        proc.on("output", (c) => (stdout += c));
+        proc.on("error", (c) => (stderr += c));
+        const t0 = Date.now();
+        const result = await Promise.race([
+          proc.completion.then((r) => ({ ...r, timedOut: false })),
+          new Promise((r) => setTimeout(() => r({ timedOut: true, stdout, stderr }), timeoutMs)),
+        ]);
+        let kill = null;
+        if (result.timedOut) {
+          const tk = Date.now();
+          proc.kill();
+          kill = await Promise.race([
+            proc.completion.then((r) => ({ settled: true, exitCode: r.exitCode, ms: Date.now() - tk })),
+            new Promise((r) => setTimeout(() => r({ settled: false }), 5_000)),
+          ]);
+        }
+        const rec = { ...result, kill, ms: Date.now() - t0, expectTimeout };
+        window.__results[name] = rec;
+        log(name, JSON.stringify(rec));
+        return rec;
+      }
+
+      // A: bodies of Request/Response/Blob/fetch settle inside a top-level
+      // await with nothing else keeping the loop alive; in-pod fetch to
+      // localhost:PORT reaches the virtual server.
+      await run("bodies", "node", ["bodies.mjs"]);
+      await run("fetch-then-chain", "node", [
+        "-e",
+        "fetch('data:text/plain,chain').then(r => r.text()).then(t => console.log('got', t))",
+      ]);
+      await run("blob-then-chain", "node", [
+        "-e",
+        "new Blob(['b']).text().then(t => console.log('got', t))",
+      ]);
+
+      // A: kill() always settles completion, even when the worker is busy.
+      const killOpts = { timeoutMs: 1_500, expectTimeout: true };
+      await run("kill-interval", "node", ["-e", "setInterval(() => {}, 1000); console.log('started')"], killOpts);
+      await run("kill-busy-loop", "node", ["-e", "console.log('busy'); while (true) {}"], killOpts);
+      await run(
+        "kill-pending-body",
+        "node",
+        ["-e", "console.log('x'); await new Blob(['hi']).text(); await new Promise(() => {})"],
+        killOpts,
+      );
+
+      // top-level awaits resolved from macrotask sources exit cleanly.
+      await run("tla-immediate", "node", [
+        "-e",
+        "const v = await new Promise((r) => setImmediate(() => r('imm'))); console.log('got', v)",
+      ]);
+      await run("tla-messageport-close", "node", [
+        "-e",
+        "const v = await new Promise((r) => { const mc = new MessageChannel(); mc.port1.onmessage = (ev) => { r(ev.data); mc.port1.close(); }; mc.port2.postMessage('x'); }); console.log('got', v)",
+      ]);
+
+      // E: `node -e` resolves relative specifiers from the cwd.
+      await run("eval-import-relative", "node", ["-e", "import('./lib.mjs').then(m => console.log(m.marker))"]);
+      await run("eval-require-relative", "node", ["-e", "console.log(require('./lib.mjs').marker)"]);
+
+      // shell: single quotes inside double quotes reach the program intact.
+      await run("shell-nested-quotes", "sh", ["-c", "node -e \"console.log('quoted', 1 + 1)\""]);
+
+      server.kill();
+      window.__done = true;
+      status.textContent = "done";
+      status.dataset.done = "true";
+    </script>
+  </body>
+</html>

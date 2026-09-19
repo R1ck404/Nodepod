@@ -1,6 +1,0 @@
-<!doctype html><html><head><meta charset="UTF-8"><title>host frame</title></head>
-<body><h1 id="hf">host frame ok</h1>
-<script>
-  fetch('/tmp-probe/host.txt').then(r => r.text()).then(t => { document.body.dataset.fetched = t.trim(); }).catch(e => { document.body.dataset.fetched = 'ERR ' + e; });
-</script>
-</body></html>

@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>host frame</title>
+  </head>
+  <body>
+    <h1 id="hf">host frame ok</h1>
+    <script>
+      // Embedder infrastructure page: must be served by the host, never by a
+      // pod's service-worker route claim, and so must its own fetches.
+      fetch("/tests/browser/host-file.txt")
+        .then((r) => r.text())
+        .then((t) => {
+          document.body.dataset.fetched = t.trim();
+        })
+        .catch((e) => {
+          document.body.dataset.fetched = "ERR " + e;
+        });
+    </script>
+  </body>
+</html>
