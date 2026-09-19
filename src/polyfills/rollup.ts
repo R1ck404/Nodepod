@@ -7,6 +7,7 @@ import {
   PINNED_ROLLUP_BROWSER,
   cdnImport,
 } from "../constants/cdn-urls";
+import { withHandle } from "../helpers/event-loop";
 
 // acorn parser extended with JSX support
 const acornJsxParser = (acorn.Parser as any).extend(acornJsx());
@@ -30,7 +31,9 @@ async function ensureRollup(): Promise<unknown> {
   if (cachedRollup) return cachedRollup;
   if (loadingPromise) return loadingPromise;
 
-  loadingPromise = (async () => {
+  // the CDN import settles from the network, not from a tracked handle:
+  // without a handle `vite build` exits 0 here before rollup ever runs
+  loadingPromise = withHandle("DynamicImport", async () => {
     try {
       const mod = await cdnImport(CDN_ROLLUP_BROWSER);
       cachedRollup = mod;
@@ -41,7 +44,7 @@ async function ensureRollup(): Promise<unknown> {
         `rollup: failed to load @rollup/browser from CDN -- ${err}`,
       );
     }
-  })();
+  });
 
   return loadingPromise;
 }
@@ -54,7 +57,12 @@ export async function rollup(inputOptions: unknown): Promise<unknown> {
   const r = (await ensureRollup()) as {
     rollup: (o: unknown) => Promise<unknown>;
   };
-  const bundle = (await r.rollup(inputOptions)) as any;
+  // @rollup/browser parses through WebAssembly; hold a handle across the
+  // build and each generate() so those awaits cannot drain the loop
+  const bundle = (await withHandle("WASMWork", () => r.rollup(inputOptions))) as any;
+  const generate = bundle.generate.bind(bundle);
+  bundle.generate = (outputOptions: any) =>
+    withHandle("WASMWork", () => generate(outputOptions));
 
   bundle.write = async function (outputOptions: any) {
     const result = await bundle.generate(outputOptions);

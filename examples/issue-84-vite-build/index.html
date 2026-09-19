@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nodepod - issue #84 vite build exits before writing dist</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+    h1 { font-size: 18px; margin-bottom: 4px; color: #fff; }
+    p { font-size: 13px; color: #888; margin-bottom: 12px; max-width: 950px; }
+    a { color: #8ac4e6; }
+    code { background: #0d0d1a; padding: 2px 6px; border-radius: 3px; color: #a8e6a3; font-size: 12px; }
+    #status { font-size: 14px; font-weight: bold; margin-bottom: 12px; }
+    #output {
+      background: #0d0d1a; border: 1px solid #333; border-radius: 6px; padding: 12px;
+      white-space: pre-wrap; font-size: 12px; line-height: 1.55; overflow-y: auto; max-height: 70vh;
+    }
+    .stdout { color: #a8e6a3; }
+    .stderr { color: #e68a8a; }
+    .info { color: #8ac4e6; }
+    .dim { color: #666; }
+    .pass { color: #a8e6a3; font-weight: bold; }
+    .fail { color: #e68a8a; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>nodepod - issue <a href="https://github.com/R1ck404/Nodepod/issues/84">#84</a> - vite build exits 0 without writing dist</h1>
+  <p>
+    Reproduces the reporter's flow: a Vite + TypeScript project, <code>npm run build</code>
+    (and the in-process <code>build()</code> variant). Before the fix the process exited
+    <code>0</code> right after the <code>vite vX building for production...</code> banner
+    because the rollup polyfill's CDN import and wasm work held no event-loop handle, so
+    the wait loop drained and exited mid-build. Pass <code>?vite=5.4.20</code> to try another version.
+  </p>
+  <div id="status">running...</div>
+  <div id="output"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const out = document.getElementById("output");
+    const status = document.getElementById("status");
+    function log(text, cls = "stdout") {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = text + "\n";
+      out.appendChild(span);
+      out.scrollTop = out.scrollHeight;
+    }
+    function finish(pass, reason) {
+      status.textContent = (pass ? "PASS" : "FAIL") + (reason ? `: ${reason}` : "");
+      status.className = pass ? "pass" : "fail";
+      window.__issue84 = { pass, reason, results };
+    }
+
+    const viteVersion = new URLSearchParams(location.search).get("vite") || "6.4.3";
+    const results = {};
+    const SCRIPT_CLOSE = "</" + "script>";
+
+    const pod = await Nodepod.boot({
+      workdir: "/home",
+      files: {
+        "/home/package.json": JSON.stringify({
+          name: "issue84", version: "1.0.0", type: "module", private: true,
+          scripts: { build: "vite build" },
+          devDependencies: { vite: viteVersion },
+        }, null, 2),
+        "/home/index.html":
+          '<!doctype html><html><head><title>t</title></head><body><div id="app"></div>' +
+          '<script type="module" src="/src/main.ts">' + SCRIPT_CLOSE + "</body></html>",
+        "/home/src/main.ts":
+          "import { greet } from './greet';\n" +
+          "const el = document.getElementById('app') as HTMLElement;\n" +
+          "el.textContent = greet('nodepod');\n",
+        "/home/src/greet.ts": "export function greet(name: string): string { return `hello ${name}`; }\n",
+      },
+    });
+    window.pod = pod;
+
+    async function run(name, cmd, args) {
+      log(`\n$ ${cmd} ${args.join(" ")}`, "info");
+      const proc = await pod.spawn(cmd, args, { cwd: "/home" });
+      let stdout = "";
+      let stderr = "";
+      proc.on("output", (c) => { stdout += c; log(c.trimEnd()); });
+      proc.on("error", (c) => { stderr += c; log(c.trimEnd(), "stderr"); });
+      const t0 = Date.now();
+      const res = await proc.completion;
+      const rec = { exitCode: res.exitCode, ms: Date.now() - t0, stdout, stderr };
+      results[name] = rec;
+      log(`[${name}] exit=${rec.exitCode} in ${rec.ms}ms`, "dim");
+      return rec;
+    }
+
+    async function distFiles() {
+      if (!(await pod.fs.exists("/home/dist"))) return [];
+      const files = [];
+      const walk = async (dir) => {
+        for (const entry of await pod.fs.readdir(dir)) {
+          const p = `${dir}/${entry}`;
+          const st = await pod.fs.stat(p);
+          if (st.isDirectory) await walk(p);
+          else files.push(p);
+        }
+      };
+      await walk("/home/dist");
+      return files;
+    }
+
+    try {
+      const install = await run("install", "npm", ["install"]);
+      if (install.exitCode !== 0) throw new Error("npm install failed");
+
+      const build = await run("build", "npm", ["run", "build"]);
+      results.distAfterNpm = await distFiles();
+      log(`dist after npm run build: ${JSON.stringify(results.distAfterNpm)}`, "info");
+      if (build.exitCode !== 0) throw new Error(`npm run build exited ${build.exitCode}`);
+      if (!/✓ built in/.test(build.stdout)) throw new Error("vite summary line missing from stdout");
+      if (!results.distAfterNpm.includes("/home/dist/index.html")) throw new Error("dist/index.html missing after npm run build");
+      if (!results.distAfterNpm.some((f) => /^\/home\/dist\/assets\/index-.*\.js$/.test(f))) throw new Error("dist/assets bundle missing");
+
+      await pod.fs.rm("/home/dist", { recursive: true });
+      const prog = await run("programmatic", "node", ["--input-type=module", "-e",
+        "import { build } from 'vite'; await build({ root: process.cwd() }); console.log('programmatic build done');"]);
+      results.distAfterProgrammatic = await distFiles();
+      log(`dist after programmatic build: ${JSON.stringify(results.distAfterProgrammatic)}`, "info");
+      if (prog.exitCode !== 0) throw new Error(`programmatic build exited ${prog.exitCode}`);
+      if (!results.distAfterProgrammatic.includes("/home/dist/index.html")) throw new Error("dist/index.html missing after programmatic build");
+
+      finish(true, `vite ${viteVersion} wrote ${results.distAfterNpm.length} files`);
+    } catch (err) {
+      log(String(err && err.message || err), "fail");
+      finish(false, String(err && err.message || err));
+    }
+  </script>
+</body>
+</html>

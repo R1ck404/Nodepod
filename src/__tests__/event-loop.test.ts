@@ -7,6 +7,7 @@ import {
   createHandleRegistry,
   getRegistry,
   getGlobalRegistry,
+  withHandle,
 } from "../helpers/event-loop";
 
 describe("HandleRegistry - basics", () => {
@@ -265,5 +266,32 @@ describe("event-loop module - global registry", () => {
 
   it("getRegistry falls back to the global registry with no active context", () => {
     expect(getRegistry()).toBe(getGlobalRegistry());
+  });
+});
+
+describe("withHandle", () => {
+  it("keeps a refed handle for the duration of the work, then closes it", async () => {
+    const registry = getGlobalRegistry();
+    const before = registry.activeRefedCount();
+    let during = -1;
+    const result = await withHandle("DynamicImport", async () => {
+      during = registry.activeRefedCount();
+      await new Promise((r) => setTimeout(r, 5));
+      return "loaded";
+    });
+    expect(result).toBe("loaded");
+    expect(during).toBe(before + 1);
+    expect(registry.activeRefedCount()).toBe(before);
+  });
+
+  it("closes the handle when the work rejects", async () => {
+    const registry = getGlobalRegistry();
+    const before = registry.activeRefedCount();
+    await expect(
+      withHandle("WASMWork", async () => {
+        throw new Error("cdn unreachable");
+      }),
+    ).rejects.toThrow("cdn unreachable");
+    expect(registry.activeRefedCount()).toBe(before);
   });
 });

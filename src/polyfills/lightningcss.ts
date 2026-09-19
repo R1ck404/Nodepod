@@ -2,6 +2,7 @@
 // primary path is the npm package with VFS-to-CDN fallback for the large .wasm (see fetch patch in ScriptEngine)
 
 import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls";
+import { withHandle } from "../helpers/event-loop";
 
 // Bitfield constants -- must be available synchronously before WASM loads
 export const Features = {
@@ -43,7 +44,9 @@ async function ensureInit(): Promise<void> {
   if (wasmMod) return;
   if (initPromise) return initPromise;
 
-  initPromise = (async () => {
+  // CDN import + wasm init settle from browser tasks; keep the process
+  // alive across them (see withHandle)
+  initPromise = withHandle("DynamicImport", async () => {
     try {
       const mod = await cdnImport(CDN_LIGHTNINGCSS_WASM);
       if (typeof mod.default === "function") {
@@ -56,7 +59,7 @@ async function ensureInit(): Promise<void> {
       initPromise = null;
       throw new Error(`lightningcss: WASM initialization failed -- ${err}`);
     }
-  })();
+  });
 
   return initPromise;
 }

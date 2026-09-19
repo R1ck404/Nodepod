@@ -237,3 +237,18 @@ export function getGlobalRegistry(): HandleRegistry {
 export function createHandleRegistry(): HandleRegistry {
   return new RegistryImpl();
 }
+
+/**
+ * Hold a refed handle for the lifetime of `work`. Anything that settles from
+ * a browser task rather than a tracked node handle (CDN imports, WebAssembly
+ * compiles, wasm-backed engines) must go through this, or the process wait
+ * loop sees an empty registry mid-await and exits early with code 0.
+ */
+export async function withHandle<T>(type: HandleType, work: () => Promise<T>): Promise<T> {
+  const h = getRegistry().register(type);
+  try {
+    return await work();
+  } finally {
+    h.close();
+  }
+}
