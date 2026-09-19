@@ -101,12 +101,14 @@ export async function fetchWithRetry(
       }
       lastStatus = response.status;
       lastFailure = `HTTP ${response.status}`;
-      // drain so the connection can be reused
-      try {
-        await response.arrayBuffer();
-      } catch {
-        /* ignore */
-      }
+      // drain so the connection can be reused, but never wait on an error
+      // body longer than the attempt itself was allowed to take
+      await Promise.race([
+        response.arrayBuffer().then(() => undefined, () => undefined),
+        sleep(Math.min(options.timeoutMs, 2_000)).then(() => {
+          response.body?.cancel().catch(() => {});
+        }),
+      ]);
     } catch (error) {
       if (callerSignal?.aborted) {
         throw new RegistryFetchError(`${label}: request aborted`, url, null, attempt);

@@ -104,6 +104,8 @@ On local loopback hosts, `previewOrigin: 'auto'` can use isolated localhost subd
 
 Setting `previewOrigin: false` retains path-based URLs. Setting `serviceWorker: false` disables navigable previews entirely but leaves programmatic requests available.
 
+With path-based URLs a preview can claim broad paths such as `/`. Host pages that live next to previews on the same origin (a runtime host document, the module URLs it loads) can be kept out of pod routing with `reservedHostPaths: ['/runtime.html', '/src/']` — exact paths, or prefixes when they end in `/`. Requests issued by a document at a reserved path go to the host as well.
+
 ## Headless execution
 
 Headless mode is the same core runtime with UI-oriented defaults turned off:

@@ -50,13 +50,9 @@
       window.pod = pod;
 
       const server = await pod.spawn("node", ["server.mjs"], { cwd: "/workspace" });
-      await new Promise((resolve) => {
-        const seen = () => resolve();
-        // onServerReady is boot-scoped; poll the port table instead so the
-        // harness does not depend on callback ordering.
-        const tick = () => (pod.port(3000) ? seen() : setTimeout(tick, 50));
-        tick();
-      });
+      // onServerReady is boot-scoped; poll the port table instead so the
+      // harness does not depend on callback ordering.
+      while (!pod.port(3000)) await new Promise((r) => setTimeout(r, 50));
       log("server ready on 3000");
 
       async function run(name, cmd, args, { timeoutMs = 10_000, expectTimeout = false } = {}) {
