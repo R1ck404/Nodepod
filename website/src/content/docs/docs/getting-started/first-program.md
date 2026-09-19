@@ -36,7 +36,7 @@ await process.completion;
 `Nodepod.boot()` creates an isolated runtime instance and seeds its in-memory filesystem. `spawn()` creates a worker-backed process. Always release an instance when your application no longer needs it:
 
 ```ts
-nodepod.teardown();
+await nodepod.teardown();
 ```
 
 ## Choose service-worker behaviour

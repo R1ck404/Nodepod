@@ -229,3 +229,119 @@ describe("npx persist flag intent", () => {
     expect(names.some((n) => n.includes("https://"))).toBe(false);
   });
 });
+
+describe("npm lifecycle output routing", () => {
+  afterEach(() => {
+    clearStreamingCallbacks();
+    setSpawnChildCallback(null);
+  });
+
+  it("writes pre/main/post script headers to stdout", async () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/app", { recursive: true });
+    volume.writeFileSync(
+      "/app/package.json",
+      JSON.stringify({
+        name: "routing-test",
+        version: "1.0.0",
+        scripts: {
+          predev: "echo pre",
+          dev: "echo main",
+          postdev: "echo post",
+        },
+      }),
+    );
+    initShellExec(volume, { cwd: "/app" });
+
+    const streamedStdout: string[] = [];
+    const streamedStderr: string[] = [];
+    setStreamingCallbacks({
+      onStdout: (text) => streamedStdout.push(text),
+      onStderr: (text) => streamedStderr.push(text),
+    });
+
+    const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      shellExec("npm run dev", {}, (error, stdout, stderr) => {
+        if (error) reject(error);
+        else resolve({ stdout, stderr });
+      });
+    });
+
+    expect(result.stdout).toContain("> routing-test@1.0.0 predev");
+    expect(result.stdout).toContain("> routing-test@1.0.0 dev");
+    expect(result.stdout).toContain("> routing-test@1.0.0 postdev");
+    expect(result.stderr).toBe("");
+    expect(streamedStdout.join("")).toContain("> routing-test@1.0.0 dev");
+    expect(streamedStderr.join("")).not.toContain("routing-test@1.0.0");
+  });
+
+  it("keeps command failures on stderr without moving the lifecycle header", async () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/app", { recursive: true });
+    volume.writeFileSync(
+      "/app/package.json",
+      JSON.stringify({
+        name: "routing-test",
+        version: "1.0.0",
+        scripts: { dev: "cat /missing" },
+      }),
+    );
+    initShellExec(volume, { cwd: "/app" });
+
+    const result = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
+      shellExec("npm run dev", {}, (error, stdout, stderr) => {
+        resolve({ error, stdout, stderr });
+      });
+    });
+
+    expect(result.error).not.toBeNull();
+    expect(result.stdout).toContain("> routing-test@1.0.0 dev");
+    expect(result.stderr).toContain("No such file or directory");
+    expect(result.stderr).not.toContain("> routing-test@1.0.0 dev");
+  });
+
+  it("drops the lifecycle banners with -s/--silent, in any position", async () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/app", { recursive: true });
+    volume.writeFileSync(
+      "/app/package.json",
+      JSON.stringify({
+        name: "routing-test",
+        version: "1.0.0",
+        scripts: {
+          prewhoami: "echo pre",
+          whoami: "echo main",
+          args: "echo",
+        },
+      }),
+    );
+    initShellExec(volume, { cwd: "/app" });
+
+    const run = (cmd: string) =>
+      new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        shellExec(cmd, {}, (error, stdout, stderr) => {
+          if (error) reject(error);
+          else resolve({ stdout, stderr });
+        });
+      });
+
+    for (const cmd of [
+      "npm run -s whoami",
+      "npm run whoami --silent",
+      "npm -s run whoami",
+      "pnpm --silent run whoami",
+      "pnpm -s whoami",
+      "yarn -s whoami",
+      "bun --silent run whoami",
+    ]) {
+      const result = await run(cmd);
+      expect(result.stdout, cmd).toBe("pre\nmain\n");
+      expect(result.stderr, cmd).toBe("");
+    }
+
+    // flags after "--" belong to the script, not to run-script
+    const passthrough = await run("npm run args -- --silent -s");
+    expect(passthrough.stdout).toContain("> routing-test@1.0.0 args");
+    expect(passthrough.stdout.trimEnd().endsWith("--silent -s")).toBe(true);
+  });
+});

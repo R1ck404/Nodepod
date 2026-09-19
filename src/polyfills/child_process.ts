@@ -514,11 +514,23 @@ function loadManifest(
   }
 }
 
+// npm/pnpm/yarn/bun accept -s/--silent on run-script to drop the
+// "> name@version script" banners (npm: loglevel silent).
+function isSilentFlag(arg: string): boolean {
+  return arg === "-s" || arg === "--silent";
+}
+
 async function runScript(
   args: string[],
   ctx: ShellContext,
 ): Promise<ShellResult> {
-  const name = args[0];
+  // extra arguments after "--" separator (npm run dev -- --webpack) belong
+  // to the script and are never interpreted here.
+  const dashIdx = args.indexOf("--");
+  const ownArgs = dashIdx >= 0 ? args.slice(0, dashIdx) : args;
+  const extraArgs = dashIdx >= 0 ? args.slice(dashIdx + 1) : [];
+  const silent = ownArgs.some(isSilentFlag);
+  const name = ownArgs.find((a) => !isSilentFlag(a));
   if (!name) {
     const r = loadManifest(ctx.cwd);
     if ("fail" in r) return r.fail;
@@ -529,10 +541,6 @@ async function runScript(
     for (const k of keys) text += `  ${k}\n    ${scripts[k]}\n`;
     return { stdout: text, stderr: "", exitCode: 0 };
   }
-
-  // extra arguments after "--" separator (npm run dev -- --webpack)
-  const dashIdx = args.indexOf("--");
-  const extraArgs = dashIdx >= 0 ? args.slice(dashIdx + 1) : [];
 
   const r = loadManifest(ctx.cwd);
   if ("fail" in r) return r.fail;
@@ -573,12 +581,17 @@ async function runScript(
   let allOut = "";
   let allErr = "";
   const label = `${r.pkg.name ?? ""}@${r.pkg.version ?? ""}`;
+  // banners go to stdout like real npm (output.standard), so a caller
+  // capturing `npm run x` sees the same lines it would from node.
+  const banner = (hdr: string) => {
+    if (silent) return;
+    allOut += hdr;
+    getStdoutSink()?.(hdr);
+  };
 
   const pre = scripts[`pre${name}`];
   if (pre) {
-    const hdr = `\n> ${label} pre${name}\n> ${pre}\n\n`;
-    allErr += hdr;
-    if (_stderrSink) _stderrSink(hdr);
+    banner(`\n> ${label} pre${name}\n> ${pre}\n\n`);
     const pr = await ctx.exec(pre, { cwd: ctx.cwd, env });
     allOut += pr.stdout;
     allErr += pr.stderr;
@@ -586,9 +599,7 @@ async function runScript(
       return { stdout: allOut, stderr: allErr, exitCode: pr.exitCode };
   }
 
-  const mainHdr = `\n> ${label} ${name}\n> ${cmd}\n\n`;
-  allErr += mainHdr;
-  if (_stderrSink) _stderrSink(mainHdr);
+  banner(`\n> ${label} ${name}\n> ${cmd}\n\n`);
   const mr = await ctx.exec(cmd, { cwd: ctx.cwd, env });
   allOut += mr.stdout;
   allErr += mr.stderr;
@@ -597,9 +608,7 @@ async function runScript(
 
   const post = scripts[`post${name}`];
   if (post) {
-    const hdr = `\n> ${label} post${name}\n> ${post}\n\n`;
-    allErr += hdr;
-    if (_stderrSink) _stderrSink(hdr);
+    banner(`\n> ${label} post${name}\n> ${post}\n\n`);
     const po = await ctx.exec(post, { cwd: ctx.cwd, env });
     allOut += po.stdout;
     allErr += po.stderr;

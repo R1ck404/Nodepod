@@ -1,5 +1,5 @@
 import type { ShellCommand } from "../shell-types";
-import type { PmDeps } from "./pm-types";
+import { splitLeadingSilentFlags, type PmDeps } from "./pm-types";
 import { VERSIONS } from "../../constants/config";
 
 const A_RESET = "\x1b[0m";
@@ -10,7 +10,8 @@ const A_DIM = "\x1b[2m";
 export function createPnpmCommand(deps: PmDeps): ShellCommand {
   return {
     name: "pnpm",
-    async execute(params, ctx) {
+    async execute(rawParams, ctx) {
+      const { silent, params } = splitLeadingSilentFlags(rawParams);
       if (!deps.hasFile("/"))
         return { stdout: "", stderr: "Volume unavailable\n", exitCode: 1 };
 
@@ -55,12 +56,12 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
         case "ls":
           return deps.listPackages(ctx, "pnpm");
         case "run":
-          return deps.runScript(params.slice(1), ctx);
+          return deps.runScript([...silent, ...params.slice(1)], ctx);
         case "start":
-          return deps.runScript(["start"], ctx);
+          return deps.runScript([...silent, "start"], ctx);
         case "test":
         case "t":
-          return deps.runScript(["test"], ctx);
+          return deps.runScript([...silent, "test"], ctx);
         case "exec":
           return deps.npxExecute(params.slice(1), ctx);
         case "dlx":
@@ -84,7 +85,7 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
           };
         default:
           // pnpm accepts `pnpm <script>` as shorthand for `pnpm run <script>`.
-          return deps.runScript(params, ctx);
+          return deps.runScript([...silent, ...params], ctx);
       }
     },
   };

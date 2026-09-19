@@ -101,7 +101,8 @@ describe("node headless host", () => {
     const res = await fetch(url);
     expect(res.status).toBe(503);
 
-    pod.teardown();
+    await pod.teardown();
+    await expect(fetch(url)).rejects.toThrow();
   }, 60_000);
 
   it("propagates cwd through nested pnpm run scripts", async () => {
@@ -135,8 +136,8 @@ describe("node headless host", () => {
     );
     const result = await child.completion;
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("/workspace");
-    pod.teardown();
+    expect(result.stdout.trim()).toMatch(/(?:^|\n)\/workspace$/);
+    await pod.teardown();
   }, 60_000);
 
   it("keeps active-server URLs byte-for-byte unchanged in spawn output", async () => {
@@ -179,6 +180,6 @@ describe("node headless host", () => {
     expect(stdoutChunks.join("")).toBe(stdout);
     expect(stderrChunks.join("")).toBe(stderr);
     expect(pod.port(5173)).toBeNull();
-    pod.teardown();
+    await pod.teardown();
   }, 60_000);
 });

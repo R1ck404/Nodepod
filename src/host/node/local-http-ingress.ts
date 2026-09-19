@@ -137,6 +137,11 @@ export function createLocalHttpIngress(
       if (!s) return;
       await new Promise<void>((resolve) => {
         s.close(() => resolve());
+        // close() only stops accepting; it waits for keep-alive sockets to go
+        // idle on their own. Force them shut so the port frees immediately and
+        // a long sequence of headless pods cannot accumulate stale sockets.
+        s.closeIdleConnections?.();
+        s.closeAllConnections?.();
       });
     },
   };
