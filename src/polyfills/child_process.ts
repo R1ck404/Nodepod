@@ -1609,6 +1609,22 @@ export async function executeNodeBinary(
   // avoid duplicate output when same error fires as both 'error' and 'unhandledrejection'
   const handledErrors = new WeakSet<object>();
 
+  // node ends the process with code 1 on an unhandled rejection or uncaught
+  // exception nobody listens for. keep the one exception proc.exit() already
+  // makes: a live dev server keeps serving and only records the code, so a
+  // plugin's stray rejection doesn't take the preview down.
+  const fatalError = () => {
+    if (getAllServers().size > 0) {
+      if (typeof (proc as any).exitCode !== "number") proc.exitCode = 1;
+      return;
+    }
+    if (didExit) return;
+    didExit = true;
+    code = 1;
+    try { proc.emit("exit", 1); } catch { /* ignore */ }
+    exitResolve();
+  };
+
   const rejHandler = (ev: PromiseRejectionEvent) => {
     ev.preventDefault();
     const r = ev.reason;
@@ -1628,6 +1644,7 @@ export async function executeNodeBinary(
       ? `Unhandled rejection: ${r.message}\n${r.stack ?? ""}\n`
       : `Unhandled rejection: ${String(r)}\n`;
     pushErr(rejMsg);
+    fatalError();
   };
   const errHandler = (ev: ErrorEvent) => {
     ev.preventDefault();
@@ -1657,6 +1674,7 @@ export async function executeNodeBinary(
       ? `${e.stack || e.message}\n`
       : `Uncaught: ${String(e)}\n`;
     pushErr(msg);
+    fatalError();
   };
   // browser and Worker globalThis has addEventListener, node-test doesn't.
   const hasGlobalEvents = typeof (globalThis as any).addEventListener === "function";

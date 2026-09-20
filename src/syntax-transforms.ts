@@ -38,7 +38,15 @@ const RE_TYPE_SPEC = /^\s*type\s+\w+/;
 const RE_AS_SPLIT = /\s+as\s+/;
 
 export interface ESMToCJSOptions {
-  /** Target used for pure default exports. */
+  /**
+   * Expression the module record's exports are reached through, e.g.
+   * `__nodepodModule.exports`. Pure default exports assign to it; named
+   * exports are written as properties of it. Defaults to `module.exports`
+   * / `exports`. Passing a binding the module cannot shadow matters: a
+   * bundled chunk that declares its own top-level `var exports = {...}`
+   * (an inlined package.json is the usual source) would otherwise receive
+   * every named export and the real module would export nothing.
+   */
   exportTarget?: string;
 }
 
@@ -72,6 +80,7 @@ export function collectEsmCjsPatches(
   );
   const mixedExports = hasDefaultExport && hasNamedExport;
   const defaultExportTarget = options.exportTarget ?? "module.exports";
+  const namedTarget = options.exportTarget ?? "exports";
   // collected during the walk, prepended at the bottom of this fn
   const hoistedFunctionExports: string[] = [];
 
@@ -141,7 +150,7 @@ export function collectEsmCjsPatches(
     } else if (node.type === "ExportDefaultDeclaration") {
       const decl = node.declaration;
       const exportTarget = mixedExports
-        ? "exports.default"
+        ? `${namedTarget}.default`
         : defaultExportTarget;
 
       if (
@@ -179,7 +188,7 @@ export function collectEsmCjsPatches(
           patches.push([
             node.end,
             node.end,
-            `;\nexports.${name} = ${name};`,
+            `;\n${namedTarget}.${name} = ${name};`,
           ]);
         } else if (decl.type === "VariableDeclaration") {
           const needsLiveBinding = decl.kind === "let" || decl.kind === "var";
@@ -196,10 +205,10 @@ export function collectEsmCjsPatches(
               for (const name of extractBindingNames(d.id)) {
                 if (needsLiveBinding) {
                   bindings.push(
-                    `Object.defineProperty(exports, ${JSON.stringify(name)}, { get() { return ${name}; }, enumerable: true })`,
+                    `Object.defineProperty(${namedTarget}, ${JSON.stringify(name)}, { get() { return ${name}; }, enumerable: true })`,
                   );
                 } else {
-                  bindings.push(`exports.${name} = ${name}`);
+                  bindings.push(`${namedTarget}.${name} = ${name}`);
                 }
               }
             }
@@ -207,10 +216,10 @@ export function collectEsmCjsPatches(
             for (const d of decl.declarations) {
               if (needsLiveBinding) {
                 bindings.push(
-                  `Object.defineProperty(exports, ${JSON.stringify(d.id.name)}, { get() { return ${d.id.name}; }, enumerable: true })`,
+                  `Object.defineProperty(${namedTarget}, ${JSON.stringify(d.id.name)}, { get() { return ${d.id.name}; }, enumerable: true })`,
                 );
               } else {
-                bindings.push(`exports.${d.id.name} = ${d.id.name}`);
+                bindings.push(`${namedTarget}.${d.id.name} = ${d.id.name}`);
               }
             }
           }
@@ -227,18 +236,18 @@ export function collectEsmCjsPatches(
         for (const spec of node.specifiers) {
           if (spec.local.name === "default") {
             lines.push(
-              `exports.${spec.exported.name} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}`,
+              `${namedTarget}.${spec.exported.name} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}`,
             );
           } else {
             lines.push(
-              `exports.${spec.exported.name} = ${tmp}.${spec.local.name}`,
+              `${namedTarget}.${spec.exported.name} = ${tmp}.${spec.local.name}`,
             );
           }
         }
         patches.push([node.start, node.end, lines.join(";\n") + ";"]);
       } else {
         const lines = node.specifiers.map(
-          (s: any) => `exports.${s.exported.name} = ${s.local.name}`,
+          (s: any) => `${namedTarget}.${s.exported.name} = ${s.local.name}`,
         );
         patches.push([node.start, node.end, lines.join(";\n") + ";"]);
       }
@@ -249,13 +258,13 @@ export function collectEsmCjsPatches(
         patches.push([
           node.start,
           node.end,
-          `exports[${JSON.stringify(name)}] = require(${JSON.stringify(src)})`,
+          `${namedTarget}[${JSON.stringify(name)}] = require(${JSON.stringify(src)})`,
         ]);
       } else {
         patches.push([
           node.start,
           node.end,
-          `Object.assign(exports, require(${JSON.stringify(src)}))`,
+          `Object.assign(${namedTarget}, require(${JSON.stringify(src)}))`,
         ]);
       }
     }
@@ -267,7 +276,7 @@ export function collectEsmCjsPatches(
   if (hoistedFunctionExports.length > 0) {
     const prefix =
       hoistedFunctionExports
-        .map((n) => `exports.${n} = ${n};`)
+        .map((n) => `${namedTarget}.${n} = ${n};`)
         .join("\n") + "\n";
     patches.push([0, 0, prefix]);
   }
@@ -507,6 +516,7 @@ function esmToCjsViaRegex(
 ): string {
   let out = code;
   const exportTarget = options.exportTarget ?? "module.exports";
+  const namedTarget = options.exportTarget ?? "exports";
   // strip TS type-only imports
   out = out.replace(RE_TYPE_IMPORT_BRACES, "");
   out = out.replace(RE_TYPE_IMPORT_DEFAULT, "");
@@ -552,8 +562,8 @@ function esmToCjsViaRegex(
   out = out.replace(RE_EXPORT_DEFAULT_FN_ANON, `${exportTarget} = function(`);
   out = out.replace(RE_EXPORT_DEFAULT, `${exportTarget} = `);
   // re-exports
-  out = out.replace(RE_EXPORT_STAR_AS, 'exports.$1 = require("$2");');
-  out = out.replace(RE_EXPORT_STAR, 'Object.assign(exports, require("$1"));');
+  out = out.replace(RE_EXPORT_STAR_AS, `${namedTarget}.$1 = require("$2");`);
+  out = out.replace(RE_EXPORT_STAR, `Object.assign(${namedTarget}, require("$1"));`);
   out = out.replace(
     RE_EXPORT_NAMED_FROM,
     (_m, specs, src) => {
@@ -563,7 +573,7 @@ function esmToCjsViaRegex(
           const parts = s.trim().split(RE_AS_SPLIT);
           const local = parts[0].trim();
           const exported = parts.length > 1 ? parts[1].trim() : local;
-          return `exports.${exported} = require("${src}").${local}`;
+          return `${namedTarget}.${exported} = require("${src}").${local}`;
         })
         .join("; ");
       return binds + ";";
@@ -578,16 +588,16 @@ function esmToCjsViaRegex(
           const parts = s.trim().split(RE_AS_SPLIT);
           const local = parts[0].trim();
           const exported = parts.length > 1 ? parts[1].trim() : local;
-          return `exports.${exported} = ${local}`;
+          return `${namedTarget}.${exported} = ${local}`;
         })
         .join("; ");
       return binds + ";";
     },
   );
   // named exports
-  out = out.replace(RE_EXPORT_ASYNC_FN, "exports.$1 = async function $1");
-  out = out.replace(RE_EXPORT_FN, "exports.$1 = function $1");
-  out = out.replace(RE_EXPORT_CLASS, "exports.$1 = class $1");
-  out = out.replace(RE_EXPORT_VAR, "exports.$1 =");
+  out = out.replace(RE_EXPORT_ASYNC_FN, `${namedTarget}.$1 = async function $1`);
+  out = out.replace(RE_EXPORT_FN, `${namedTarget}.$1 = function $1`);
+  out = out.replace(RE_EXPORT_CLASS, `${namedTarget}.$1 = class $1`);
+  out = out.replace(RE_EXPORT_VAR, `${namedTarget}.$1 =`);
   return out;
 }
