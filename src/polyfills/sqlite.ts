@@ -17,8 +17,13 @@ import waSqliteFactory from "wa-sqlite/dist/wa-sqlite.mjs";
 type WaSqliteFactoryOptions = {
   wasmBinary: Uint8Array;
   wasmModule?: WebAssembly.Module;
-  noInitialRun?: boolean;
   locateFile?: (path: string, prefix: string) => string;
+  // Emscripten hooks used by the synchronous load path (see loadEngineSync)
+  instantiateWasm?: (
+    imports: WebAssembly.Imports,
+    receive: (instance: WebAssembly.Instance) => void,
+  ) => WebAssembly.Exports;
+  onRuntimeInitialized?: () => void;
 };
 
 // The Emscripten wrapper eagerly resolves `wa-sqlite.wasm` even when callers
@@ -667,10 +672,6 @@ export const WASM_CACHE_PATH = "/.nodepod/wa-sqlite.wasm";
 export const WASM_SAB_HEADER_BYTES = 16;
 export const WASM_SAB_MAX_BYTES = 1024 * 1024;
 
-const ENGINE_LOAD_TIMEOUT_MS = 30_000;
-const SAB_STATUS_PENDING = 0;
-const SAB_STATUS_OK = 1;
-const SAB_STATUS_FAIL = 2;
 
 let engineInstance: SqliteEngine | null = null;
 let engineLoading: Promise<SqliteEngine | null> | null = null;
@@ -694,20 +695,6 @@ export function __resetSqliteEngineForTesting(): void {
   engineLoading = null;
   engineLoadFailed = false;
   nodepodVfs = null;
-}
-
-function syncAwait(val: unknown): unknown {
-  if (val && typeof (val as { then?: unknown }).then === "function") {
-    let resolved: unknown;
-    let gotSync = false;
-    (val as Promise<unknown>).then((v) => {
-      resolved = v;
-      gotSync = true;
-    });
-    if (gotSync) return resolved;
-    return undefined;
-  }
-  return val;
 }
 
 function ensureLoadStarted(): void {
@@ -760,6 +747,10 @@ async function loadEngine(): Promise<SqliteEngine | null> {
       wasmBinary,
       locateFile: locateBundledWaSqlite,
     })) as WaModule;
+    // a synchronous DatabaseSync may have installed an engine while we were
+    // awaiting; keep that one — getEngine() is called per operation and open
+    // handles belong to its wasm memory
+    if (engineInstance) return engineInstance;
     return buildEngineFromWaModule(module);
   } catch (err) {
     if (typeof console !== "undefined") console.warn("[node:sqlite] load failed:", err);
@@ -775,32 +766,51 @@ function buildEngineFromWaModule(waModule: WaModule): SqliteEngine {
 }
 
 // sync fast path: load from pod VFS after host preload (or warm cache).
+//
+// The Emscripten factory always returns a promise, but the MODULARIZE glue
+// mutates the object we pass in and, when instantiateWasm hands it an
+// instance synchronously, runs the runtime init inline — onRuntimeInitialized
+// fires before the factory returns. That is what lets a cold `new
+// DatabaseSync()` work without anyone having awaited preloadSqlite() first.
+// Off the main thread there is no size limit on sync compile/instantiate.
 function loadEngineSync(): SqliteEngine | null {
   try {
     const v = vol();
     if (!v.existsSync(WASM_CACHE_PATH)) return null;
 
     const wasmBinary = new Uint8Array(v.readFileSync(WASM_CACHE_PATH));
-    precompileWasm(wasmBinary);
 
     let compiled = getCachedModule(wasmBinary);
     if (!compiled) {
       compiled = new WebAssembly.Module(wasmBinary);
     }
+    const wasmModule = compiled;
 
     const factory = waSqliteFactory as unknown as (
       options: WaSqliteFactoryOptions,
     ) => Promise<WaModule>;
-    const ready = factory({
+    let initialized = false;
+    // no noInitialRun: main() must run, same as the async path — it does the
+    // library setup vfs_register depends on
+    const moduleArg: WaSqliteFactoryOptions = {
       wasmBinary,
-      wasmModule: compiled,
-      noInitialRun: true,
+      wasmModule,
       locateFile: locateBundledWaSqlite,
-    });
+      instantiateWasm(imports, receive) {
+        const instance = new WebAssembly.Instance(wasmModule, imports);
+        receive(instance);
+        return instance.exports;
+      },
+      onRuntimeInitialized() {
+        initialized = true;
+      },
+    };
+    // the returned promise is the same object we hold; swallow a rejection so
+    // it never surfaces as unhandled if init threw after we gave up
+    factory(moduleArg).catch(() => {});
 
-    const waModule = syncAwait(ready);
-    if (!waModule || typeof waModule !== "object") return null;
-    return buildEngineFromWaModule(waModule as WaModule);
+    if (!initialized) return null;
+    return buildEngineFromWaModule(moduleArg as unknown as WaModule);
   } catch (err) {
     if (typeof console !== "undefined") {
       console.warn("[node:sqlite] sync load failed:", err);
@@ -809,56 +819,11 @@ function loadEngineSync(): SqliteEngine | null {
   }
 }
 
-function waitForEngineLoading(): SqliteEngine | null {
-  ensureLoadStarted();
-  if (engineInstance) return engineInstance;
-  if (!engineLoading) return null;
-
-  const warm = syncAwait(engineLoading);
-  if (warm && typeof warm === "object") return warm as SqliteEngine;
-
-  if (typeof SharedArrayBuffer === "undefined" || typeof Atomics === "undefined") {
-    return null;
-  }
-
-  let result: SqliteEngine | null = null;
-  let failed = false;
-  const sab = new SharedArrayBuffer(4);
-  const ctrl = new Int32Array(sab);
-  engineLoading.then(
-    (r) => {
-      result = r;
-    },
-    () => {
-      failed = true;
-    },
-  ).finally(() => {
-    Atomics.store(ctrl, 0, 1);
-    Atomics.notify(ctrl, 0);
-  });
-
-  const deadline = Date.now() + ENGINE_LOAD_TIMEOUT_MS;
-  while (result === null && !failed) {
-    if (Date.now() > deadline) break;
-    Atomics.wait(ctrl, 0, 0, 10);
-  }
-  return result;
-}
-
-function blockForEngineViaHost(): void {
-  if (!hostBridge) return;
-  try {
-    hostBridge.ensureWasmCached();
-  } catch (err) {
-    engineLoadFailed = true;
-    throw err;
-  }
+function installEngineSync(): boolean {
   const eng = loadEngineSync();
-  if (eng) {
-    engineInstance = eng;
-    return;
-  }
-  engineLoadFailed = true;
+  if (!eng) return false;
+  engineInstance = eng;
+  return true;
 }
 
 function getEngine(): SqliteEngine {
@@ -867,38 +832,24 @@ function getEngine(): SqliteEngine {
     throw new Error("[node:sqlite] WASM engine failed to load.");
   }
 
+  // 1. bytes already in the pod VFS (host preload, snapshot, or a previous
+  //    process in this pod) — instantiate right here, synchronously
+  if (installEngineSync()) return engineInstance!;
+
+  // 2. process worker: block on the host for the bytes, then instantiate
+  if (hostBridge) {
+    try {
+      hostBridge.ensureWasmCached();
+    } catch (err) {
+      engineLoadFailed = true;
+      throw err;
+    }
+    if (installEngineSync()) return engineInstance!;
+  }
+
+  // 3. nothing synchronous is possible here (main thread, or no SAB): make
+  //    sure the async load is at least in flight so a later attempt succeeds
   ensureLoadStarted();
-  if (engineLoading) {
-    const eng = syncAwait(engineLoading);
-    if (eng && typeof eng === "object") {
-      engineInstance = eng as SqliteEngine;
-      return engineInstance;
-    }
-  }
-
-  try {
-    const syncEng = loadEngineSync();
-    if (syncEng) {
-      engineInstance = syncEng;
-      return engineInstance;
-    }
-  } catch {
-    /* volume unavailable */
-  }
-
-  blockForEngineViaHost();
-  if (engineInstance) return engineInstance;
-
-  try {
-    const syncEng = loadEngineSync();
-    if (syncEng) {
-      engineInstance = syncEng;
-      return engineInstance;
-    }
-  } catch {
-    /* volume unavailable */
-  }
-
   throw new Error(
     "[node:sqlite] WASM engine not ready. Await preloadSqlite() before using DatabaseSync.",
   );
@@ -908,6 +859,7 @@ export async function preloadSqlite(): Promise<boolean> {
   if (engineInstance) return true;
   ensureLoadStarted();
   const eng = await engineLoading!;
+  if (engineInstance) return true;
   if (!eng) {
     engineLoadFailed = true;
     return false;

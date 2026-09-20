@@ -95,6 +95,13 @@ test.describe("runtime", () => {
     }
     expectClean(results["handled-rejection"]);
     expect(results["handled-rejection"].stdout).toBe("handled soft\n");
+
+    // node:sqlite: a cold synchronous DatabaseSync works with no engine
+    // warm at worker init (host-fetched bytes, then VFS-cached bytes).
+    expectClean(results["sqlite-cold-first"]);
+    expect(results["sqlite-cold-first"].stdout).toBe("lazy\n");
+    expectClean(results["sqlite-cold-second"]);
+    expect(results["sqlite-cold-second"].stdout).toBe("lazy\n");
   });
 });
 

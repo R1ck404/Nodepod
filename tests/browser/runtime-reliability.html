@@ -128,6 +128,20 @@
       await run("uncaught-exception", "node", ["-e", "setTimeout(() => { throw new Error('kaboom') }, 10); setTimeout(() => console.log('still alive'), 200)"]);
       await run("handled-rejection", "node", ["-e", "process.on('unhandledRejection', (e) => console.log('handled', e.message)); Promise.reject(new Error('soft'))"]);
 
+      // node:sqlite is lazy: the worker did not boot the engine at init, so
+      // a cold `new DatabaseSync()` has to pull the wasm from the host and
+      // instantiate synchronously. Run it twice — the first process fetches
+      // and caches the bytes, the second reads them back from the pod VFS.
+      const sqliteCase =
+        "const { DatabaseSync } = require('node:sqlite');" +
+        "const db = new DatabaseSync(':memory:');" +
+        "db.exec('CREATE TABLE t (v TEXT)');" +
+        "db.prepare('INSERT INTO t VALUES (?)').run('lazy');" +
+        "console.log(db.prepare('SELECT v FROM t').get().v);" +
+        "db.close()";
+      await run("sqlite-cold-first", "node", ["-e", sqliteCase], { timeoutMs: 30_000 });
+      await run("sqlite-cold-second", "node", ["-e", sqliteCase], { timeoutMs: 30_000 });
+
       server.kill();
       window.__done = true;
       status.textContent = "done";

@@ -73,10 +73,10 @@ const SQLITE_SAB_OK = 1;
 const SQLITE_SAB_FAIL = 2;
 const SQLITE_LOAD_TIMEOUT_MS = 30_000;
 
-function installSqliteHostBridge(): void {
+function installSqliteHostBridge(): boolean {
   if (typeof SharedArrayBuffer === "undefined" || !_volume) {
     setSqliteHostBridge(null);
-    return;
+    return false;
   }
   setSqliteHostBridge({
     ensureWasmCached() {
@@ -114,6 +114,7 @@ function installSqliteHostBridge(): void {
       }
     },
   });
+  return true;
 }
 
 const _httpClientCallbacks = new Map<
@@ -325,18 +326,21 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   // if main had SAB off, neither buffer was sent
   _sabEnabled = !!msg.syncBuffer;
 
-  installSqliteHostBridge();
+  const sqliteBridge = installSqliteHostBridge();
 
   if (msg.sqliteStartup === "bytes") {
     warmSqliteWasmBytes();
-  } else {
-    // DatabaseSync must be ready before synchronous user code can construct it
+  } else if (msg.sqliteStartup === "engine" || !sqliteBridge) {
+    // without the host bridge a cold DatabaseSync has no synchronous way to
+    // get the wasm, so the engine must be ready before user code runs
     try {
       await warmSqliteEngine();
     } catch (err) {
       console.warn("[node:sqlite] automatic initialization failed:", err);
     }
   }
+  // lazy: most processes never touch node:sqlite; the first DatabaseSync
+  // blocks on the bridge for the bytes and instantiates in place
 
   _initialized = true;
   post({ type: "ready", pid: _pid });

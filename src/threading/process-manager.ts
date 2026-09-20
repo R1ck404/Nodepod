@@ -256,7 +256,7 @@ export class ProcessManager extends EventEmitter {
       lazyFsPort,
       sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
         ? "bytes"
-        : "engine",
+        : "lazy",
     };
     this._processPorts.set(pid, ownedPorts);
     try {

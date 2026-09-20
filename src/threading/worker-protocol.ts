@@ -43,7 +43,12 @@ export interface MainToWorker_Init {
   // dedicated fs proxy port for the process worker's own lazy VFS reads
   // (lean spawn mode — snapshot excluded node_modules etc.)
   lazyFsPort?: MessagePort;
-  sqliteStartup?: "bytes" | "engine";
+  // node:sqlite engine policy for this process. "lazy" (default): nothing at
+  // init — the first DatabaseSync pulls the wasm bytes from the host and
+  // instantiates synchronously. "bytes": pre-cache the bytes in the pod VFS
+  // during init. "engine": full engine boot before ready (forced anyway when
+  // the worker has no SharedArrayBuffer, since the sync path needs it).
+  sqliteStartup?: "lazy" | "bytes" | "engine";
 }
 
 export interface MainToWorker_Probe {
