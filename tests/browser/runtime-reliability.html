@@ -122,6 +122,12 @@
       // shell: single quotes inside double quotes reach the program intact.
       await run("shell-nested-quotes", "sh", ["-c", "node -e \"console.log('quoted', 1 + 1)\""]);
 
+      // an unhandled rejection / uncaught exception without a listener ends
+      // the process with code 1 (node parity); with a listener it does not.
+      await run("unhandled-rejection", "node", ["-e", "Promise.reject(new Error('boom')); setTimeout(() => console.log('still alive'), 200)"]);
+      await run("uncaught-exception", "node", ["-e", "setTimeout(() => { throw new Error('kaboom') }, 10); setTimeout(() => console.log('still alive'), 200)"]);
+      await run("handled-rejection", "node", ["-e", "process.on('unhandledRejection', (e) => console.log('handled', e.message)); Promise.reject(new Error('soft'))"]);
+
       server.kill();
       window.__done = true;
       status.textContent = "done";

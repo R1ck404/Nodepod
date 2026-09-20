@@ -81,6 +81,20 @@ test.describe("runtime", () => {
     // shell: `node -e "console.log('...')"` keeps its single quotes.
     expectClean(results["shell-nested-quotes"]);
     expect(results["shell-nested-quotes"].stdout).toBe("quoted 2\n");
+
+    // fatal errors exit 1 and stop the process; a listener keeps it alive.
+    for (const [name, text] of [
+      ["unhandled-rejection", "Unhandled rejection: boom"],
+      ["uncaught-exception", "kaboom"],
+    ] as const) {
+      const rec = results[name];
+      expect(rec.timedOut, name).toBe(false);
+      expect(rec.exitCode, name).toBe(1);
+      expect(rec.stderr, name).toContain(text);
+      expect(rec.stdout, name).not.toContain("still alive");
+    }
+    expectClean(results["handled-rejection"]);
+    expect(results["handled-rejection"].stdout).toBe("handled soft\n");
   });
 });
 
