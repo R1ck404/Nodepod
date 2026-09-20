@@ -396,6 +396,7 @@ var __vite_injected_original_import_meta_url = "file://" + $filename;
 var console = $console;
 var import_meta = $importMeta;
 var __asyncLoad = $asyncLoad;
+var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
 var Promise = ${promiseVar};
 var global = globalThis;
@@ -1188,10 +1189,13 @@ function toImportNamespace(loaded: unknown): Record<string, unknown> {
   return ns;
 }
 
-function makeDynamicLoader(
-  resolver: ResolverFn,
-): (specifier: string) => SyncThenable<unknown> | Promise<unknown> {
-  return (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+type DynamicLoader = ((specifier: string) => SyncThenable<unknown> | Promise<unknown>) & {
+  /** Module-scoped `Function` whose bodies route import() through this loader. */
+  Function: FunctionConstructor;
+};
+
+function makeDynamicLoader(resolver: ResolverFn): DynamicLoader {
+  const load = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
     try {
       const loaded = resolver(specifier);
       return new SyncThenable(toImportNamespace(loaded));
@@ -1207,6 +1211,34 @@ function makeDynamicLoader(
       });
     }
   };
+  return Object.assign(load, { Function: makeScopedFunction(load) });
+}
+
+const NativeFunction = Function;
+
+// `new Function("m", "return import(m)")` is how CommonJS builds keep an
+// ESM-only dependency loadable (@preact/preset-vite, import-meta-resolve,
+// ...): the body is assembled at runtime, so the AST rewrite of import() ->
+// __asyncLoad() never sees it and the worker's native import() receives a
+// bare specifier it cannot resolve ("Failed to resolve module specifier").
+// Each module gets a Function whose bodies get the same rewrite, with
+// __asyncLoad bound to that module's resolver. Bodies without import() go
+// to the native constructor untouched.
+function makeScopedFunction(asyncLoad: (specifier: string) => unknown): FunctionConstructor {
+  const Scoped = function Function(this: unknown, ...args: unknown[]): unknown {
+    const body = args.length ? String(args[args.length - 1]) : "";
+    if (!/\bimport\s*\(/.test(body)) return NativeFunction(...(args as string[]));
+    const params = args.slice(0, -1).map(String);
+    const inner = NativeFunction("__asyncLoad", ...params, rewriteDynamicImportsRegex(body));
+    const wrapped = function (this: unknown, ...callArgs: unknown[]) {
+      return inner.call(this, asyncLoad, ...callArgs);
+    };
+    Object.defineProperty(wrapped, "length", { value: Math.max(0, inner.length - 1) });
+    Object.defineProperty(wrapped, "toString", { value: () => inner.toString() });
+    return wrapped;
+  };
+  Scoped.prototype = NativeFunction.prototype;
+  return Scoped as unknown as FunctionConstructor;
 }
 
 // ── Types ──
