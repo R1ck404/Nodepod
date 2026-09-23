@@ -15,6 +15,8 @@ export class VFSBridge {
   // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
   private _warnedSharedVFSDrop = false;
+  // called after a worker's bulk mount; used to page package packs back out
+  private _onWorkerSnapshot: ((snapshot: VFSBinarySnapshot) => void) | null = null;
 
   constructor(volume: MemoryVolume) {
     this._volume = volume;
@@ -22,6 +24,10 @@ export class VFSBridge {
 
   setBroadcaster(fn: (path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void): void {
     this._broadcaster = fn;
+  }
+
+  onWorkerSnapshot(fn: ((snapshot: VFSBinarySnapshot) => void) | null): void {
+    this._onWorkerSnapshot = fn;
   }
 
   setSharedVFS(controller: SharedVFSController, hydrate = false): void {
@@ -173,6 +179,7 @@ export class VFSBridge {
     } finally {
       this._suppressWatch = false;
     }
+    this._onWorkerSnapshot?.(snapshot);
   }
 
   // writeFile returns false on table/data exhaustion — silent drops mean
@@ -302,6 +309,15 @@ export class VFSBridge {
       const absPath = filename.startsWith("/") ? filename : "/" + filename;
       if (isInternalVfsPath(absPath)) return;
 
+      // paged-out package content (memory.evictPackageContent): bring it
+      // back in, then broadcast it
+      if (this._volume.isPagedOut(absPath)) {
+        void this._volume
+          .ensureResident(absPath)
+          .then(() => this._broadcastPath(absPath))
+          .catch((e) => console.warn(`[VFSBridge] Watch error for "${absPath}":`, e));
+        return;
+      }
       this._broadcastPath(absPath);
     });
 

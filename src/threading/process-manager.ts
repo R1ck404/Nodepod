@@ -66,6 +66,9 @@ interface WasiBrokerRoot extends WasiBrokerChild {
   children: Map<number, WasiBrokerChild>;
 }
 
+// fs proxy calls that read file content (the rest only need metadata)
+const PAGE_IN_FS_OPS = new Set(["readFileSync", "readFile", "openSync", "copyFileSync", "openAsBlob"]);
+
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
@@ -660,8 +663,24 @@ export class ProcessManager extends EventEmitter {
   private _handleFsProxyWithRecovery(
     request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
     bridge: ReturnType<typeof buildFileSystemBridge>,
+    pagedIn = false,
   ): void {
     const path = request.payload?.[0];
+    // paged-out package content: read it back in, then answer. the worker
+    // is blocked on Atomics.wait meanwhile; handleFsProxy re-checks the
+    // request sequence, so a reply after the worker gave up is dropped
+    if (
+      !pagedIn &&
+      typeof path === "string" &&
+      PAGE_IN_FS_OPS.has(request.type) &&
+      this._volume.isPagedOut(path)
+    ) {
+      void this._volume
+        .ensureResident(path)
+        .catch((e) => console.warn(`[ProcessManager] paging in "${path}" failed:`, e))
+        .then(() => this._handleFsProxyWithRecovery(request, bridge, true));
+      return;
+    }
     const canRecover = (request.type === "statSync" || request.type === "readFileSync")
       && isRecoverableWasmPath(path)
       && !this._volume.existsSync(path);

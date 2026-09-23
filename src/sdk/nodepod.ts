@@ -64,6 +64,11 @@ import {
   openWorkspacePersistence,
   type WorkspacePersistence,
 } from "../persistence/workspace";
+import {
+  PackContentSource,
+  adoptMountedPack,
+  canPageFrom,
+} from "../persistence/pack-content-source";
 
 let activeNodepodCount = 0;
 
@@ -384,9 +389,28 @@ export class Nodepod {
       }
     }
 
+    // memory.evictPackageContent: installed package content lives in the
+    // package cache and is paged into main-thread memory on demand
+    let packSource: PackContentSource | null = null;
+    if (handler.options.evictPackageContent) {
+      if (!sabEnabled || opts.spawnSnapshot === "full") {
+        console.warn(
+          "[Nodepod] memory.evictPackageContent needs lean spawn snapshots (SharedArrayBuffer); package content stays in memory",
+        );
+      } else if (!canPageFrom(snapshotCache)) {
+        console.warn(
+          "[Nodepod] memory.evictPackageContent needs the package snapshot cache; package content stays in memory",
+        );
+      } else {
+        packSource = new PackContentSource(snapshotCache);
+        volume.enableEviction(packSource, handler.options.residentContentBudgetMB * 1024 * 1024);
+      }
+    }
+
     const packages = new DependencyInstaller(volume, {
       cwd,
       snapshotCache,
+      packSource,
       performanceTracker,
       profiler: profiler.enabled ? profiler : null,
     });
@@ -419,6 +443,22 @@ export class Nodepod {
     nodepod._headless = headless;
     nodepod._snapshotCache = snapshotCache;
     nodepod._persistence = persistence;
+    if (packSource && canPageFrom(snapshotCache)) {
+      const source = packSource;
+      const cache = snapshotCache;
+      // a worker's `npm install` restored a pack and sent us all of its
+      // bytes; if our cache has the same pack, page them straight back out
+      nodepod._vfsBridge.onWorkerSnapshot((snapshot) => {
+        const key = snapshot.sourceKey;
+        if (!key) return;
+        void cache
+          .getManifest(key)
+          .then((head) => {
+            if (head) adoptMountedPack(volume, source, key, head, snapshot.manifest, snapshot.data);
+          })
+          .catch(() => {});
+      });
+    }
     profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
 
     if (opts.spawnSnapshot) {
@@ -1052,6 +1092,12 @@ export class Nodepod {
   snapshot(opts?: SnapshotOptions): Snapshot {
     this._assertActive();
     const shallow = opts?.shallow ?? true;
+    if (!shallow && this._volume.evictionEnabled) {
+      throw new Error(
+        "[Nodepod] snapshot({ shallow: false }) can't include paged-out package content " +
+          "(memory.evictPackageContent). Use a shallow snapshot; restore() reinstalls packages from package.json.",
+      );
+    }
     return this._volume.toSnapshot(
       undefined,
       shallow ? Nodepod.SHALLOW_EXCLUDE_DIRS : undefined,
@@ -1156,6 +1202,13 @@ export class Nodepod {
       dirCount: number;
       watcherCount: number;
       lazyResidentBytes: number;
+      /** Package files paged out of memory (memory.evictPackageContent). */
+      pagedOutFiles: number;
+      pagedOutBytes: number;
+      /** Paged-in package content currently held, bounded by the resident budget. */
+      residentPackBytes: number;
+      /** Synchronous reads that hit paged-out content (should stay 0). */
+      pagedOutSyncMisses: number;
     };
     engine: {
       moduleCacheSize: number;
@@ -1228,6 +1281,11 @@ export class Nodepod {
   get sharedFSBuffer(): SharedArrayBuffer | null {
     this._assertActive();
     if (!this._sabEnabled) return null;
+    if (this._volume.evictionEnabled) {
+      // the mirror is filled synchronously from every file's bytes, which
+      // paged-out package content can't provide
+      throw new Error("[Nodepod] sharedFSBuffer is not available with memory.evictPackageContent");
+    }
     if (!this._sharedVFS) {
       try {
         const shared = new SharedVFSController(this._sharedVFSBufferSize);

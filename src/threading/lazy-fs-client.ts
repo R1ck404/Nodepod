@@ -13,7 +13,9 @@ import type { VolumeMissHandler } from "../memory-volume";
 const HEADER_BYTES = 16;
 const DEFAULT_PAYLOAD = 256 * 1024;
 const MAX_RETAINED_PAYLOAD = 4 * 1024 * 1024;
-const CALL_TIMEOUT_MS = 5000;
+// matches the WASI fs proxy. the main thread may be paging package content
+// back in from storage before it can answer
+const CALL_TIMEOUT_MS = 30000;
 const WASM_RECOVERY_TIMEOUT_MS = 120000;
 
 interface ProxyResult {
@@ -36,6 +38,16 @@ function nextCapacity(required: number): number {
   return Math.max(required, capacity);
 }
 
+function timeoutError(type: string, target: unknown): Error {
+  const err = new Error(`ETIMEDOUT: fs proxy ${type} got no answer for ${String(target)}`) as Error & {
+    code: string;
+  };
+  err.code = "ETIMEDOUT";
+  return err;
+}
+
+// null on a failed call; throws ETIMEDOUT when the main thread didn't answer
+// in time, which the volume treats as "unknown" rather than "missing"
 function call(
   state: CallState,
   port: MessagePort,
@@ -79,7 +91,7 @@ function call(
       state.sab = null;
       state.capacity = 0;
     }
-    return null;
+    throw timeoutError(type, target);
   }
 
   const status = Atomics.load(ctrl, 0);
@@ -99,6 +111,20 @@ function call(
   };
 }
 
+// the main thread answered with an error; EAGAIN (content couldn't be paged
+// in just now) says nothing about whether the file exists
+function throwIfTransient(res: ProxyResult | null, type: string, target: unknown): void {
+  if (!res || res.ok || res.resultType !== 6) return;
+  const err = decodeJson(res.bytes) as { code?: string } | null;
+  if (err?.code === "EAGAIN") {
+    const transient = new Error(`EAGAIN: fs proxy ${type} could not read ${String(target)} right now`) as Error & {
+      code: string;
+    };
+    transient.code = "EAGAIN";
+    throw transient;
+  }
+}
+
 function decodeJson(bytes: Uint8Array): unknown {
   try {
     return JSON.parse(new TextDecoder().decode(bytes));
@@ -108,7 +134,10 @@ function decodeJson(bytes: Uint8Array): unknown {
 }
 
 // Builds a VolumeMissHandler backed by a dedicated MessagePort to the tab's
-// fs bridge. All methods return null on any failure (treated as a miss).
+// fs bridge. All methods return null on any failure (treated as a miss) and
+// throw ETIMEDOUT when the main thread doesn't answer in time; readFile also
+// throws EAGAIN when the main thread couldn't page the content in. Both are
+// transient: the volume doesn't remember them as a missing file.
 export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
   const state: CallState = { sab: null, capacity: 0, sequence: 0 };
   const knownSizes = new Map<string, number>();
@@ -166,6 +195,7 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
         // retry with a buffer sized to the reported full length
         res = call(state, port, "readFileSync", [path], res.fullLength + 1024);
       }
+      throwIfTransient(res, "readFileSync", path);
       if (!res || !res.ok) return null;
       // buffer (5) or string (4) — the bridge returns bytes for no-encoding reads
       if (res.resultType === 5 || res.resultType === 4) return res.bytes;
