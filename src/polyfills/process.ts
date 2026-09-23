@@ -676,9 +676,29 @@ export function buildProcessEnv(config?: {
       throw new ProcessExitSentinel(resolved);
     },
 
-    nextTick(fn, ...args) {
-      queueMicrotask(() => fn(...args));
-    },
+    // Node drains the entire nextTick queue before the promise microtask
+    // queue (including nextTicks queued during the drain), so chained
+    // nextTick callbacks run before already-queued promise callbacks.
+    // A raw queueMicrotask would interleave them FIFO instead.
+    nextTick: (() => {
+      const pending: Array<() => void> = [];
+      let pumpScheduled = false;
+      const drain = () => {
+        pumpScheduled = false;
+        let batch = pending.splice(0);
+        while (batch.length > 0) {
+          for (const cb of batch) cb();
+          batch = pending.splice(0);
+        }
+      };
+      return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {
+        pending.push(() => fn(...args));
+        if (!pumpScheduled) {
+          pumpScheduled = true;
+          queueMicrotask(drain);
+        }
+      };
+    })(),
 
     stdout: stdoutStream,
     stderr: stderrStream,

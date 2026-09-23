@@ -830,14 +830,28 @@ class SyncThenable<T> {
 
 // Try to synchronously unwrap a thenable. Returns the value if .then() fires sync,
 // otherwise returns the original value (possibly a native Promise).
+// The synchronous fast-path in SyncPromise.then below is gated on this scope:
+// user-code .then calls outside of it keep native microtask timing (Node parity),
+// while require() machinery unwrapping inside it keeps working synchronously.
+let syncScopeDepth = 0;
+function inSyncScope<T>(fn: () => T): T {
+  syncScopeDepth++;
+  try {
+    return fn();
+  } finally {
+    syncScopeDepth--;
+  }
+}
 function syncAwait(val: unknown): unknown {
   if (val && typeof (val as any).then === "function") {
     let resolved: unknown;
     let gotSync = false;
-    (val as any).then((v: unknown) => {
-      resolved = v;
-      gotSync = true;
-    });
+    inSyncScope(() =>
+      (val as any).then((v: unknown) => {
+        resolved = v;
+        gotSync = true;
+      }),
+    );
     if (gotSync) return resolved;
   }
   return val;
@@ -940,7 +954,11 @@ function createSyncPromise(): typeof Promise {
       onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
       onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
     ): Promise<TResult1 | TResult2> {
-      if (this._syncResolved && onFulfilled) {
+      // Sync fast-path ONLY inside an explicit sync scope (syncAwait above):
+      // it exists so require() machinery can unwrap synchronously. Everywhere
+      // else, fall through to native microtask timing so user-visible .then
+      // ordering matches Node (sync statements, then nextTick, then promises).
+      if (syncScopeDepth > 0 && this._syncResolved && onFulfilled) {
         try {
           const result = onFulfilled(this._syncValue as T);
           if (
