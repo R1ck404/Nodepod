@@ -161,6 +161,7 @@
     "better-auth": "^1.2.10",
     "better-call": "1.3.7",
     "esbuild": "^0.27.2",
+    "fake-indexeddb": "^6.2.5",
     "http-proxy": "^1.18.1",
     "next": "^16.2.9",
     "typescript": "^5.9.3",

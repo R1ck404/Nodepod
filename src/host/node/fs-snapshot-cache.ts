@@ -15,7 +15,7 @@ import type { VFSBinarySnapshot } from "../../threading/worker-protocol";
 const SCHEMA = 2;
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-function defaultCacheDir(): string {
+export function defaultCacheDir(): string {
   return (
     process.env.NODEPOD_CACHE ||
     join(tmpdir(), "nodepod-snapshots")

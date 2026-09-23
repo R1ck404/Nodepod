@@ -2,7 +2,7 @@
 title: Profiling and inspection
 description: Diagnose Nodepod runtime performance and inspect attached previews.
 sidebar:
-  order: 6
+  order: 7
 ---
 
 ## Profiling

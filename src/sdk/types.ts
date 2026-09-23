@@ -2,6 +2,7 @@ import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
 import type { ShellOptions } from "../shell/shell-options";
 import type { PreviewOriginOption } from "../request-proxy";
+import type { PersistenceOptions } from "../persistence/workspace/types";
 export type { ShellLimits, ShellOptions } from "../shell/shell-options";
 export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
 export type {
@@ -32,6 +33,12 @@ export interface NodepodOptions {
   /** Opt-in Nodepod subsystem profiling. Disabled by default. */
   profiler?: import("../profiling/types").ProfilerOptions;
   files?: Record<string, string | Uint8Array>;
+  /**
+   * Save the project filesystem and restore it on the next boot with the
+   * same `id`. node_modules is not saved; it is reinstalled from
+   * package.json (normally straight from the package cache).
+   */
+  persistence?: PersistenceOptions;
   env?: Record<string, string>;
   workdir?: string;
   /**

@@ -17,6 +17,7 @@ import type {
   MainToWorker_Init,
   VFSBinarySnapshot,
   WorkerToMain_SpawnRequest,
+  WorkerToMain_VFSMeta,
   WorkerToMain_ForkRequest,
   WorkerToMain_WorkerThreadRequest,
   WorkerToMain_WasiWorkerRequest,
@@ -844,6 +845,12 @@ export class ProcessManager extends EventEmitter {
         if (!isInternalVfsPath(path)) {
           this._vfsBridge.broadcastChange(path, null, false, handle.pid);
         }
+      }
+    });
+
+    handle.on("vfs-meta", (meta: WorkerToMain_VFSMeta) => {
+      if (this._vfsBridge && !isInternalVfsPath(meta.path)) {
+        this._vfsBridge.handleWorkerMeta(meta);
       }
     });
 

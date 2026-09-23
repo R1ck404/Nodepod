@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +13,8 @@ import type {
 } from "../types";
 import { spawnNodeEvalWorker } from "./node-worker-adapter";
 import { createLocalHttpIngress } from "./local-http-ingress";
-import { openFsSnapshotCache } from "./fs-snapshot-cache";
+import { openFsSnapshotCache, defaultCacheDir } from "./fs-snapshot-cache";
+import { createFsWorkspaceStore } from "./fs-workspace-store";
 
 export interface NodeHostOptions {
   /** Absolute path to dist/__worker__.js (or equivalent IIFE bundle). */
@@ -142,6 +144,12 @@ export function createNodeHost(opts: NodeHostOptions = {}): RuntimeHost {
         return null;
       }
       return openFsSnapshotCache(opts.cacheDir);
+    },
+
+    async openWorkspaceStore(id: string) {
+      // hashed: any id is a safe single path segment ("..", "*", ...)
+      const dir = createHash("sha256").update(id).digest("hex").slice(0, 32);
+      return createFsWorkspaceStore(join(opts.cacheDir ?? defaultCacheDir(), "workspaces", dir));
     },
 
     createHttpIngress({ proxy, headless }): HttpIngress | null {

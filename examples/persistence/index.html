@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>nodepod persistence example</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: monospace;
+                background: #1a1a2e;
+                color: #e0e0e0;
+                padding: 24px;
+            }
+            h1 {
+                font-size: 18px;
+                margin-bottom: 8px;
+                color: #fff;
+            }
+            p {
+                font-size: 13px;
+                color: #888;
+                margin-bottom: 16px;
+            }
+            textarea {
+                width: 100%;
+                height: 160px;
+                background: #0d0d1a;
+                color: #e0e0e0;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 12px;
+                font: inherit;
+            }
+            .row {
+                display: flex;
+                gap: 8px;
+                margin: 12px 0;
+            }
+            button {
+                font: inherit;
+                padding: 6px 12px;
+                background: #2a2a4a;
+                color: #e0e0e0;
+                border: 1px solid #444;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+            #output {
+                background: #0d0d1a;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 16px;
+                min-height: 160px;
+                white-space: pre-wrap;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+            .info {
+                color: #8ac4e6;
+            }
+            .stdout {
+                color: #a8e6a3;
+            }
+            .stderr {
+                color: #e68a8a;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>nodepod workspace persistence</h1>
+        <p>Edit and run the script, then reload the page. The file (and anything the script writes) comes back.</p>
+        <textarea id="source" spellcheck="false"></textarea>
+        <div class="row">
+            <button id="run">Run</button>
+            <button id="reload">Reload page</button>
+            <button id="reset">Delete saved workspace</button>
+        </div>
+        <div id="output"></div>
+
+        <script type="module">
+            import { Nodepod } from "/dist/index.mjs"; // use 'https://esm.sh/@scelar/nodepod' in production
+
+            const out = document.getElementById("output");
+            const source = document.getElementById("source");
+            function log(text, cls = "stdout") {
+                const span = document.createElement("span");
+                span.className = cls;
+                span.textContent = text + "\n";
+                out.appendChild(span);
+            }
+
+            const nodepod = await Nodepod.boot({
+                workdir: "/app",
+                persistence: { id: "persistence-example" },
+                // only written the first time; after that the saved copy wins
+                files: {
+                    "/app/main.js": `const fs = require('fs');
+const runs = fs.existsSync('/app/runs.txt') ? Number(fs.readFileSync('/app/runs.txt', 'utf8')) : 0;
+fs.writeFileSync('/app/runs.txt', String(runs + 1));
+console.log('this script has run ' + (runs + 1) + ' time(s), across reloads');
+`,
+                },
+            });
+
+            nodepod.persistence?.on("saved", ({ entries, bytes }) =>
+                log(`saved ${entries} change(s), ${bytes} bytes`, "info"),
+            );
+            nodepod.persistence?.on("error", (err) => log(`save failed: ${err.message}`, "stderr"));
+
+            source.value = await nodepod.fs.readFile("/app/main.js", "utf8");
+            source.addEventListener("input", () => nodepod.fs.writeFile("/app/main.js", source.value));
+
+            document.getElementById("run").onclick = async () => {
+                const proc = await nodepod.spawn("node", ["main.js"], { cwd: "/app" });
+                proc.on("output", (text) => log(text.trimEnd()));
+                proc.on("error", (text) => log(text.trimEnd(), "stderr"));
+                await proc.completion;
+            };
+            document.getElementById("reload").onclick = async () => {
+                await nodepod.persistence?.flush();
+                location.reload();
+            };
+            document.getElementById("reset").onclick = async () => {
+                await nodepod.persistence?.clear();
+                location.reload();
+            };
+
+            log("booted; workspace status: " + nodepod.persistence?.status, "info");
+        </script>
+    </body>
+</html>

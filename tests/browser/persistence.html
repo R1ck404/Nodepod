@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Nodepod workspace persistence harness</title>
+  </head>
+  <body>
+    <p id="status">loading</p>
+    <script type="module">
+      // Exposes the SDK to persistence.spec.ts, which boots pods with
+      // page.evaluate() so it can reload between boots and open two tabs.
+      import * as nodepod from "/dist/index.mjs";
+
+      window.__nodepod = nodepod;
+      document.querySelector("#status").dataset.ready = "true";
+    </script>
+  </body>
+</html>

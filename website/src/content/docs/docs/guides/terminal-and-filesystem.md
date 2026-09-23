@@ -30,4 +30,4 @@ const entries = await nodepod.fs.readdir('/home/project/src');
 const stat = await nodepod.fs.stat('/home/project/src/index.js');
 ```
 
-Paths are POSIX-style. Each Nodepod instance owns an ephemeral filesystem unless you explicitly create and persist a snapshot. Treat browser storage as untrusted local state, not as your application's source of truth.
+Paths are POSIX-style. Each Nodepod instance owns an ephemeral filesystem unless you boot it with [workspace persistence](/Nodepod/docs/guides/persistence/) or explicitly create and store a snapshot. Treat browser storage as untrusted local state, not as your application's source of truth.

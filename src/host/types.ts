@@ -1,4 +1,5 @@
 import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import type { WorkspaceStore } from "../persistence/workspace/types";
 import type { RequestProxy } from "../request-proxy";
 
 /** Minimal message event shape shared by browser Workers and Node adapters. */
@@ -65,4 +66,6 @@ export interface RuntimeHost {
     opts: OpenSnapshotCacheOptions,
   ): Promise<IDBSnapshotCache | null>;
   createHttpIngress?(opts: CreateHttpIngressOptions): HttpIngress | null;
+  /** Default store for `persistence` when the caller doesn't pass one. */
+  openWorkspaceStore?(id: string): Promise<WorkspaceStore | null>;
 }

@@ -320,6 +320,12 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
     }
   });
 
+  // metadata changes fire no watchers, so they get their own channel
+  _volume.onMetaChange((path, change) => {
+    if (_suppressVFSWatch || isInternalVfsPath(path)) return;
+    post({ type: "vfs-meta", path, ...change });
+  });
+
   if (msg.syncBuffer) {
     _syncChannelWorker = new SyncChannelWorker(msg.syncBuffer);
   }

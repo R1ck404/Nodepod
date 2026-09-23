@@ -2,7 +2,7 @@
 title: Headless mode
 description: Run Nodepod without terminal or preview UI in browsers, Node.js, or Bun.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 ## Browser
