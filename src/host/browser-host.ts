@@ -2,6 +2,7 @@ import { ungzip } from "pako";
 import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
 import { openSnapshotCache } from "../persistence/idb-cache";
 import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
+import { createIndexedDBWorkspaceStore } from "../persistence/workspace/idb-store";
 import { registerDefaultHostFactory } from "./runtime-host";
 import type {
   HostWorker,
@@ -149,6 +150,10 @@ export function createBrowserHost(): RuntimeHost {
       } catch {
         return null;
       }
+    },
+
+    async openWorkspaceStore(id: string) {
+      return createIndexedDBWorkspaceStore(id);
     },
 
     createHttpIngress(): HttpIngress {

@@ -3,7 +3,7 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
+import type { VFSBinarySnapshot, VFSSnapshotEntry, WorkerToMain_VFSMeta } from "./worker-protocol";
 import type { SharedVFSController } from "./shared-vfs";
 
 const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
@@ -200,6 +200,22 @@ export class VFSBridge {
     }
   }
 
+  handleWorkerMeta(meta: WorkerToMain_VFSMeta): void {
+    // metadata changes fire no watchers, so there's nothing to suppress
+    try {
+      if (!this._volume.inspectNode(meta.path)) return;
+      if (meta.mode !== undefined) this._volume.lchmodSync(meta.path, meta.mode);
+      if (meta.uid !== undefined && meta.gid !== undefined) {
+        this._volume.lchownSync(meta.path, meta.uid, meta.gid);
+      }
+      if (meta.atimeMs !== undefined && meta.mtimeMs !== undefined) {
+        this._volume.lutimesSync(meta.path, new Date(meta.atimeMs), new Date(meta.mtimeMs));
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Failed to apply metadata for "${meta.path}":`, e);
+    }
+  }
+
   handleWorkerMkdir(path: string): void {
     this._suppressWatch = true;
     try {
@@ -286,30 +302,34 @@ export class VFSBridge {
       const absPath = filename.startsWith("/") ? filename : "/" + filename;
       if (isInternalVfsPath(absPath)) return;
 
-      try {
-        if (this._volume.existsSync(absPath)) {
-          const stat = this._volume.statSync(absPath);
-          if (stat.isDirectory()) {
-            this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
-            if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
-          } else {
-            const data = this._volume.readFileSync(absPath);
-            // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
-            const buffer = new ArrayBuffer(data.byteLength);
-            new Uint8Array(buffer).set(data);
-            this.broadcastChange(absPath, buffer, false, -1);
-            if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
-          }
-        } else {
-          this.broadcastChange(absPath, null, false, -1);
-          if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
-        }
-      } catch (e) {
-        console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
-      }
+      this._broadcastPath(absPath);
     });
 
     return () => handle.close();
+  }
+
+  private _broadcastPath(absPath: string): void {
+    try {
+      if (this._volume.existsSync(absPath)) {
+        const stat = this._volume.statSync(absPath);
+        if (stat.isDirectory()) {
+          this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
+          if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
+        } else {
+          const data = this._volume.readFileSync(absPath);
+          // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
+          const buffer = new ArrayBuffer(data.byteLength);
+          new Uint8Array(buffer).set(data);
+          this.broadcastChange(absPath, buffer, false, -1);
+          if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
+        }
+      } else {
+        this.broadcastChange(absPath, null, false, -1);
+        if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
+    }
   }
 
   private _walkVolume(

@@ -259,6 +259,19 @@ export interface WorkerToMain_VFSSnapshot {
   snapshot: VFSBinarySnapshot;
 }
 
+// chmod/chown/utimes in a worker: watchers don't see metadata changes, so
+// they travel separately from vfs-write. only the fields the call changed
+// are set (a lazily fetched worker copy has made-up values for the rest)
+export interface WorkerToMain_VFSMeta {
+  type: "vfs-meta";
+  path: string;
+  mode?: number;
+  uid?: number;
+  gid?: number;
+  atimeMs?: number;
+  mtimeMs?: number;
+}
+
 export interface WorkerToMain_SpawnRequest {
   type: "spawn-request";
   requestId: number;
@@ -432,6 +445,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_VFSWrite
   | WorkerToMain_VFSDelete
   | WorkerToMain_VFSSnapshot
+  | WorkerToMain_VFSMeta
   | WorkerToMain_SpawnRequest
   | WorkerToMain_ChildSignal
   | WorkerToMain_ChildStdin

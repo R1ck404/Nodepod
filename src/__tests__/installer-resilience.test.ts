@@ -161,3 +161,14 @@ describe("installer resilience", () => {
     ).rejects.toThrow(/contained mismatch@9\.9\.9, expected 1\.0\.0/);
   }, 15_000);
 });
+
+describe("package cache keys", () => {
+  it("the shell's resolved default registry and the SDK's default share a key", async () => {
+    const { manifestSnapshotKey } = await import("../packages/installer");
+    const raw = JSON.stringify({ devDependencies: { vite: "8.0.10" } });
+    const sdk = manifestSnapshotKey(raw, { withDevDeps: true });
+    expect(manifestSnapshotKey(raw, { withDevDeps: true, registry: "https://registry.npmjs.org" })).toBe(sdk);
+    expect(manifestSnapshotKey(raw, { withDevDeps: true, registry: "https://registry.npmjs.org/" })).toBe(sdk);
+    expect(manifestSnapshotKey(raw, { withDevDeps: true, registry: "https://npm.example.com" })).not.toBe(sdk);
+  });
+});

@@ -18,7 +18,7 @@ Nodepod publishes five supported entry points.
 ## Main browser lifecycle
 
 1. Call `Nodepod.boot(options)`.
-2. Use `fs`, `packages`, `spawn()`, `request()`, `port()`, `createTerminal()`, `snapshot()`, or inspection/profiling capabilities.
+2. Use `fs`, `packages`, `spawn()`, `request()`, `port()`, `createTerminal()`, `snapshot()`, `persistence`, or inspection/profiling capabilities.
 3. Detach UI integrations.
 4. Call `teardown()`.
 

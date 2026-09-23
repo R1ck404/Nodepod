@@ -254,6 +254,10 @@ export class ProcessHandle extends EventEmitter {
           this.emit("vfs-snapshot", msg.snapshot);
           break;
 
+        case "vfs-meta":
+          this.emit("vfs-meta", msg);
+          break;
+
         case "spawn-request":
           this.emit("spawn-request", msg);
           break;

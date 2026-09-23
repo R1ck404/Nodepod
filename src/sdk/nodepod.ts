@@ -58,6 +58,12 @@ import {
 import { NodepodProfilerImpl } from "../profiling/profiler";
 import { PreviewInspector } from "./preview-inspector";
 import { TerminalServerUrlOutputStream } from "./server-url-output";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import {
+  openWorkspacePersistence,
+  type WorkspacePersistence,
+} from "../persistence/workspace";
 
 let activeNodepodCount = 0;
 
@@ -133,6 +139,8 @@ export class Nodepod {
   private _performance: PerformanceTracker;
   private _instrumentationProfiler: NodepodProfilerImpl | null;
   private _httpIngress: HttpIngress | null = null;
+  private _snapshotCache: IDBSnapshotCache | null = null;
+  private _persistence: WorkspacePersistence | null = null;
   private _headless = false;
   private _rewriteTerminalUrls: boolean;
   private _terminalUrlOutputStreams = new Set<TerminalServerUrlOutputStream>();
@@ -275,6 +283,27 @@ export class Nodepod {
   /* ---- Static factory ---- */
 
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
+    // undo what a failed boot already set up (e.g. the workspace lock, which
+    // would otherwise block the next boot of the same workspace)
+    const onFailure: Array<() => void> = [];
+    try {
+      return await Nodepod._boot(opts, onFailure);
+    } catch (e) {
+      for (const undo of onFailure) {
+        try {
+          undo();
+        } catch {
+          /* keep the original error */
+        }
+      }
+      throw e;
+    }
+  }
+
+  private static async _boot(
+    opts: NodepodOptions,
+    onFailure: Array<() => void>,
+  ): Promise<Nodepod> {
     const performanceTracker = new PerformanceTracker();
     const profiler = new NodepodProfilerImpl(opts.profiler);
     const stopBoot = performanceTracker.start("boot.total");
@@ -333,6 +362,28 @@ export class Nodepod {
       }
     }
 
+    // restore the saved workspace into the still-empty volume, then save
+    // every change from here on (including the `files` seed below)
+    let persistence: WorkspacePersistence | null = null;
+    let restored = false;
+    if (opts.persistence) {
+      const stopRestore = performanceTracker.start("boot.workspaceRestore");
+      try {
+        const opened = await openWorkspacePersistence(
+          volume,
+          opts.persistence,
+          host.openWorkspaceStore?.bind(host),
+        );
+        if (opened) {
+          persistence = opened.persistence;
+          restored = opened.restored;
+          onFailure.push(() => void opened.persistence.close());
+        }
+      } finally {
+        stopRestore();
+      }
+    }
+
     const packages = new DependencyInstaller(volume, {
       cwd,
       snapshotCache,
@@ -366,6 +417,8 @@ export class Nodepod {
       opts.rewriteTerminalUrls !== false,
     );
     nodepod._headless = headless;
+    nodepod._snapshotCache = snapshotCache;
+    nodepod._persistence = persistence;
     profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
 
     if (opts.spawnSnapshot) {
@@ -384,7 +437,9 @@ export class Nodepod {
     // embedded bundle string; fire-and-forget with embedded fallback
     ProcessManager.probeExternalWorkerBundle(opts.workerUrl).catch(() => {});
 
-    if (opts.files) {
+    const seedFiles =
+      !restored || opts.persistence?.seed === "always";
+    if (opts.files && seedFiles) {
       for (const [path, content] of Object.entries(opts.files)) {
         const dir = path.substring(0, path.lastIndexOf("/")) || "/";
         if (dir !== "/" && !volume.existsSync(dir)) {
@@ -401,6 +456,25 @@ export class Nodepod {
     for (const dir of ["/tmp", "/home"]) {
       if (!volume.existsSync(dir)) {
         volume.mkdirSync(dir, { recursive: true });
+      }
+    }
+
+    // node_modules isn't saved with the workspace; bring it back from
+    // package.json, normally straight out of the package snapshot cache
+    if (restored && persistence && opts.persistence?.autoInstall !== false) {
+      const manifestPath = (cwd === "/" ? "" : cwd) + "/package.json";
+      if (volume.existsSync(manifestPath)) {
+        const stopInstall = performanceTracker.start("boot.workspaceInstall");
+        try {
+          // same as `npm install` in the terminal, so it also reuses the
+          // package cache that install filled
+          await packages.installFromManifest(undefined, { withDevDeps: true });
+        } catch (e) {
+          // nobody can listen on nodepod.persistence before boot returns
+          console.warn("[Nodepod] reinstalling dependencies of the restored workspace failed:", e);
+        } finally {
+          stopInstall();
+        }
       }
     }
 
@@ -988,13 +1062,24 @@ export class Nodepod {
     this._assertActive();
     const autoInstall = opts?.autoInstall ?? true;
 
-    // Swap the internal tree
-    const fresh = MemoryVolume.fromSnapshot(snapshot);
-    (this._volume as any).tree = (fresh as any).tree;
-    this._volume.rebuildIndexes();
+    // decode and trial-mount first: a snapshot that can't be loaded must
+    // throw before anything of the current filesystem is removed
+    const entries = MemoryVolume.snapshotToMountEntries(snapshot);
+    new MemoryVolume().mountEntries(entries);
+
+    // replace everything but runtime-internal state through the regular
+    // mutation paths, so workers, the SharedVFS mirror, watchers and
+    // persistence all see the new tree
+    for (const name of this._volume.readdirSync("/")) {
+      const entryPath = "/" + name;
+      if (isInternalVfsPath(entryPath)) continue;
+      this._volume.removeTreeSync(entryPath);
+    }
+    this._volume.mountEntries(entries, { notify: true });
 
     // Auto-install deps from package.json if requested and manifest exists
-    if (autoInstall && this._volume.existsSync("/package.json")) {
+    const manifestPath = (this._cwd === "/" ? "" : this._cwd) + "/package.json";
+    if (autoInstall && this._volume.existsSync(manifestPath)) {
       await this._packages.installFromManifest();
     }
   }
@@ -1037,6 +1122,11 @@ export class Nodepod {
     this._vfsBridge.clearSharedVFS();
     this._sharedVFS = null;
     this._syncChannel = null;
+    // captures pending changes synchronously, so disposing the volume
+    // right after doesn't lose them
+    const persistenceClosed = this._persistence?.close();
+    this._snapshotCache?.close();
+    this._snapshotCache = null;
     this._volume.dispose();
     this._handler.destroy();
     this._unsubscribePressure?.();
@@ -1050,6 +1140,7 @@ export class Nodepod {
       ProcessManager.disposeGlobalResources();
     }
     await ingressStopped?.catch(() => {});
+    await persistenceClosed;
   }
 
   /* ---- Performance stats ---- */
@@ -1167,6 +1258,10 @@ export class Nodepod {
 
   get volume(): MemoryVolume {
     return this._volume;
+  }
+  /** Workspace persistence, when booted with the `persistence` option and a store was available. */
+  get persistence(): WorkspacePersistence | null {
+    return this._persistence;
   }
   /** @deprecated Main-thread engine removed for security. all code now runs in isolated Web Workers via spawn() <-- this removes fatal security flaws. */
   get engine(): never {

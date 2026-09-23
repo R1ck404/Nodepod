@@ -24,6 +24,7 @@ import { PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
 import type { PerformanceTracker } from "../performance-tracker";
 import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler";
 import { resolveWithCache } from "./resolution-cache";
+import { NPM_REGISTRY_URL } from "../constants/config";
 import { writeNpmPackageLock } from "./pm-cli";
 import {
   discoverWorkspaces,
@@ -65,12 +66,20 @@ function stableRecord(record: Record<string, string> | undefined): string {
   return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
 }
 
+// the SDK passes no registry, the shell passes the resolved default URL:
+// both mean the public registry and must share cache entries
+function cacheRegistry(registry: string | undefined): string {
+  if (!registry) return "default";
+  const trimmed = registry.replace(/\/+$/, "");
+  return trimmed === NPM_REGISTRY_URL ? "default" : trimmed;
+}
+
 export function manifestSnapshotKey(raw: string, flags: InstallFlags = {}): string {
   return quickDigest(JSON.stringify({
     version: SNAPSHOT_CACHE_VERSION,
     transformer: TRANSFORMER_CACHE_VERSION,
     manifest: raw,
-    registry: flags.registry ?? "default",
+    registry: cacheRegistry(flags.registry),
     dev: !!flags.withDevDeps,
     optional: !!flags.withOptionalDeps,
     transform: isEagerTransform(flags.transformModules) ? "eager" : "lazy",
@@ -269,7 +278,7 @@ export class DependencyInstaller {
       version: RESOLVER_CACHE_VERSION,
       package: targetName,
       range: targetRange,
-      registry: flags.registry ?? "default",
+      registry: cacheRegistry(flags.registry),
       dev: !!flags.withDevDeps,
       optional: !!flags.withOptionalDeps,
     }));
@@ -437,7 +446,7 @@ export class DependencyInstaller {
     const resolutionSpan = this.profileSpan("packages.resolve");
     const resolutionKey = quickDigest(JSON.stringify({
       version: RESOLVER_CACHE_VERSION,
-      registry: flags.registry ?? "default",
+      registry: cacheRegistry(flags.registry),
       dependencies: stableRecord(manifest.dependencies),
       devDependencies: flags.withDevDeps ? stableRecord(manifest.devDependencies) : "",
       optionalDependencies: flags.withOptionalDeps ? stableRecord(manifest.optionalDependencies) : "",
@@ -632,7 +641,7 @@ export class DependencyInstaller {
             version: RESOLVER_CACHE_VERSION,
             package: candidate.packageName,
             range: candidate.versionRange,
-            registry: flags.registry ?? "default",
+            registry: cacheRegistry(flags.registry),
             dev: !!flags.withDevDeps,
             optional: !!flags.withOptionalDeps,
           }));

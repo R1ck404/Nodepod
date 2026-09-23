@@ -17,6 +17,10 @@ export type {
   WatchCallback,
   WatchEventKind,
   SystemError,
+  VolumeMutation,
+  VolumeNodeInfo,
+  MountEntry,
+  MetaChange,
 } from "./memory-volume";
 export { ScriptEngine, executeCode } from "./script-engine";
 export type { ModuleRecord, EngineOptions, ResolverFn } from "./script-engine";
@@ -192,6 +196,24 @@ export { NodepodProcess } from "./sdk/nodepod-process";
 export { NodepodFS } from "./sdk/nodepod-fs";
 export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client";
 export {
+  WorkspacePersistence,
+  createMemoryWorkspaceStore,
+  createIndexedDBWorkspaceStore,
+  listIndexedDBWorkspaces,
+  deleteIndexedDBWorkspace,
+} from "./persistence/workspace";
+export type {
+  PersistenceOptions,
+  PersistenceStatus,
+  PersistenceSavedEvent,
+  WorkspaceStore,
+  WorkspaceManifest,
+  WorkspaceEntry,
+  WorkspaceBatch,
+  IndexedDBWorkspaceStoreOptions,
+  StoredWorkspaceInfo,
+} from "./persistence/workspace";
+export {
   PreviewInspector,
   PreviewInspectorError,
   PreviewNotAttachedError,
@@ -206,6 +228,7 @@ export type {
   TerminalTheme,
   StatResult,
   Snapshot,
+  SnapshotOptions,
   SpawnOptions,
   ShellLimits,
   ShellOptions,
