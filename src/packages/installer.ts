@@ -14,6 +14,8 @@ import { convertPackage, prepareTransformer } from "../module-transformer";
 import type { PackageManifest } from "../types/manifest";
 import * as path from "../polyfills/path";
 import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import { canPageFrom, type PackContentSource } from "../persistence/pack-content-source";
+import type { VFSSnapshotEntry } from "../threading/worker-protocol";
 import { quickDigest } from "../helpers/digest";
 import {
   createFilteredBinarySnapshot,
@@ -114,7 +116,7 @@ export function isEagerTransform(value: boolean | "eager" | undefined): boolean 
 }
 
 export function isManifestSnapshotComplete(
-  snapshot: Parameters<typeof restoreBinarySnapshot>[1],
+  snapshot: { manifest: ReadonlyArray<{ path: string }> },
   workingDir: string,
   manifest: PackageManifest,
   flags: InstallFlags = {},
@@ -212,6 +214,7 @@ export class DependencyInstaller {
   private registryClient: RegistryClient;
   private workingDir: string;
   private _snapshotCache: IDBSnapshotCache | null;
+  private _packSource: PackContentSource | null;
   private _performance: PerformanceTracker | null;
   private _profiler: NodepodProfilerImpl | null;
 
@@ -220,6 +223,8 @@ export class DependencyInstaller {
     opts: {
       cwd?: string;
       snapshotCache?: IDBSnapshotCache | null;
+      /** Mount cached packs paged out instead of loading them (volume eviction). */
+      packSource?: PackContentSource | null;
       performanceTracker?: PerformanceTracker | null;
       profiler?: NodepodProfilerImpl | null;
     } & RegistryConfig = {},
@@ -228,6 +233,7 @@ export class DependencyInstaller {
     this.registryClient = new RegistryClient(opts);
     this.workingDir = opts.cwd || "/";
     this._snapshotCache = opts.snapshotCache ?? null;
+    this._packSource = opts.packSource ?? null;
     this._performance = opts.performanceTracker ?? null;
     this._profiler = opts.profiler ?? null;
   }
@@ -242,6 +248,53 @@ export class DependencyInstaller {
 
   private endProfileSpan(token: ProfileSpanToken | null): void {
     this._profiler?.end(token);
+  }
+
+  // Runs fn with every file under dirs in memory. Installing on top of a
+  // paged-out node_modules reads package files synchronously (the WASI
+  // companion scan, building the pack to cache); those would otherwise see
+  // EAGAIN and silently skip the files. Eviction waits until fn is done.
+  private async withPackagesResident<T>(dirs: string[], fn: () => T): Promise<T> {
+    if (!this.vol.evictionEnabled) return fn();
+    const resume = this.vol.pauseEviction();
+    try {
+      const paths = dirs.flatMap((dir) => this.vol.pagedOutPaths(dir));
+      for (let i = 0; i < paths.length; i += 512) {
+        await this.vol.ensureResident(paths.slice(i, i + 512));
+      }
+      return fn();
+    } finally {
+      resume();
+    }
+  }
+
+  // Restores a cached pack, or returns null on a miss. With a pack source
+  // the pack is mounted paged out (manifest only); otherwise its data is
+  // loaded and mounted in full.
+  private async restoreCachedPack(
+    key: string,
+    accept: (manifest: VFSSnapshotEntry[]) => boolean,
+    onProgress?: (message: string) => void,
+  ): Promise<number | null> {
+    const cache = this._snapshotCache;
+    if (!cache) return null;
+    const paged = !!this._packSource && this.vol.evictionEnabled && canPageFrom(cache);
+    const cached = paged ? null : await cache.get(key);
+    const head = paged ? await (cache as Required<IDBSnapshotCache>).getManifest(key) : null;
+    const manifest = paged ? head?.manifest : cached?.manifest;
+    if (!manifest || !accept(manifest)) return null;
+
+    onProgress?.("Restoring cached node_modules...");
+    const stopRestore = this._performance?.start("install.restore");
+    const restoreSpan = this.profileSpan("snapshots.restore", "snapshots");
+    try {
+      return paged
+        ? await this._packSource!.mountPaged(this.vol, key, head!)
+        : restoreBinarySnapshot(this.vol, { ...cached!, sourceKey: key });
+    } finally {
+      stopRestore?.();
+      this.endProfileSpan(restoreSpan);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -317,14 +370,8 @@ export class DependencyInstaller {
 
     if (this._snapshotCache && treeKey) {
       try {
-        const cached = await this._snapshotCache.get(treeKey);
-        if (cached) {
-          onProgress?.("Restoring cached packages...");
-          const stopRestore = this._performance?.start("install.restore");
-          const restoreSpan = this.profileSpan("snapshots.restore", "snapshots");
-          const restored = restoreBinarySnapshot(this.vol, cached);
-          stopRestore?.();
-          this.endProfileSpan(restoreSpan);
+        const restored = await this.restoreCachedPack(treeKey, () => true, onProgress);
+        if (restored !== null) {
           // bin stubs + lock file are deterministic — recreate from the tree
           const nmRoot = path.join(this.workingDir, "node_modules");
           for (const [depName] of tree) {
@@ -365,9 +412,10 @@ export class DependencyInstaller {
       try {
         const nmRoot = path.join(this.workingDir, "node_modules");
         const prefixes = [...tree.keys()].map((n) => path.join(nmRoot, n));
-        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
-          prefixes.some((prefix) => p === prefix || p.startsWith(prefix + "/")),
-        );
+        const snapshot = await this.withPackagesResident(prefixes, () =>
+          createFilteredBinarySnapshot(this.vol, (p) =>
+            prefixes.some((prefix) => p === prefix || p.startsWith(prefix + "/")),
+          ));
         await this._snapshotCache.set(treeKey, snapshot);
       } catch { /* cache write failure is non-fatal */ }
     }
@@ -411,14 +459,13 @@ export class DependencyInstaller {
     const cacheKey = this._snapshotCache ? manifestSnapshotKey(raw, flags) : null;
     if (this._snapshotCache && cacheKey) {
       try {
-        const cached = await this._snapshotCache.get(cacheKey);
-        if (cached && isManifestSnapshotComplete(cached, this.workingDir, manifest, flags)) {
-          onProgress?.("Restoring cached node_modules...");
-          const stopRestore = this._performance?.start("install.restore");
-          const restoreSpan = this.profileSpan("snapshots.restore", "snapshots");
-          const restored = restoreBinarySnapshot(this.vol, cached);
-          stopRestore?.();
-          this.endProfileSpan(restoreSpan);
+        const restored = await this.restoreCachedPack(
+          cacheKey,
+          (cachedManifest) =>
+            isManifestSnapshotComplete({ manifest: cachedManifest }, this.workingDir, manifest, flags),
+          onProgress,
+        );
+        if (restored !== null) {
           onProgress?.(`Restored ${restored} cached entries`);
           this._performance?.increment("install.cacheHits");
           this._profiler?.count("packages.snapshotCacheHits");
@@ -475,8 +522,9 @@ export class DependencyInstaller {
     // no base64 — restores go through the bulk binary path)
     if (this._snapshotCache && cacheKey && newPkgs.length > 0) {
       try {
-        const snapshot = createFilteredBinarySnapshot(this.vol, (p) =>
-          p.includes("/node_modules/"),
+        const snapshot = await this.withPackagesResident(
+          [path.join(this.workingDir, "node_modules")],
+          () => createFilteredBinarySnapshot(this.vol, (p) => p.includes("/node_modules/")),
         );
         await this._snapshotCache.set(cacheKey, snapshot);
       } catch { /* cache write failure is non-fatal */ }
@@ -623,7 +671,11 @@ export class DependencyInstaller {
     for (let pass = 0; pass < 16; pass++) {
       installed.push(...await this.materializePackages(tree, flags));
 
-      const candidates = this.findWasiCompanionCandidates(tree);
+      const nmRoot = path.join(this.workingDir, "node_modules");
+      const candidates = await this.withPackagesResident(
+        [...tree.keys()].map((placement) => path.join(nmRoot, placement)),
+        () => this.findWasiCompanionCandidates(tree),
+      );
       let added = false;
 
       for (const candidate of candidates) {

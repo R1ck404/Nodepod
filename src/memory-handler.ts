@@ -115,6 +115,15 @@ export interface MemoryHandlerOptions {
   monitorIntervalMs?: number;
   /** Max process stdout/stderr accumulation in bytes. Default: 4194304 (4MB) */
   maxProcessOutputBytes?: number;
+  /**
+   * Keep installed package content (node_modules restored from the package
+   * cache) out of main-thread memory and read files back from the cache on
+   * demand. Needs SharedArrayBuffer (lean spawn snapshots) and the package
+   * snapshot cache. Default: false.
+   */
+  evictPackageContent?: boolean;
+  /** Package content kept in main-thread memory with evictPackageContent. Default: 128 */
+  residentContentBudgetMB?: number;
 }
 
 const DEFAULTS: Required<MemoryHandlerOptions> = {
@@ -129,6 +138,8 @@ const DEFAULTS: Required<MemoryHandlerOptions> = {
   heapWarnThresholdMB: 350,
   monitorIntervalMs: 30_000,
   maxProcessOutputBytes: 4_194_304,
+  evictPackageContent: false,
+  residentContentBudgetMB: 128,
 };
 
 /* ---- MemoryHandler ---- */

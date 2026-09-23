@@ -46,6 +46,8 @@ export class NodepodFS {
   ): Promise<string | Uint8Array> {
     const token = this.begin("filesystem.readFile", { path });
     try {
+      // package content may be paged out of memory (memory.evictPackageContent)
+      if (this._vol.isPagedOut(path)) await this._vol.ensureResident(path);
       const result = encoding
         ? this._vol.readFileSync(path, "utf8") as string
         : this._vol.readFileSync(path) as Uint8Array;

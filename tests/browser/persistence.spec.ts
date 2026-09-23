@@ -117,3 +117,59 @@ test.describe("workspace persistence", () => {
       .toEqual(["EWORKSPACELOCKLOST"]);
   });
 });
+
+test.describe("package content eviction", () => {
+  test("pages a cached package out of main-thread memory and back in for workers", async ({ page }) => {
+    await openHarness(page);
+    // eviction needs SharedArrayBuffer (lean spawn snapshots); without cross-origin
+    // isolation it turns itself off, which the other specs cover
+    test.skip(!(await page.evaluate(() => crossOriginIsolated)), "needs cross-origin isolation");
+    const manifest = JSON.stringify({ name: "evict-e2e", dependencies: { "is-number": "7.0.0" } });
+
+    // first boot installs from the network and fills the IndexedDB package cache
+    await page.evaluate(async (manifest) => {
+      const { Nodepod } = (window as unknown as { __nodepod: SDK }).__nodepod;
+      const pod = await Nodepod.boot({
+        serviceWorker: false,
+        watermark: false,
+        workdir: "/app",
+        files: { "/app/package.json": manifest },
+      });
+      await pod.packages.installFromManifest();
+      await pod.teardown();
+    }, manifest);
+
+    const result = await page.evaluate(async (manifest) => {
+      const { Nodepod } = (window as unknown as { __nodepod: SDK }).__nodepod;
+      const pod = await Nodepod.boot({
+        serviceWorker: false,
+        watermark: false,
+        workdir: "/app",
+        files: { "/app/package.json": manifest },
+        memory: { evictPackageContent: true },
+      });
+      await pod.packages.installFromManifest();
+      const afterRestore = pod.memoryStats().vfs;
+      const child = await pod.spawn("node", ["-e", "console.log(require('is-number')(42))"], { cwd: "/app" });
+      const run = await child.completion;
+      const out = {
+        enabled: pod.volume.evictionEnabled,
+        pagedOut: afterRestore.pagedOutFiles,
+        indexPagedOut: pod.volume.isPagedOut("/app/node_modules/is-number/index.js"),
+        stdout: run.stdout.trim(),
+        stderr: run.stderr,
+        sdkRead: (await pod.fs.readFile("/app/node_modules/is-number/index.js", "utf8")).includes("module.exports"),
+        syncMisses: pod.memoryStats().vfs.pagedOutSyncMisses,
+      };
+      await pod.teardown();
+      return out;
+    }, manifest);
+
+    expect(result.enabled).toBe(true);
+    expect(result.pagedOut).toBeGreaterThan(0);
+    expect(result.stdout).toBe("true");
+    expect(result.stderr).toBe("");
+    expect(result.sdkRead).toBe(true);
+    expect(result.syncMisses).toBe(0);
+  });
+});

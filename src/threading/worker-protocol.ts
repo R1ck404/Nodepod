@@ -11,6 +11,10 @@ export interface VFSBinarySnapshot {
   // directory names excluded from the snapshot (lean spawn mode). the worker
   // installs a lazy fs fallback for paths under these names.
   lazyDirNames?: string[];
+  // set when the snapshot is a package pack restored from the snapshot
+  // cache under this key; lets the main thread page it from the cache
+  // instead of keeping the forwarded bytes
+  sourceKey?: string;
 }
 
 export interface VFSSnapshotEntry {

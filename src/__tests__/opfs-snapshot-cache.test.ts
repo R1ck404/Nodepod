@@ -35,7 +35,8 @@ describe("OPFS snapshot cache", () => {
     await cache!.set("key", snapshot);
     expect(await cache!.get("key")).toEqual(snapshot);
 
-    files.set("key.bin", new Blob([new Uint8Array([9])]));
+    const dataFile = [...files.keys()].find((name) => name.endsWith(".bin"))!;
+    files.set(dataFile, new Blob([new Uint8Array([9])]));
     expect(await cache!.get("key")).toBeNull();
   });
 });
