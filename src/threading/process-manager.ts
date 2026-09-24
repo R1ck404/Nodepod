@@ -36,7 +36,7 @@ import type { ShellOptions } from "../shell/shell-options";
 import type { VFSBridge } from "./vfs-bridge";
 import { getRuntimeHost } from "../host/runtime-host";
 import type { HostWorker } from "../host/types";
-import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
+import { SyncResultWriter, SYNC_STATUS_ERROR } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
 
@@ -116,6 +116,8 @@ export class ProcessManager extends EventEmitter {
   // pids of children whose stdout is their parent's terminal: they start at
   // the parent's size and get its resizes, like processes sharing a tty
   private _ttyChildren = new Set<number>();
+  // spawnSync/execSync results bigger than one sync slot, by slot handle
+  private _syncWriters = new Map<number, { pid: number; writer: SyncResultWriter }>();
   private _httpCallbacks = new Map<
     number,
     { pid: number; fn: (resp: WorkerToMain_HttpResponse) => void }
@@ -1538,6 +1540,16 @@ export class ProcessManager extends EventEmitter {
       });
     });
 
+    handle.on("sync-more", (syncSlot: number) => {
+      const pending = this._syncWriters.get(syncSlot);
+      if (pending && !pending.writer.writeNext()) this._syncWriters.delete(syncSlot);
+    });
+    handle.on("exit", () => {
+      for (const [syncSlot, pending] of this._syncWriters) {
+        if (pending.pid === handle.pid) this._syncWriters.delete(syncSlot);
+      }
+    });
+
     handle.on("spawn-sync", (msg: WorkerToMain_SpawnSync) => {
       if (!this._syncBuffer) {
         return;
@@ -1553,17 +1565,9 @@ export class ProcessManager extends EventEmitter {
         (msg.args.length
           ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
           : quoteShell(msg.command));
-      const maxStdoutLen = (SLOT_SIZE - 3) * 4;
-      const { slot: syncSlotIndex } = decodeSyncSlot(msg.syncSlot);
-
       const signalError = (exitCode: number) => {
         try {
-          const int32 = new Int32Array(this._syncBuffer!);
-          const slotBase = syncSlotIndex * SLOT_SIZE;
-          Atomics.store(int32, slotBase + 1, exitCode);
-          Atomics.store(int32, slotBase + 2, 0);
-          Atomics.store(int32, slotBase, 2); // STATUS_ERROR
-          Atomics.notify(int32, slotBase);
+          new SyncResultWriter(this._syncBuffer!, msg.syncSlot, exitCode, "", "", SYNC_STATUS_ERROR).writeNext();
         } catch {
           // buffer unusable, worker will time out
         }
@@ -1613,13 +1617,20 @@ export class ProcessManager extends EventEmitter {
           childHandle.on("ready", sendExec);
         }
 
-        // parent is blocked on Atomics.wait, can't process postMessage — emit directly
-        childHandle.on("stdout", (data: string) => {
-          handle.emit("stdout", data);
-        });
-        childHandle.on("stderr", (data: string) => {
-          handle.emit("stderr", data);
-        });
+        // parent is blocked on Atomics.wait, can't process postMessage — emit
+        // directly. only streams the child shares with the parent show up in
+        // its output; piped ones are captured for the result (node: execSync
+        // captures stdout and passes stderr through, spawnSync captures both)
+        if (!msg.stdio || msg.stdio[1] === "inherit") {
+          childHandle.on("stdout", (data: string) => {
+            handle.emit("stdout", data);
+          });
+        }
+        if (!msg.stdio || msg.stdio[2] === "inherit") {
+          childHandle.on("stderr", (data: string) => {
+            handle.emit("stderr", data);
+          });
+        }
 
         childHandle.on("stdin-raw-status", (isRaw: boolean) => {
           handle.emit("stdin-raw-status", isRaw);
@@ -1627,22 +1638,16 @@ export class ProcessManager extends EventEmitter {
 
         childHandle.on("exit", (exitCode: number) => {
           try {
-            const int32 = new Int32Array(this._syncBuffer!);
-            const encoder = new TextEncoder();
-            const slotBase = syncSlotIndex * SLOT_SIZE;
-            const stdoutBytes = encoder.encode(childHandle.stdout);
-            const truncatedLen = Math.min(stdoutBytes.byteLength, maxStdoutLen);
-
-            Atomics.store(int32, slotBase + 1, exitCode);
-            Atomics.store(int32, slotBase + 2, truncatedLen);
-
-            const uint8 = new Uint8Array(this._syncBuffer!);
-            const dataOffset = (slotBase + 3) * 4;
-            uint8.set(stdoutBytes.subarray(0, truncatedLen), dataOffset);
-
-            // last store wakes the waiting worker
-            Atomics.store(int32, slotBase, 1);
-            Atomics.notify(int32, slotBase);
+            // stdout and stderr, in as many chunks as they need: the worker
+            // asks for each further one with "sync-more"
+            const writer = new SyncResultWriter(
+              this._syncBuffer!,
+              msg.syncSlot,
+              exitCode,
+              childHandle.stdout,
+              childHandle.stderr,
+            );
+            if (writer.writeNext()) this._syncWriters.set(msg.syncSlot, { pid: handle.pid, writer });
           } catch {
             signalError(1);
           }
