@@ -35,7 +35,7 @@ import {
   type WorkspaceGraph,
 } from "./workspace";
 
-const RESOLVER_CACHE_VERSION = 2;
+const RESOLVER_CACHE_VERSION = 3;
 const MATERIALIZE_ATTEMPTS = 3;
 const MATERIALIZE_RETRY_DELAY_MS = 750;
 const SNAPSHOT_CACHE_VERSION = 4;
