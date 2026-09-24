@@ -68,4 +68,28 @@ describe("event-loop ordering parity with node", () => {
     );
     expect(lines).toEqual(["sync", "immediate"]);
   });
+
+  it("top-level await with a .then chain unwraps on import", async () => {
+    const vol = new MemoryVolume();
+    vol.writeFileSync(
+      "/lib.mjs",
+      "export const v = await Promise.resolve(1).then(x => x + 1);\n"
+    );
+    vol.writeFileSync(
+      "/a.mjs",
+      "import { v } from './lib.mjs';\nconsole.log(v);\n"
+    );
+    initShellExec(vol, { cwd: "/" });
+    const ctx: ShellContext = {
+      cwd: "/",
+      env: { HOME: "/home", PATH: "/usr/bin", PWD: "/" },
+      volume: vol,
+      exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    };
+    const { executeNodeBinary: run } = await import(
+      "../polyfills/child_process"
+    );
+    const r = await run("/a.mjs", [], ctx);
+    expect(r.stdout.trim().split("\n").pop()).toBe("2");
+  });
 });

@@ -460,8 +460,11 @@ export function stripTopLevelAwait(
           ) {
             awaitEnd++;
           }
-          patches.push([node.start, awaitEnd, "__syncAwait("]);
-          patches.push([node.end, node.end, ")"]);
+          // Thunk form: the whole argument (including any `.then` chains)
+          // evaluates inside syncAwaitFn's scope, so chained promises
+          // unwrap synchronously like the rest of the sync fast-paths.
+          patches.push([node.start, awaitEnd, "__syncAwaitFn(() => ("]);
+          patches.push([node.end, node.end, "))"]);
         }
       }
 

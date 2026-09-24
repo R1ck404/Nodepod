@@ -398,6 +398,7 @@ var import_meta = $importMeta;
 var __asyncLoad = $asyncLoad;
 var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
+var __syncAwaitFn = $syncAwaitFn;
 var Promise = ${promiseVar};
 var global = globalThis;
 `;
@@ -432,7 +433,7 @@ async function __wasmInstantiate(moduleOrBytes, imports) {
 `;
   }
 
-  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $SyncPromise) {
+  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $syncAwaitFn, $SyncPromise) {
 ${vars}return (${fnKeyword}() {
 ${code}
 }).call(this);
@@ -857,6 +858,17 @@ function syncAwait(val: unknown): unknown {
   return val;
 }
 
+/**
+ * Thunk form emitted by the TLA transform: `await EXPR` compiles to
+ * `__syncAwaitFn(() => (EXPR))`. The whole argument — including any
+ * `.then` chains — evaluates inside the sync scope, so chained promises
+ * unwrap synchronously exactly like values passed to `syncAwait`.
+ * Genuinely async values behave as before (returned pending).
+ */
+function syncAwaitFn(thunk: () => unknown): unknown {
+  return inSyncScope(() => syncAwait(thunk()));
+}
+
 // Promise subclass that resolves .then() synchronously when the executor resolves sync.
 // Needed because async functions always return native Promises, but when their body
 // resolves synchronously we want __syncAwait to unwrap the result.
@@ -1008,7 +1020,7 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && onRejected) {
+      if (this._syncRejected && syncScopeDepth > 0 && onRejected) {
         try {
           const result = onRejected(this._syncError);
           return new SyncPromise<TResult2>((res) =>
@@ -2166,6 +2178,7 @@ function buildResolver(
         importMetaForModule(childResolver, resolved, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
 
@@ -2216,6 +2229,7 @@ function buildResolver(
             importMetaForModule(childResolver, resolved, dir),
             asyncLoader,
             syncAwait,
+            syncAwaitFn,
             SyncPromiseClass,
           );
           record.loaded = true;
@@ -3274,6 +3288,7 @@ export class ScriptEngine {
         importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
 
@@ -3405,6 +3420,7 @@ export class ScriptEngine {
           importMetaForModule(resolver, filename, dir),
           asyncLoader,
           syncAwait,
+          syncAwaitFn,
           SyncPromiseClass,
         );
         mod.loaded = true;
@@ -3433,6 +3449,7 @@ export class ScriptEngine {
         importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
       mod.loaded = true;

@@ -680,15 +680,33 @@ export function buildProcessEnv(config?: {
     // queue (including nextTicks queued during the drain), so chained
     // nextTick callbacks run before already-queued promise callbacks.
     // A raw queueMicrotask would interleave them FIFO instead.
+    // A throwing callback must not drop the rest of the batch (Node runs
+    // them, then surfaces the error): collect and rethrow async.
     nextTick: (() => {
       const pending: Array<() => void> = [];
       let pumpScheduled = false;
       const drain = () => {
         pumpScheduled = false;
         let batch = pending.splice(0);
+        let firstError: unknown = null;
+        let sawError = false;
         while (batch.length > 0) {
-          for (const cb of batch) cb();
+          for (const cb of batch) {
+            try {
+              cb();
+            } catch (e) {
+              if (!sawError) {
+                sawError = true;
+                firstError = e;
+              }
+            }
+          }
           batch = pending.splice(0);
+        }
+        if (sawError) {
+          queueMicrotask(() => {
+            throw firstError;
+          });
         }
       };
       return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {
