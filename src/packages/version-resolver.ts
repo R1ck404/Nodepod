@@ -796,6 +796,79 @@ async function walkEdgesForPackage(
       ),
     );
   }
+
+  await nestPeerConsumers(placementKey, { ...edges, ...optionalEdges }, state);
+}
+
+// Node resolution from `fromKey`: the placement key `name` resolves to, walking
+// up through each enclosing node_modules to the root.
+function visiblePlacement(
+  fromKey: string,
+  name: string,
+  completed: Map<string, ResolvedDependency>,
+): string | undefined {
+  let key = fromKey;
+  while (key) {
+    const nested = `${key}/node_modules/${name}`;
+    if (completed.has(nested)) return nested;
+    const cut = key.lastIndexOf("/node_modules/");
+    key = cut < 0 ? "" : key.slice(0, cut);
+  }
+  return completed.has(name) ? name : undefined;
+}
+
+// A dependency with peer dependencies has to see the same peers as the package
+// that depends on it. When the requirer nested its own copy of a peer (it pins
+// a version the root doesn't hold) but the dependency itself was reused from
+// higher up, the dependency would resolve the other copy: napi-rs wasm bindings
+// pin @emnapi/core 2.x while a shared @napi-rs/wasm-runtime at the root picked
+// up a root @emnapi 1.x, and the mismatched pair fails at load. npm nests the
+// dependency next to the requirer's peers in that case, and so do we.
+async function nestPeerConsumers(
+  placementKey: string,
+  edges: Record<string, string>,
+  state: TreeWalkState,
+): Promise<void> {
+  const { completed, registry } = state;
+  for (const [childName, childRange] of Object.entries(edges)) {
+    const childKey = visiblePlacement(placementKey, childName, completed);
+    if (!childKey || childKey.startsWith(`${placementKey}/node_modules/`)) continue;
+    const child = completed.get(childKey)!;
+    let info: VersionDetail | undefined;
+    try {
+      info = (await registry.fetchManifest(child.fetchName)).versions[child.version];
+    } catch {
+      continue;
+    }
+    const peers = Object.keys(info?.peerDependencies || {});
+    const mismatched = peers.some((peer) => {
+      const own = visiblePlacement(placementKey, peer, completed);
+      return own !== undefined && own !== visiblePlacement(childKey, peer, completed);
+    });
+    if (!mismatched) continue;
+
+    const nestedKey = `${placementKey}/node_modules/${childName}`;
+    const pending = state.placementPromises.get(nestedKey);
+    if (pending) {
+      await pending;
+      continue;
+    }
+    if (completed.has(nestedKey)) continue;
+    const alias = parseNpmAlias(childRange);
+    const nested = installPackageAt(
+      nestedKey,
+      alias?.realName ?? child.fetchName,
+      childName,
+      alias ? alias.realRange : child.version,
+      state,
+    );
+    state.placementPromises.set(nestedKey, nested.then(() => undefined));
+    try {
+      await nested;
+    } catch {
+      /* keep the shared copy if the nested install can't resolve */
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
