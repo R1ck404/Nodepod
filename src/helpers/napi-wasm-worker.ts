@@ -284,6 +284,7 @@ export function createNapiWorkerFactory(
       workerData: workerDataVal,
       threadId: this.threadId,
       isEval,
+      argv: Array.isArray(opts?.argv) ? opts.argv.map(String) : [],
       cwd: (globalThis as any).process?.cwd?.() ?? "/",
       env,
       onMessage: (data: unknown) => self.emit("message", data),

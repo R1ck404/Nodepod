@@ -20,6 +20,8 @@ export type WorkerThreadForkFn = (
     workerData: unknown;
     threadId: number;
     isEval?: boolean;
+    /** extra process.argv entries after the script, like node's `argv` option */
+    argv?: string[];
     cwd: string;
     env: Record<string, string>;
     onMessage: (data: unknown) => void;
@@ -334,6 +336,7 @@ export const Worker = function Worker(
     workerData: workerDataVal,
     threadId: this.threadId,
     isEval,
+    argv: Array.isArray(opts?.argv) ? opts.argv.map(String) : [],
     cwd: (globalThis as any).process?.cwd?.() ?? "/",
     env,
     onMessage: (data: unknown) => {

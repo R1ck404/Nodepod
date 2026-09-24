@@ -1525,13 +1525,25 @@ export async function executeNodeBinary(
     _activeProcs.add(proc as any);
   }
 
-  // forked children keep an IPCChannel handle for the whole fork lifetime,
-  // released on disconnect or exit. "IPCChannel" matches what real node
-  // reports from process.getActiveResourcesInfo() for fork IPC channels.
+  // forked children hold an IPCChannel handle until disconnect or exit.
+  // "IPCChannel" matches what real node reports from
+  // process.getActiveResourcesInfo(). like node, the channel only keeps the
+  // child alive while it listens for 'message' or 'disconnect': a child
+  // that never does exits once its own work is done.
   const isFork = !!opts?.isFork;
   let ipcHandle: Handle | null = null;
   if (isFork) {
-    ipcHandle = getRegistry().register("IPCChannel");
+    ipcHandle = getRegistry().register("IPCChannel", { refed: false });
+    const isChannelEvent = (evt: unknown) => evt === "message" || evt === "disconnect";
+    // newListener fires before the listener is added
+    proc.on("newListener", (evt: unknown) => {
+      if (isChannelEvent(evt)) ipcHandle?.ref();
+    });
+    proc.on("removeListener", (evt: unknown) => {
+      if (isChannelEvent(evt) && proc.listenerCount("message") + proc.listenerCount("disconnect") === 0) {
+        ipcHandle?.unref();
+      }
+    });
     const origDisconnect = proc.disconnect;
     proc.disconnect = (() => {
       origDisconnect?.call(proc);

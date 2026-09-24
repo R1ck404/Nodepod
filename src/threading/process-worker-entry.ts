@@ -1053,6 +1053,7 @@ function workerThreadFork(
     threadId: number;
     isEval?: boolean;
     rawWasi?: boolean;
+    argv?: string[];
     cwd: string;
     env: Record<string, string>;
     onMessage: (data: unknown) => void;
@@ -1118,7 +1119,7 @@ function workerThreadFork(
       requestId,
       modulePath,
       isEval: opts.isEval,
-      args: [],
+      args: opts.argv ?? [],
       cwd: opts.cwd,
       env: opts.env,
       workerData: opts.workerData,
