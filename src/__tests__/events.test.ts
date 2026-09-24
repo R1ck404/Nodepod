@@ -2,6 +2,50 @@ import { describe, it, expect, vi } from "vitest";
 import eventModule, { EventEmitter } from "../polyfills/events";
 
 describe("EventEmitter", () => {
+  describe("newListener / removeListener", () => {
+    it("announces a listener before it is added, with the original for once()", () => {
+      const ee = new EventEmitter();
+      const seen: Array<[string, unknown, number]> = [];
+      ee.on("newListener", (name: string, fn: unknown) => {
+        seen.push([name, fn, ee.listenerCount(name)]);
+      });
+      const a = () => {};
+      const b = () => {};
+      const c = () => {};
+      ee.on("data", a);
+      ee.once("data", b);
+      ee.prependListener("end", c);
+      expect(seen).toEqual([["data", a, 0], ["data", b, 1], ["end", c, 0]]);
+    });
+
+    it("announces removals, including once() listeners that fire", () => {
+      const ee = new EventEmitter();
+      const removed: Array<[string, unknown]> = [];
+      ee.on("removeListener", (name: string, fn: unknown) => removed.push([name, fn]));
+      const a = () => {};
+      const b = () => {};
+      ee.on("x", a);
+      ee.once("y", b);
+      ee.removeListener("x", a);
+      ee.removeListener("x", a); // not registered anymore: no event
+      ee.emit("y");
+      expect(removed).toEqual([["x", a], ["y", b]]);
+    });
+
+    it("announces every listener removeAllListeners drops", () => {
+      const ee = new EventEmitter();
+      const removed: string[] = [];
+      const a = () => {};
+      ee.on("x", a);
+      ee.on("y", a);
+      ee.on("removeListener", (name: string) => removed.push(name));
+      ee.removeAllListeners();
+      // like node: the last removeListener listener is gone before it could hear about itself
+      expect(removed).toEqual(["x", "y"]);
+      expect(ee.eventNames()).toEqual([]);
+    });
+  });
+
   describe("on/emit", () => {
     it("emits event and calls listener", () => {
       const ee = new EventEmitter();
