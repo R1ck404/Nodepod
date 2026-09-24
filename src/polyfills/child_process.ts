@@ -2109,8 +2109,8 @@ export function exec(
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = exitCode;
-      child.emit("close", exitCode, null);
       child.emit("exit", exitCode, null);
+      child.emit("close", exitCode, null);
       if (done) {
         if (exitCode !== 0) {
           const e = new Error(`Command failed: ${command}`);
@@ -2501,8 +2501,8 @@ export function spawn(
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = 127;
-      child.emit("close", 127, null);
       child.emit("exit", 127, null);
+      child.emit("close", 127, null);
     });
     return child;
   }
@@ -2577,8 +2577,8 @@ export function spawn(
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = exitCode;
-      child.emit("close", exitCode, null);
       child.emit("exit", exitCode, null);
+      child.emit("close", exitCode, null);
     }).catch((e) => {
       childHandle.close();
       child.emit("error", e instanceof Error ? e : new Error(String(e)));
@@ -2600,8 +2600,8 @@ export function spawn(
         child.stdout?.push(null);
         child.stderr?.push(null);
         child.exitCode = exitCode;
-        child.emit("close", exitCode, null);
         child.emit("exit", exitCode, null);
+        child.emit("close", exitCode, null);
       },
       (e) => {
         child.emit("error", e instanceof Error ? e : new Error(String(e)));
