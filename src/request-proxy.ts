@@ -18,6 +18,29 @@ import {
 import { EventEmitter } from "./polyfills/events";
 import { Buffer } from "./polyfills/buffer";
 import { bytesToBase64 } from "./helpers/byte-encoding";
+
+// Response buffers nothing else references (just received from a process
+// worker): the preview relay may transfer them to the service worker as-is.
+const _transferable = new WeakSet<ArrayBuffer>();
+
+export function markTransferable(buf: ArrayBuffer): void {
+  _transferable.add(buf);
+}
+
+function transferableBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buf = bytes.buffer;
+  if (
+    buf instanceof ArrayBuffer &&
+    _transferable.has(buf) &&
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === buf.byteLength
+  ) {
+    _transferable.delete(buf);
+    return buf;
+  }
+  // a copy (Buffer#slice would be a view over the same memory)
+  return new Uint8Array(bytes).buffer as ArrayBuffer;
+}
 import { TIMEOUTS, WS_OPCODE } from "./constants/config";
 import { createHash } from "./polyfills/crypto";
 import {
@@ -1507,6 +1530,24 @@ export class RequestProxy extends EventEmitter {
                 fallbackResp.headers.forEach((v, k) => {
                   fallbackHeaders[k] = v;
                 });
+                if (data.rawBody) {
+                  replyPort.postMessage(
+                    {
+                      type: "response",
+                      id,
+                      data: {
+                        statusCode: fallbackResp.status,
+                        statusMessage: fallbackResp.statusText || "OK",
+                        headers: fallbackHeaders,
+                        body: fallbackBody,
+                        // not the pod's: never cache it under the pod's path
+                        fromNetwork: true,
+                      },
+                    },
+                    [fallbackBody],
+                  );
+                  return;
+                }
                 const fallbackB64 = fallbackBody.byteLength > 0
                   ? bytesToBase64(new Uint8Array(fallbackBody))
                   : "";
@@ -1526,23 +1567,41 @@ export class RequestProxy extends EventEmitter {
             }
           }
 
-          let bodyB64 = "";
           // HEAD must not carry a body even if the app wrote one
-          if (method?.toUpperCase() !== "HEAD" && resp.body?.length) {
-            const bytes =
-              resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
-            bodyB64 = bytesToBase64(bytes);
+          const bytes =
+            method?.toUpperCase() !== "HEAD" && resp.body?.length && resp.body instanceof Uint8Array
+              ? resp.body
+              : null;
+          if (data.rawBody) {
+            // the service worker takes raw bytes: hand the buffer over
+            // (transfer, no copy when it is ours to give) instead of
+            // base64-encoding it on this thread
+            const body = bytes ? transferableBuffer(bytes) : null;
+            replyPort.postMessage(
+              {
+                type: "response",
+                id,
+                data: {
+                  statusCode: resp.statusCode,
+                  statusMessage: resp.statusMessage,
+                  headers: resp.headers,
+                  body,
+                },
+              },
+              body ? [body] : [],
+            );
+          } else {
+            replyPort.postMessage({
+              type: "response",
+              id,
+              data: {
+                statusCode: resp.statusCode,
+                statusMessage: resp.statusMessage,
+                headers: resp.headers,
+                bodyBase64: bytes ? bytesToBase64(bytes) : "",
+              },
+            });
           }
-          replyPort.postMessage({
-            type: "response",
-            id,
-            data: {
-              statusCode: resp.statusCode,
-              statusMessage: resp.statusMessage,
-              headers: resp.headers,
-              bodyBase64: bodyB64,
-            },
-          });
         }
       } catch (err) {
         replyPort.postMessage({

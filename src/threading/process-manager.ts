@@ -6,10 +6,15 @@ import type { MemoryVolume } from "../memory-volume";
 import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 import { precompileWasm } from "../helpers/wasm-cache";
+import {
+  getSharedEsbuildModule,
+  prefetchSharedEsbuildModule,
+} from "../helpers/esbuild-wasm-module";
 import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
 import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
+import { getSharedTransformStore, type TransformEntry } from "./transform-store";
 import { isRecoverableWasmPath, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import type {
   SpawnConfig,
@@ -67,6 +72,12 @@ interface WasiBrokerRoot extends WasiBrokerChild {
 }
 
 // fs proxy calls that read file content (the rest only need metadata)
+// commands that start JavaScript tooling (directly, or via a shell's -c)
+const JS_TOOL_COMMAND_RE = /(?:^|[\s/;&|(])(?:node|npx|npm|pnpm|pnpx|yarn|bun|bunx|tsx|vite|vitest)(?:$|[\s;&|)])/;
+function runsJsTool(command: string, args?: string[]): boolean {
+  return JS_TOOL_COMMAND_RE.test(command) || (!!args && args.length > 0 && JS_TOOL_COMMAND_RE.test(args.join(" ")));
+}
+
 const PAGE_IN_FS_OPS = new Set(["readFileSync", "readFile", "openSync", "copyFileSync", "openAsBlob"]);
 
 export class ProcessManager extends EventEmitter {
@@ -102,6 +113,11 @@ export class ProcessManager extends EventEmitter {
   ) {
     super();
     this._volume = volume;
+    // index of persisted transform packs, ready before the first spawn needs it
+    void getSharedTransformStore().loadIndex();
+    // bulk mounts (package cache restores) fire no watchers: running
+    // processes that already listed those directories must list them again
+    volume.onSilentMount((paths) => this._relistInWorkers(paths));
     this._performance = performanceTracker;
     this._profiler = profiler;
   }
@@ -155,6 +171,13 @@ export class ProcessManager extends EventEmitter {
     }
 
     const pid = this._nextPid++;
+
+    // a JS tool starting where esbuild is installed: start compiling the
+    // shared wasm module now so it is ready by the time the new process
+    // first calls into esbuild
+    if (runsJsTool(config.command, config.args) && this._hasInstalledEsbuild(config.cwd ?? "/")) {
+      prefetchSharedEsbuildModule();
+    }
 
     // lean mode needs SAB in the worker (Atomics.wait for the lazy fs proxy)
     let lean = this._spawnSnapshotMode === "lean";
@@ -240,8 +263,16 @@ export class ProcessManager extends EventEmitter {
       const lazyCh = new MessageChannel();
       lazyCh.port1.onmessage = (e: MessageEvent) => {
         const data = e.data;
-        if (!data || typeof data !== "object" || !data.__fs__) return;
-        this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
+        if (!data || typeof data !== "object") return;
+        if (data.__fs__) {
+          this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
+        } else if (data.__tc__) {
+          void this._answerTransformPack(data.__tc__);
+        } else if (data.__tcput__) {
+          const put = data.__tcput__ as { scope: string; text?: string; entries?: TransformEntry[] };
+          const batch = put.text ?? put.entries;
+          if (batch) getSharedTransformStore().put(put.scope, batch);
+        }
       };
       lazyCh.port1.start();
       ownedPorts.push(lazyCh.port1);
@@ -261,6 +292,12 @@ export class ProcessManager extends EventEmitter {
       sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
         ? "bytes"
         : "lazy",
+      // null: the index isn't read yet, so the worker asks for every pack
+      transformScopes: lazyFsPort
+        ? getSharedTransformStore().indexLoaded
+          ? getSharedTransformStore().knownScopes()
+          : null
+        : undefined,
     };
     this._processPorts.set(pid, ownedPorts);
     try {
@@ -274,6 +311,21 @@ export class ProcessManager extends EventEmitter {
 
     this.emit("spawn", pid, config.command, config.args);
     return handle;
+  }
+
+  private _hasInstalledEsbuild(cwd: string): boolean {
+    let dir = cwd.replace(/\/+$/, "") || "/";
+    for (let depth = 0; depth < 8; depth++) {
+      const base = dir === "/" ? "" : dir;
+      try {
+        if (this._volume.existsSync(`${base}/node_modules/esbuild/package.json`)) return true;
+      } catch {
+        /* ignore */
+      }
+      if (dir === "/") break;
+      dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+    }
+    return false;
   }
 
   private _isDependencyManagementCommand(command: string, args: string[]): boolean {
@@ -468,7 +520,7 @@ export class ProcessManager extends EventEmitter {
     method: string,
     path: string,
     headers: Record<string, string>,
-    body?: string | null,
+    body?: string | ArrayBuffer | null,
   ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string | string[]>; body: string | ArrayBuffer }> {
     const pid = this._serverPorts.get(port);
     if (pid === undefined) {
@@ -517,15 +569,18 @@ export class ProcessManager extends EventEmitter {
         },
       });
 
-      handle.postMessage({
-        type: "http-request",
-        requestId,
-        port,
-        method,
-        path,
-        headers,
-        body: body ?? null,
-      });
+      handle.postMessage(
+        {
+          type: "http-request",
+          requestId,
+          port,
+          method,
+          path,
+          headers,
+          body: body ?? null,
+        },
+        body instanceof ArrayBuffer ? [body] : undefined,
+      );
     });
   }
 
@@ -658,6 +713,20 @@ export class ProcessManager extends EventEmitter {
       name,
     });
     return { worker, url: worker.__nodepodRevokeUrl ?? "" };
+  }
+
+  // A worker is blocked (Atomics.wait) until the pack is written into its SAB;
+  // reading a pack that isn't in memory yet goes to IndexedDB first.
+  private async _answerTransformPack(
+    request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
+  ): Promise<void> {
+    let text = "[]";
+    try {
+      text = await getSharedTransformStore().packText(String(request.payload?.[0] ?? ""));
+    } catch {
+      /* answer with an empty pack */
+    }
+    handleFsProxy(request, { transformPack: () => text });
   }
 
   private _handleFsProxyWithRecovery(
@@ -1405,6 +1474,17 @@ export class ProcessManager extends EventEmitter {
       this._finishWasiWorker(handle, msg.requestId, 1);
     });
 
+    handle.on("esbuild-module-request", () => {
+      void getSharedEsbuildModule().then((module) => {
+        if (handle.state === "exited") return;
+        try {
+          handle.postMessage({ type: "esbuild-module", module });
+        } catch {
+          handle.postMessage({ type: "esbuild-module", module: null });
+        }
+      });
+    });
+
     handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {
       handle.holdSync();
       void this._handleSqlitePreload(handle, msg.sab).finally(() => {
@@ -1643,6 +1723,24 @@ export class ProcessManager extends EventEmitter {
         console.warn("[node:sqlite] host preload failed:", err);
       }
       notify(ProcessManager.SAB_STATUS_FAIL);
+    }
+  }
+
+  private _relistInWorkers(paths: string[]): void {
+    if (this._processes.size === 0) return;
+    const dirs = new Set<string>();
+    for (const path of paths) {
+      const slash = path.lastIndexOf("/");
+      dirs.add(slash <= 0 ? "/" : path.slice(0, slash));
+    }
+    const list = [...dirs];
+    for (const [, handle] of this._processes) {
+      if (handle.state === "exited") continue;
+      try {
+        handle.postMessage({ type: "vfs-relist", paths: list });
+      } catch {
+        /* exiting */
+      }
     }
   }
 

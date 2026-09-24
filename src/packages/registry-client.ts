@@ -50,6 +50,9 @@ const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
 const REGISTRY_CACHE_NAME = "nodepod-registry-v1";
 const REGISTRY_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const REGISTRY_MEMORY_MAX_ENTRIES = 256;
+// how long a 404 answers repeat requests (a package published meanwhile is
+// found again after this)
+const NOT_FOUND_TTL_MS = 60_000;
 const sharedMetadata = new Map<string, PackageMetadata>();
 const inFlightMetadata = new Map<string, Promise<PackageMetadata>>();
 
@@ -80,6 +83,10 @@ function encodeForUrl(pkgName: string): string {
 export class RegistryClient {
   private baseUrl: string;
   private metadataStore: Map<string, PackageMetadata>;
+  // packages the registry just said don't exist: an install asks for some
+  // names twice (the resolver's prefetch, then its walk; wasm variant
+  // guesses), and a 404 answers both
+  private notFound = new Map<string, { error: Error; at: number }>();
   private profiler: NodepodProfilerImpl | null;
 
   constructor(config: RegistryConfig = {}) {
@@ -102,6 +109,9 @@ export class RegistryClient {
       this.metadataStore.set(name, shared);
       return shared;
     }
+    const miss = this.notFound.get(name);
+    if (miss && Date.now() - miss.at < NOT_FOUND_TTL_MS) throw miss.error;
+
     const pending = inFlightMetadata.get(sharedKey);
     if (pending) return pending;
 
@@ -109,6 +119,11 @@ export class RegistryClient {
     inFlightMetadata.set(sharedKey, request);
     try {
       return await request;
+    } catch (err) {
+      if (err instanceof Error && err.message.endsWith("does not exist in the registry")) {
+        this.notFound.set(name, { error: err, at: Date.now() });
+      }
+      throw err;
     } finally {
       inFlightMetadata.delete(sharedKey);
     }

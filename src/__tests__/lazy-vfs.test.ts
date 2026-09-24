@@ -42,8 +42,13 @@ function volumeBackedHandler(main: MemoryVolume): VolumeMissHandler & {
     readdir(path) {
       calls.readdir.push(path);
       try {
+        // like the real bridge: lstat, links reported with their target
         return main.readdirSync(path).map((name) => {
-          const st = main.statSync(path === "/" ? `/${name}` : `${path}/${name}`);
+          const child = path === "/" ? `/${name}` : `${path}/${name}`;
+          const st = main.lstatSync(child);
+          if (st.isSymbolicLink()) {
+            return { name, isDirectory: false, isSymlink: true, target: main.readlinkSync(child) };
+          }
           return { name, isDirectory: st.isDirectory() };
         });
       } catch {
@@ -138,11 +143,58 @@ describe("MemoryVolume lazy hydration", () => {
     expect(st.size).toBe("module.exports = 42;".length);
   });
 
-  it("negative results are cached (one proxy call per missing path)", () => {
+  it("negative results are answered locally after one listing", () => {
+    const calls = () =>
+      handler.calls.stat.length + handler.calls.readFile.length + handler.calls.readdir.length;
     expect(worker.existsSync("/project/node_modules/nope/index.js")).toBe(false);
+    const afterFirst = calls();
+    expect(afterFirst).toBe(1); // one listing of /project/node_modules
     expect(worker.existsSync("/project/node_modules/nope/index.js")).toBe(false);
-    const statCalls = handler.calls.stat.filter((p) => p.includes("nope"));
-    expect(statCalls.length).toBe(1);
+    expect(worker.existsSync("/project/node_modules/nope/index.ts")).toBe(false);
+    expect(worker.existsSync("/project/node_modules/other")).toBe(false);
+    expect(calls()).toBe(afterFirst);
+  });
+
+  it("resolution probes in one package directory cost one listing", () => {
+    const probes = ["index", "index.js", "index.mjs", "index.cjs", "index.json", "package.json"];
+    const found = probes.filter((p) => worker.existsSync(`/project/node_modules/lodash/${p}`));
+    expect(found).toEqual(["index.js", "package.json"]);
+    expect(handler.calls.readdir).toEqual(["/project/node_modules", "/project/node_modules/lodash"]);
+    expect(handler.calls.stat).toEqual([]);
+    expect(handler.calls.readFile).toEqual([]);
+  });
+
+  it("a package extracted locally and renamed into node_modules needs no listings", () => {
+    worker.mkdirSync("/.stage/pkg/lib", { recursive: true });
+    worker.writeFileSync("/.stage/pkg/package.json", '{"name":"pkg"}');
+    worker.writeFileSync("/.stage/pkg/lib/index.js", "module.exports = 1");
+    worker.renameSync("/.stage/pkg", "/project/node_modules/pkg");
+    const before = handler.calls.readdir.length + handler.calls.stat.length;
+    expect(worker.readdirSync("/project/node_modules/pkg").sort()).toEqual(["lib", "package.json"]);
+    expect(worker.readdirSync("/project/node_modules/pkg/lib")).toEqual(["index.js"]);
+    expect(worker.existsSync("/project/node_modules/pkg/lib/missing.js")).toBe(false);
+    expect(handler.calls.readdir.length + handler.calls.stat.length).toBe(before);
+  });
+
+  it("a local write doesn't force its listed parent to be listed again", () => {
+    expect(worker.existsSync("/project/node_modules/nope")).toBe(false); // lists node_modules
+    worker.writeFileSync("/project/node_modules/local.txt", "x");
+    const before = handler.calls.readdir.length;
+    expect(worker.existsSync("/project/node_modules/nope2")).toBe(false);
+    expect(handler.calls.readdir.length).toBe(before);
+  });
+
+  it("a directory created locally still merges its unhydrated remote children", () => {
+    worker.mkdirSync("/project/node_modules/lodash", { recursive: true });
+    worker.writeFileSync("/project/node_modules/lodash/extra.js", "local");
+    expect(worker.readFileSync("/project/node_modules/lodash/index.js", "utf8")).toBe("module.exports = 42;");
+    expect(worker.readdirSync("/project/node_modules/lodash").sort()).toEqual(["extra.js", "index.js", "package.json"]);
+  });
+
+  it("probes for node_modules inside shipped directories never reach the handler", () => {
+    expect(worker.existsSync("/project/src/node_modules/lodash")).toBe(false);
+    expect(worker.existsSync("/project/node_modules/lodash/node_modules/x")).toBe(false);
+    expect(handler.calls.stat).toEqual([]);
   });
 
   it("misses outside lazy dirs never consult the handler", () => {
@@ -243,7 +295,9 @@ describe("MemoryVolume lazy hydration", () => {
     bounded.setMissHandler(boundedHandler, snap.lazyDirNames!);
 
     expect([...bounded.readFileSync("/node_modules/pkg/a.bin")]).toEqual([1, 2, 3, 4, 5]);
-    // materialize hardlink locally sharing inode
+    // the directory listing already knows a-link.bin as its own stub;
+    // replace it with a local hardlink sharing a.bin's inode
+    bounded.unlinkSync("/node_modules/pkg/a-link.bin");
     bounded.linkSync("/node_modules/pkg/a.bin", "/node_modules/pkg/a-link.bin");
     expect([...bounded.readFileSync("/node_modules/pkg/b.bin")]).toEqual([6, 7, 8, 9, 10]);
     // a.bin was evicted; hardlink sibling must rehydrate, not return empty
@@ -298,5 +352,108 @@ describe("MemoryVolume lazy hydration", () => {
     plain.writeFileSync("/a.txt", "stale");
     plain.markLazyInvalidated("/a.txt");
     expect(plain.readFileSync("/a.txt", "utf8")).toBe("stale");
+  });
+});
+
+describe("MemoryVolume lazy hydration through symlinks", () => {
+  function setup() {
+    const main = makeMainVolume();
+    // workspace package linked into node_modules (absolute target)
+    main.writeFileSync("/project/packages/pkg/package.json", '{"name":"@scope/pkg","main":"index.js"}');
+    main.writeFileSync("/project/packages/pkg/index.js", "module.exports = 'ws';");
+    main.mkdirSync("/project/node_modules/@scope", { recursive: true });
+    main.symlinkSync("/project/packages/pkg", "/project/node_modules/@scope/pkg");
+    // pnpm-style: the link and its target both live under node_modules
+    main.writeFileSync("/project/node_modules/.pnpm/foo@1.0.0/node_modules/foo/index.js", "module.exports = 'foo';");
+    main.symlinkSync(".pnpm/foo@1.0.0/node_modules/foo", "/project/node_modules/foo");
+    // a bin link (relative, to a file)
+    main.writeFileSync("/project/node_modules/lodash/bin.js", "#!/usr/bin/env node");
+    main.mkdirSync("/project/node_modules/.bin", { recursive: true });
+    main.symlinkSync("../lodash/bin.js", "/project/node_modules/.bin/lodash");
+    const snap = new VFSBridge(main).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const worker = MemoryVolume.fromBinarySnapshot(snap);
+    worker.setMissHandler(volumeBackedHandler(main), snap.lazyDirNames!);
+    return worker;
+  }
+
+  it("resolves a linked workspace package", () => {
+    const worker = setup();
+    expect(worker.statSync("/project/node_modules/@scope/pkg").isDirectory()).toBe(true);
+    expect(worker.readFileSync("/project/node_modules/@scope/pkg/index.js", "utf8")).toBe("module.exports = 'ws';");
+    expect(worker.lstatSync("/project/node_modules/@scope/pkg").isSymbolicLink()).toBe(true);
+    expect(worker.realpathSync("/project/node_modules/@scope/pkg")).toBe("/project/packages/pkg");
+  });
+
+  it("resolves a pnpm-style link whose target is itself lazy", () => {
+    const worker = setup();
+    expect(worker.existsSync("/project/node_modules/foo/index.js")).toBe(true);
+    expect(worker.readFileSync("/project/node_modules/foo/index.js", "utf8")).toBe("module.exports = 'foo';");
+    expect(worker.realpathSync("/project/node_modules/foo")).toBe("/project/node_modules/.pnpm/foo@1.0.0/node_modules/foo");
+    expect(worker.existsSync("/project/node_modules/foo/missing.js")).toBe(false);
+  });
+
+  it("lists links and reads through a bin link", () => {
+    const worker = setup();
+    expect(worker.readdirSync("/project/node_modules").sort()).toEqual([".bin", ".pnpm", "@scope", "foo", "lodash"]);
+    expect(worker.readdirSync("/project/node_modules/.bin")).toEqual(["lodash"]);
+    expect(worker.readFileSync("/project/node_modules/.bin/lodash", "utf8")).toBe("#!/usr/bin/env node");
+    expect(worker.statSync("/project/node_modules/.bin/lodash").size).toBe("#!/usr/bin/env node".length);
+  });
+});
+
+describe("MemoryVolume lazy hydration after later main-thread changes", () => {
+  it("finds a node_modules created after the process started", () => {
+    const main = new MemoryVolume();
+    main.writeFileSync("/project/index.js", "1");
+    const snap = new VFSBridge(main).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const worker = MemoryVolume.fromBinarySnapshot(snap);
+    worker.setMissHandler(volumeBackedHandler(main), ["node_modules"]);
+    expect(worker.existsSync("/project/node_modules/late/index.js")).toBe(false);
+    main.writeFileSync("/project/node_modules/late/index.js", "module.exports = 1;");
+    worker.relistLazy(["/project/node_modules/late"]);
+    expect(worker.readFileSync("/project/node_modules/late/index.js", "utf8")).toBe("module.exports = 1;");
+  });
+
+  it("finds packages mounted without notifications once told to list again", () => {
+    const main = makeMainVolume();
+    const mounted: string[][] = [];
+    main.onSilentMount((paths) => mounted.push(paths));
+    const snap = new VFSBridge(main).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const worker = MemoryVolume.fromBinarySnapshot(snap);
+    worker.setMissHandler(volumeBackedHandler(main), snap.lazyDirNames!);
+    expect(worker.readdirSync("/project/node_modules")).toEqual(["lodash"]);
+    expect(worker.existsSync("/project/node_modules/fresh/index.js")).toBe(false);
+
+    main.mountEntries([
+      { path: "/project/node_modules/fresh", kind: "directory" },
+      { path: "/project/node_modules/fresh/index.js", kind: "file", content: new TextEncoder().encode("module.exports = 'fresh';") },
+    ]);
+    expect(mounted).toEqual([["/project/node_modules/fresh", "/project/node_modules/fresh/index.js"]]);
+    // what the process manager broadcasts: the parent directories
+    worker.relistLazy(["/project/node_modules", "/project/node_modules/fresh"]);
+    expect(worker.existsSync("/project/node_modules/fresh/index.js")).toBe(true);
+    expect(worker.readFileSync("/project/node_modules/fresh/index.js", "utf8")).toBe("module.exports = 'fresh';");
+    expect(worker.readdirSync("/project/node_modules").sort()).toEqual(["fresh", "lodash"]);
+  });
+});
+
+describe("MemoryVolume lazy hydration of recoverable wasm", () => {
+  it("asks for a node_modules .wasm by path, where the main thread can recover it", () => {
+    const main = makeMainVolume();
+    const snap = new VFSBridge(main).createSnapshot({ excludeDirNames: ["node_modules"] });
+    const worker = MemoryVolume.fromBinarySnapshot(snap);
+    const handler = volumeBackedHandler(main);
+    // the main thread fetches a missing binary when asked for exactly it
+    const wasmPath = "/node_modules/engine/engine.wasm";
+    const recovering: VolumeMissHandler = {
+      ...handler,
+      stat(path) {
+        if (path === wasmPath) main.writeFileSync(wasmPath, new Uint8Array([0, 0x61, 0x73, 0x6d]));
+        return handler.stat(path);
+      },
+    };
+    worker.setMissHandler(recovering, snap.lazyDirNames!);
+    expect(worker.existsSync(wasmPath)).toBe(true);
+    expect(worker.readFileSync(wasmPath)).toEqual(new Uint8Array([0, 0x61, 0x73, 0x6d]));
   });
 });

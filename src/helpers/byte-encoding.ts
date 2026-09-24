@@ -1,20 +1,44 @@
 // Chunked to avoid blowing the call stack on large buffers
-const SEGMENT_SIZE = 8192;
+const SEGMENT_SIZE = 0x8000;
 
-export function bytesToBase64(data: Uint8Array): string {
+// Uint8Array.prototype.toBase64 / Uint8Array.fromBase64 (native, no
+// intermediate binary string). Vite base64-encodes an inline sourcemap into
+// every module it serves, so this is on the dev-server hot path.
+const nativeToBase64 = (Uint8Array.prototype as { toBase64?: () => string }).toBase64;
+const nativeFromBase64 = (Uint8Array as { fromBase64?: (s: string) => Uint8Array }).fromBase64;
+
+function bytesToBinaryString(data: Uint8Array): string {
+  if (data.length <= SEGMENT_SIZE) {
+    return String.fromCharCode.apply(null, data as unknown as number[]);
+  }
   const segments: string[] = [];
   for (let offset = 0; offset < data.length; offset += SEGMENT_SIZE) {
-    const end = Math.min(offset + SEGMENT_SIZE, data.length);
-    let chunk = '';
-    for (let i = offset; i < end; i++) {
-      chunk += String.fromCharCode(data[i]);
-    }
-    segments.push(chunk);
+    segments.push(
+      String.fromCharCode.apply(null, data.subarray(offset, offset + SEGMENT_SIZE) as unknown as number[]),
+    );
   }
-  return btoa(segments.join(''));
+  return segments.join('');
+}
+
+export function bytesToBase64(data: Uint8Array): string {
+  if (nativeToBase64) {
+    try {
+      return nativeToBase64.call(data);
+    } catch {
+      /* e.g. a view the native method rejects: use the portable path */
+    }
+  }
+  return btoa(bytesToBinaryString(data));
 }
 
 export function base64ToBytes(encoded: string): Uint8Array {
+  if (nativeFromBase64) {
+    try {
+      return nativeFromBase64(encoded);
+    } catch {
+      /* atob below reports invalid input the way it always has */
+    }
+  }
   const raw = atob(encoded);
   const result = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) {
@@ -38,14 +62,5 @@ export function bytesToHex(data: Uint8Array): string {
 }
 
 export function bytesToLatin1(data: Uint8Array): string {
-  const segments: string[] = [];
-  for (let offset = 0; offset < data.length; offset += SEGMENT_SIZE) {
-    const end = Math.min(offset + SEGMENT_SIZE, data.length);
-    let chunk = '';
-    for (let i = offset; i < end; i++) {
-      chunk += String.fromCharCode(data[i]);
-    }
-    segments.push(chunk);
-  }
-  return segments.join('');
+  return bytesToBinaryString(data);
 }

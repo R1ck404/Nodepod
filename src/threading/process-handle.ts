@@ -298,6 +298,10 @@ export class ProcessHandle extends EventEmitter {
           this.emit("sqlite-preload", msg);
           break;
 
+        case "esbuild-module-request":
+          this.emit("esbuild-module-request");
+          break;
+
         case "server-listen":
           this.emit("server-listen", msg.port, msg.hostname);
           break;

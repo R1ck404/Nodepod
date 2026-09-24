@@ -1,6 +1,6 @@
 // Version Resolver — semver parsing, range matching, and dependency tree resolution.
 
-import { RegistryClient, VersionDetail } from "./registry-client";
+import { RegistryClient, VersionDetail, type PackageMetadata } from "./registry-client";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -346,8 +346,98 @@ export async function resolveDependencyTree(
   const client = config.registry || new RegistryClient();
   const state = createState(client, config);
 
+  await prefetchMetadata(client, [[rootName, versionRange]], config);
   await walkDependency(rootName, versionRange, state);
   return state.completed;
+}
+
+// The tree walk below decides placement in a fixed order, and much of it
+// runs one registry round trip after another (claims, edges in chunks, each
+// waiting on whole subtrees). This pass first walks the same graph by
+// name and range with many requests in flight, so the metadata is already in
+// the registry client's cache when the walk asks for it: resolution costs
+// roughly the graph's depth in round trips, with results unchanged. Failures
+// are left for the walk itself to report.
+const PREFETCH_CONCURRENCY = 24;
+
+function pickVersion(metadata: PackageMetadata, range: string): string | null {
+  if (range === "latest" || range === "*") return metadata["dist-tags"].latest ?? null;
+  if (metadata["dist-tags"][range]) return metadata["dist-tags"][range];
+  return pickBestMatch(Object.keys(metadata.versions), range);
+}
+
+function prefetchMetadata(
+  client: RegistryClient,
+  roots: Array<[string, string]>,
+  config: ResolutionConfig,
+): Promise<void> {
+  const seen = new Set<string>();
+  const queue: Array<[string, string]> = roots.slice();
+  let active = 0;
+  return new Promise<void>((resolve) => {
+    const enqueueEdges = (name: string, info: VersionDetail): void => {
+      const peerMeta = info.peerDependenciesMeta || {};
+      for (const [peer, range] of Object.entries(info.peerDependencies || {})) {
+        if (!peerMeta[peer]?.optional) queue.push([peer, range]);
+      }
+      for (const entry of Object.entries(info.dependencies || {})) queue.push(entry);
+      const optional = info.optionalDependencies || {};
+      const optNames = Object.keys(optional);
+      if (config.optionalDependencies) {
+        for (const entry of Object.entries(optional)) queue.push(entry as [string, string]);
+      } else {
+        // same selection as walkEdgesForPackage: wasm variants, or the
+        // {pkg}-wasm32-wasi / {pkg}-wasm guesses for native-only packages
+        const wasm = optNames.filter((n) => n.includes("wasm32-wasi") || n.includes("wasm"));
+        for (const n of wasm) queue.push([n, optional[n] as string]);
+        if (wasm.length === 0 && optNames.length >= 2) {
+          const platformRe = /-(darwin|linux|win32|freebsd|android|sunos)-(x64|x86|arm64|arm|ia32|s390x|ppc64|mips|riscv)/;
+          if (optNames.every((n) => platformRe.test(n))) {
+            queue.push([name + "-wasm32-wasi", "*"], [name + "-wasm", "*"]);
+          }
+        }
+      }
+    };
+    const pump = (): void => {
+      while (active < PREFETCH_CONCURRENCY && queue.length > 0) {
+        const [name, rawRange] = queue.shift()!;
+        // a spec this pass can't read is left for the walk to report
+        let fetchName: string;
+        let range: string;
+        try {
+          if (typeof rawRange !== "string") continue;
+          const alias = parseNpmAlias(rawRange);
+          fetchName = alias?.realName ?? name;
+          range = alias?.realRange ?? rawRange;
+        } catch {
+          continue;
+        }
+        const key = `${fetchName}@${range}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        active++;
+        let request: Promise<PackageMetadata>;
+        try {
+          request = client.fetchManifest(fetchName);
+        } catch (err) {
+          request = Promise.reject(err);
+        }
+        request
+          .then((metadata) => {
+            const version = pickVersion(metadata, range);
+            const info = version ? metadata.versions[version] : undefined;
+            if (info) enqueueEdges(name, info);
+          })
+          .catch(() => {})
+          .finally(() => {
+            active--;
+            pump();
+          });
+      }
+      if (active === 0 && queue.length === 0) resolve();
+    };
+    pump();
+  });
 }
 
 export async function resolveFromManifest(
@@ -372,6 +462,8 @@ export async function resolveFromManifest(
       : [];
 
   const entries = Object.entries(allDeps);
+
+  await prefetchMetadata(client, [...entries, ...optionalRoot], config);
 
   // Claim root slots for every direct manifest dep before walking transitive
   // edges or auto-installed peers. Otherwise a plugin's peer range (e.g.

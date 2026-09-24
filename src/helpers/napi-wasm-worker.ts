@@ -470,12 +470,19 @@ export function handleFsProxy(
         if (typeof entry.isFile === "function" && entry.isFile()) {
           try { size = fsBridge.statSync(child).size ?? 0; } catch { /* stale entry */ }
         }
+        const isSymlink = typeof entry.isSymbolicLink === "function" ? entry.isSymbolicLink() : false;
+        // a lazily listed worker volume recreates the link itself
+        let target: string | undefined;
+        if (isSymlink) {
+          try { target = String(fsBridge.readlinkSync(child)); } catch { /* dangling or gone */ }
+        }
         return {
           name: entry.name,
           parentPath: entry.parentPath || entry.path,
           _isFile: typeof entry.isFile === "function" ? entry.isFile() : false,
           _isDir: typeof entry.isDirectory === "function" ? entry.isDirectory() : false,
-          _isSymlink: typeof entry.isSymbolicLink === "function" ? entry.isSymbolicLink() : false,
+          _isSymlink: isSymlink,
+          _target: target,
           size,
         };
       });

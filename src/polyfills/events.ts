@@ -25,9 +25,12 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
     return;
   }
 
-  // debounce per-path to avoid cascading reloads from multiple VFS writes
+  // coalesce per-path so the several VFS events of one logical write
+  // (truncate + write, or a batch synced from another thread in one task)
+  // emit once. A write lands within a single task, so waiting for the next
+  // task is enough; a fixed delay here was added straight onto HMR latency.
   const pending = new Map<string, { event: string; timer: ReturnType<typeof setTimeout> }>();
-  const DEBOUNCE_MS = 50;
+  const DEBOUNCE_MS = 0;
 
   const cleanup = vol.onGlobalChange((path: string, event: string) => {
     if (

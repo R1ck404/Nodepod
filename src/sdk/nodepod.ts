@@ -4,6 +4,7 @@ import {
   RequestProxy,
   getProxyInstance,
   NodepodSWSetupError,
+  markTransferable,
   type IVirtualServer,
 } from "../request-proxy";
 import type { VolumeSnapshot } from "../engine-types";
@@ -249,23 +250,33 @@ export class Nodepod {
           listening: true,
           address: () => ({ port, address: "0.0.0.0", family: "IPv4" }),
           dispatchRequest: async (method, url, headers, body) => {
-            const bodyStr = body
+            // request bodies stay bytes end to end (a utf8 round trip
+            // corrupted binary uploads); the copy is transferred away
+            // (an empty body is no body, as it always was for the worker)
+            const requestBody = body
               ? typeof body === "string"
                 ? body
-                : body.toString("utf8")
+                : body.byteLength > 0
+                  ? (new Uint8Array(body).buffer as ArrayBuffer)
+                  : null
               : null;
             const result = await this._processManager.dispatchHttpRequest(
               port,
               method,
               url,
               headers,
-              bodyStr,
+              requestBody,
             );
-            // Body can be ArrayBuffer (binary) or string (text)
-            const respBody =
-              result.body instanceof ArrayBuffer
-                ? Buffer.from(new Uint8Array(result.body))
-                : Buffer.from(result.body);
+            // Body can be ArrayBuffer (binary) or string (text). The worker
+            // sent (transferred) a fresh buffer: wrap it instead of copying,
+            // and let the preview relay transfer it onward.
+            let respBody: Buffer;
+            if (result.body instanceof ArrayBuffer) {
+              markTransferable(result.body);
+              respBody = Buffer.from(result.body);
+            } else {
+              respBody = Buffer.from(result.body);
+            }
             return {
               statusCode: result.statusCode,
               statusMessage: result.statusMessage,
@@ -405,6 +416,12 @@ export class Nodepod {
         packSource = new PackContentSource(snapshotCache);
         volume.enableEviction(packSource, handler.options.residentContentBudgetMB * 1024 * 1024);
       }
+    }
+    // memory.packPackageContent: package files nobody reads stay deflated.
+    // A full spawn snapshot copies every file into each process, which would
+    // inflate them all on every spawn.
+    if (handler.options.packPackageContent && sabEnabled && opts.spawnSnapshot !== "full") {
+      volume.enableContentPacking();
     }
 
     const packages = new DependencyInstaller(volume, {
@@ -1209,6 +1226,12 @@ export class Nodepod {
       residentPackBytes: number;
       /** Synchronous reads that hit paged-out content (should stay 0). */
       pagedOutSyncMisses: number;
+      /** Package files kept deflated in memory (memory.packPackageContent). */
+      packedFiles: number;
+      /** Their size, uncompressed. */
+      packedBytes: number;
+      /** What they take in memory. */
+      packedStoredBytes: number;
     };
     engine: {
       moduleCacheSize: number;

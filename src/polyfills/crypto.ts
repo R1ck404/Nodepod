@@ -3,7 +3,8 @@
 import { scrypt as nobleScrypt } from "@noble/hashes/scrypt";
 import { Buffer } from "./buffer";
 import { EventEmitter } from "./events";
-import { digestSync, hmacSync } from "./sync-digest";
+import { digestSync, hmacSync, createStreamingDigest, type StreamingDigest } from "./sync-digest";
+import { bytesToHex } from "../helpers/byte-encoding";
 
 function normalizeAlg(name: string): string {
   const upper = name.toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -44,9 +45,7 @@ function joinChunks(parts: Uint8Array[]): Uint8Array {
 
 function formatOutput(raw: Uint8Array, enc?: string): string | Buffer {
   if (enc === "hex") {
-    return Array.from(raw)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
+    return bytesToHex(raw);
   }
   if (enc === "base64") {
     return btoa(String.fromCharCode(...raw));
@@ -117,17 +116,43 @@ export const Hash = function Hash(this: any, alg: string) {
   if (!this) return;
   this._alg = normalizeAlg(alg);
   this._parts = [];
+  // SHA-1/2 hash incrementally: every update is consumed immediately, so the
+  // input needs no defensive copy and digest() needs no join
+  this._stream = createStreamingDigest(this._alg) as StreamingDigest | null;
 } as unknown as HashConstructor;
 
 Hash.prototype.update = function update(input: string | Buffer | Uint8Array, enc?: string): any {
   if (input == null) {
     throw new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + String(input));
   }
+  if (this._stream) {
+    if (this._digested) {
+      const err = new Error("Digest already called") as Error & { code: string };
+      err.code = "ERR_CRYPTO_HASH_FINALIZED";
+      throw err;
+    }
+    if (typeof input === "string") {
+      this._stream.update(Buffer.from(input, (enc as BufferEncoding) || "utf8"));
+    } else if (input instanceof Uint8Array) {
+      this._stream.update(input);
+    } else {
+      this._stream.update(toUpdateChunk(input, enc));
+    }
+    return this;
+  }
   this._parts.push(toUpdateChunk(input, enc));
   return this;
 };
 
+// the streaming hasher finalizes once; repeat digests reuse its result the
+// way the buffered implementation always allowed
+function streamDigest(h: any): Uint8Array {
+  if (!h._digested) h._digested = h._stream.digest();
+  return h._digested;
+}
+
 Hash.prototype.digestAsync = async function digestAsync(enc?: string): Promise<string | Buffer> {
+  if (this._stream) return formatOutput(streamDigest(this), enc);
   const merged = joinChunks(this._parts);
   const ab = new Uint8Array(merged).buffer as ArrayBuffer;
   const hashed = await crypto.subtle.digest(this._alg, ab);
@@ -135,8 +160,9 @@ Hash.prototype.digestAsync = async function digestAsync(enc?: string): Promise<s
 };
 
 Hash.prototype.digest = function digest(enc?: string): string | Buffer {
+  if (this._stream) return formatOutput(streamDigest(this), enc);
   const merged = joinChunks(this._parts);
-  const hashed = digestSync(this._alg, new Uint8Array(merged));
+  const hashed = digestSync(this._alg, merged);
   return formatOutput(hashed, enc);
 };
 

@@ -23,7 +23,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 20;
+const SW_VERSION = 21;
 const DEFAULT_INSTANCE = "default";
 const INTERNAL_BRIDGE_PATHS = new Set([
   "/__nodepod_bridge__.html",
@@ -211,6 +211,85 @@ function registerPreviewNavigation(resultingClientId, pod, strippedPath) {
   adoptPreviewClient(resultingClientId, pod);
 }
 
+// ── Response cache ──
+// Proxied responses carry Cache-Control: no-store to the browser, so without
+// this every reload re-requests and re-transfers every module. Responses the
+// server marks immutable (content-hashed URLs, e.g. pre-bundled deps) are
+// served from here with no round trip; responses with an ETag are
+// revalidated with If-None-Match and a 304 is answered from here. Entries
+// are per server and bounded by total bytes (LRU).
+const RESPONSE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+const RESPONSE_CACHE_MAX_ENTRY = 8 * 1024 * 1024;
+const responseCache = new Map(); // key -> entry, insertion order = recency
+let responseCacheBytes = 0;
+// bumped by every clear: a response still in flight from a server that has
+// since stopped must not repopulate the cache
+let responseCacheEpoch = 0;
+
+function responseCacheKey(instanceId, serverPort, path) {
+  return instanceId + "|" + serverPort + "|" + path;
+}
+
+function headerValue(headers, name) {
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === name) {
+      const v = headers[k];
+      return Array.isArray(v) ? v.join(", ") : v == null ? "" : String(v);
+    }
+  }
+  return "";
+}
+
+function responseCacheGet(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  responseCache.delete(key);
+  responseCache.set(key, entry);
+  return entry;
+}
+
+function responseCacheDelete(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return;
+  responseCache.delete(key);
+  responseCacheBytes -= entry.size;
+}
+
+function responseCachePut(key, entry) {
+  if (entry.size > RESPONSE_CACHE_MAX_ENTRY) return;
+  responseCacheDelete(key);
+  responseCache.set(key, entry);
+  responseCacheBytes += entry.size;
+  for (const [k, e] of responseCache) {
+    if (responseCacheBytes <= RESPONSE_CACHE_MAX_BYTES) break;
+    responseCache.delete(k);
+    responseCacheBytes -= e.size;
+  }
+}
+
+// the request's values of the headers a response varies on
+function varyValues(varyNames, headers) {
+  return varyNames.map((name) => headerValue(headers, name));
+}
+
+function varyMatches(entry, headers) {
+  if (!entry.varyNames) return true;
+  const now = varyValues(entry.varyNames, headers);
+  return now.every((v, i) => v === entry.varyValues[i]);
+}
+
+function responseCacheClear(instanceId, serverPort) {
+  responseCacheEpoch++;
+  const prefix = serverPort == null ? instanceId + "|" : instanceId + "|" + serverPort + "|";
+  for (const key of [...responseCache.keys()]) {
+    if (key.startsWith(prefix)) responseCacheDelete(key);
+  }
+}
+
+function cachedResponse(entry) {
+  return buildProxyResponse(entry.body, entry.status, entry.statusText, Object.assign({}, entry.headers));
+}
+
 function trackInstanceServer(instanceId, serverPort) {
   if (!instanceId || serverPort == null) return;
   let set = instanceServers.get(instanceId);
@@ -222,6 +301,7 @@ function trackInstanceServer(instanceId, serverPort) {
 }
 
 function untrackInstanceServer(instanceId, serverPort) {
+  responseCacheClear(instanceId, serverPort);
   const set = instanceServers.get(instanceId);
   if (!set) return;
   set.delete(serverPort);
@@ -473,6 +553,7 @@ function forgetInstanceRouting(instanceId) {
   }
   if (lastActivePod && lastActivePod.instanceId === instanceId) lastActivePod = null;
   instanceServers.delete(instanceId);
+  responseCacheClear(instanceId);
 }
 
 // only release if this port still owns it. a newer tab may have reclaimed it
@@ -1932,6 +2013,35 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   if (merged) headers["cookie"] = merged;
   else delete headers["cookie"];
 
+  // cacheable only for plain GETs of subresources: documents get per-load
+  // script injection, and range requests want partial bodies. Credentialed
+  // requests may get per-user responses: not cached either.
+  const cacheKey =
+    method === "GET" &&
+    !headers["range"] &&
+    !headers["authorization"] &&
+    !isDocumentRequest(originalRequest || request)
+      ? responseCacheKey(instanceId, serverPort, path)
+      : null;
+  // a hard reload or a no-cache request goes to the server as asked
+  const requestCacheControl = (headers["cache-control"] || "") + " " + (headers["pragma"] || "");
+  const bypassCache =
+    request.cache === "reload" ||
+    request.cache === "no-cache" ||
+    request.cache === "no-store" ||
+    /no-cache|no-store/i.test(requestCacheControl);
+  const storeAllowed = request.cache !== "no-store" && !/no-store/i.test(requestCacheControl);
+  const cacheEpoch = responseCacheEpoch;
+  let cached = cacheKey && !bypassCache ? responseCacheGet(cacheKey) : null;
+  if (cached && !varyMatches(cached, headers)) cached = null;
+  if (cached && cached.immutable) return cachedResponse(cached);
+  let revalidating = false;
+  if (cached && cached.etag && !headers["if-none-match"]) {
+    headers["if-none-match"] = cached.etag;
+    revalidating = true;
+  }
+  const requestHeaders = Object.assign({}, headers);
+
   let body = undefined;
   if (request.method !== "GET" && request.method !== "HEAD") {
     try {
@@ -1961,21 +2071,26 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   });
 
   try {
-    targetPort.postMessage({
-      type: "request",
-      id,
-      data: {
-        instanceId,
-        port: serverPort,
-        method: request.method,
-        url: path,
-        headers,
-        body,
-        // original url so main thread can fall back to a network fetch if
-        // the virtual server returns 404 (fonts, CDNs etc)
-        originalUrl: request.url,
+    targetPort.postMessage(
+      {
+        type: "request",
+        id,
+        data: {
+          instanceId,
+          port: serverPort,
+          method: request.method,
+          url: path,
+          headers,
+          body,
+          // original url so main thread can fall back to a network fetch if
+          // the virtual server returns 404 (fonts, CDNs etc)
+          originalUrl: request.url,
+          // answer with the body as a transferred ArrayBuffer, not base64
+          rawBody: true,
+        },
       },
-    });
+      body ? [body] : [],
+    );
   } catch (err) {
     // port got detached between lookup and post
     pending.delete(id);
@@ -1987,13 +2102,47 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     const data = await promise;
     let responseBody = null;
     // HEAD responses must not include a body even if upstream sent one
-    if (method !== "HEAD" && data.bodyBase64) {
-      const binary = atob(data.bodyBase64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      responseBody = bytes;
+    if (method !== "HEAD") {
+      if (data.body instanceof ArrayBuffer) {
+        if (data.body.byteLength > 0) responseBody = new Uint8Array(data.body);
+      } else if (data.bodyBase64) {
+        // a tab running an older nodepod still answers in base64
+        const binary = atob(data.bodyBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        responseBody = bytes;
+      }
     }
+    // our own If-None-Match matched: the cached copy is current. A 304 still
+    // carries headers of its own (cookies, a refreshed validator)
+    if (revalidating && data.statusCode === 304) {
+      const notModified = data.headers || {};
+      for (const k of Object.keys(notModified)) {
+        if (k.toLowerCase() === "set-cookie") storeSetCookies(instanceId, serverPort, notModified[k]);
+      }
+      const refreshed = headerValue(notModified, "etag");
+      if (refreshed) cached.etag = refreshed;
+      return cachedResponse(cached);
+    }
+
     const respHeaders = Object.assign({}, data.headers || {});
+    const cacheControl = headerValue(respHeaders, "cache-control").toLowerCase();
+    const etag = headerValue(respHeaders, "etag");
+    const vary = headerValue(respHeaders, "vary").toLowerCase();
+    const varyNames = vary ? vary.split(",").map((s) => s.trim()).filter(Boolean) : null;
+    const cacheable =
+      cacheKey &&
+      storeAllowed &&
+      !data.fromNetwork &&
+      cacheEpoch === responseCacheEpoch &&
+      data.statusCode === 200 &&
+      !headerValue(respHeaders, "set-cookie") &&
+      !/no-store|private/.test(cacheControl) &&
+      !(varyNames && varyNames.includes("*")) &&
+      (/\bimmutable\b/.test(cacheControl) || !!etag);
+    // a 304 answering the app's own If-None-Match says nothing against
+    // what's stored
+    if (cacheKey && !cacheable && data.statusCode !== 304) responseCacheDelete(cacheKey);
 
     // Capture Set-Cookie into the SW jar before doing anything else, so the
     // cookies survive even though the browser will ignore them on the
@@ -2099,6 +2248,20 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
 
     sanitizeProxyHeaders(respHeaders, instanceId, serverPort);
+
+    if (cacheable) {
+      responseCachePut(cacheKey, {
+        body: finalBody,
+        size: (finalBody ? finalBody.byteLength : 0) + 512,
+        status: data.statusCode,
+        statusText: data.statusMessage || "OK",
+        headers: Object.assign({}, respHeaders),
+        etag,
+        immutable: /\bimmutable\b/.test(cacheControl),
+        varyNames,
+        varyValues: varyNames ? varyValues(varyNames, requestHeaders) : null,
+      });
+    }
 
     return buildProxyResponse(
       finalBody,

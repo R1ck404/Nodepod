@@ -3,9 +3,6 @@
 import { Buffer } from "./buffer";
 import { Transform } from "./stream";
 import { CDN_BROTLI_WASM, cdnImport } from "../constants/cdn-urls";
-// Pure JS brotli decompressor (no WASM, no Node APIs) - sync fallback
-// @ts-ignore - no type declarations for brotli/decompress
-import brotliJsDecompress from "brotli/decompress";
 import pako from "pako";
 import { getRegistry } from "../helpers/event-loop";
 
@@ -65,8 +62,19 @@ async function ensureBrotli(): Promise<BrotliEngine | null> {
   return brotliLoading;
 }
 
+// Pure JS brotli decompressor (no WASM, no Node APIs), the sync fallback.
+// Loaded on first use: the decoder decompresses its 120KB static dictionary
+// when it is evaluated, which cost every process worker ~10ms at boot for a
+// path that almost never runs. The bundler inlines the module behind this
+// require() and only evaluates it when the call executes.
+declare const require: (id: string) => unknown;
+let brotliJsDecompress: ((input: Uint8Array) => Uint8Array | null) | null = null;
+
 /** Pure JS brotli decompressor, used as sync fallback when WASM isn't ready. */
 function brotliDecompressJs(input: Uint8Array): Uint8Array {
+  if (!brotliJsDecompress) {
+    brotliJsDecompress = require("brotli/decompress") as (input: Uint8Array) => Uint8Array | null;
+  }
   const result = brotliJsDecompress(Buffer.from(input));
   if (!result) throw new Error("Brotli JS decompression failed");
   return new Uint8Array(result);

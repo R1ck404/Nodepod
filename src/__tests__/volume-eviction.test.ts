@@ -224,13 +224,20 @@ describe("lazy worker volumes", () => {
     let slow = true;
     const timeout = () => Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" });
     const vol = new MemoryVolume();
+    // a lean snapshot ships the lazy dir itself, empty
+    vol.mkdirSync("/node_modules");
     vol.setMissHandler(
       {
         readFile: () => {
           if (slow) throw timeout();
           return new TextEncoder().encode("late but fine");
         },
-        readdir: () => [],
+        readdir: (p) => {
+          if (slow) throw timeout();
+          return p === "/node_modules"
+            ? [{ name: "dep", isDirectory: true }]
+            : [{ name: "index.js", isDirectory: false, size: 13 }];
+        },
         stat: (p) => {
           if (slow) throw timeout();
           return p.endsWith(".js")

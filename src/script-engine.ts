@@ -9,7 +9,7 @@ import type {
   LoadedModule,
 } from "./engine-types";
 import type { PackageManifest } from "./types/manifest";
-import { quickDigest } from "./helpers/digest";
+import { quickDigest, contentDigest } from "./helpers/digest";
 import { createImportMeta } from "./helpers/import-meta";
 import { LRUCache as _LRUCache } from "./memory-handler";
 import { bytesToBase64, bytesToHex } from "./helpers/byte-encoding";
@@ -126,6 +126,7 @@ import {
 } from "resolve.exports";
 import {
   esmToCjs,
+  applyPatches,
   collectEsmCjsPatches,
   hasTopLevelAwait,
   stripTopLevelAwait,
@@ -144,6 +145,11 @@ import {
 import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
 import { isTypeScriptFile, stripTypeScript } from "./strip-typescript";
+import {
+  lexModule,
+  hasStaticModuleSyntax,
+  patchDynamicImports,
+} from "./helpers/module-lexer";
 
 // CSS files must never go through stripTypeScript
 function isCSSFile(filename: string): boolean {
@@ -232,40 +238,6 @@ function pickModuleExportName(source: string): string {
   return candidate;
 }
 
-function astHasTopLevelAwait(ast: any): boolean {
-  let found = false;
-  let insideAsync = 0;
-  const walk = (node: any): void => {
-    if (found || !node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) walk(child);
-      return;
-    }
-    if (typeof node.type !== "string") return;
-    const isAsyncFn =
-      (node.type === "FunctionDeclaration" ||
-        node.type === "FunctionExpression" ||
-        node.type === "ArrowFunctionExpression") && node.async;
-    if (isAsyncFn) insideAsync++;
-    if (
-      (node.type === "AwaitExpression" ||
-        (node.type === "ForOfStatement" && node.await)) &&
-      insideAsync === 0
-    ) {
-      found = true;
-    }
-    if (!found) {
-      for (const key of Object.keys(node)) {
-        if (key === "type" || key === "start" || key === "end") continue;
-        walk(node[key]);
-      }
-    }
-    if (isAsyncFn) insideAsync--;
-  };
-  walk(ast);
-  return found;
-}
-
 function convertModuleSyntaxDetailed(
   source: string,
   filePath: string,
@@ -299,19 +271,29 @@ function convertViaAst(
   }) as any;
   const patches: Array<[number, number, string]> = [];
 
-  // collect import.meta and import() patches
-  traverseAst(ast, (node: any) => {
-    if (
-      node.type === "MetaProperty" &&
-      node.meta?.name === "import" &&
-      node.property?.name === "meta"
-    ) {
-      patches.push([node.start, node.end, "import_meta"]);
+  // collect import.meta and import() patches: the lexer finds them in one
+  // tokenizer pass, where walking every node of the AST cost about as much
+  // again as a large chunk's parse
+  const lexed = source.length <= LEXER_MAX_CHARS ? lexModule(source) : null;
+  if (lexed) {
+    for (const imp of lexed[0]) {
+      if (imp.d === -2) patches.push([imp.ss, imp.se, "import_meta"]);
+      else if (imp.t === 2 && imp.d > -1) patches.push([imp.ss, imp.ss + 6, "__asyncLoad"]);
     }
-    if (node.type === "ImportExpression") {
-      patches.push([node.start, node.start + 6, "__asyncLoad"]);
-    }
-  });
+  } else {
+    traverseAst(ast, (node: any) => {
+      if (
+        node.type === "MetaProperty" &&
+        node.meta?.name === "import" &&
+        node.property?.name === "meta"
+      ) {
+        patches.push([node.start, node.end, "import_meta"]);
+      }
+      if (node.type === "ImportExpression") {
+        patches.push([node.start, node.start + 6, "__asyncLoad"]);
+      }
+    });
+  }
 
   const hasImportDecl = ast.body.some(
     (n: any) => n.type === "ImportDeclaration",
@@ -326,10 +308,7 @@ function convertViaAst(
   }
 
   // apply all patches in one pass
-  let output = source;
-  patches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-  for (const [s, e, r] of patches)
-    output = output.slice(0, s) + r + output.slice(e);
+  let output = applyPatches(source, patches);
 
   if (hasExportDecl) {
     // wrapper sets __esModule in outer scope (see ESM_SENTINEL). doing it
@@ -340,11 +319,184 @@ function convertViaAst(
   // .mjs files with `const require = createRequire(...)` hit TDZ after esmToCjs
   output = demoteLexicalRequire(output);
 
-  return { code: output, hasTLA: astHasTopLevelAwait(ast) };
+  return {
+    code: output,
+    hasTLA: RE_AWAIT_WORD.test(source) && moduleAstHasTopLevelAwait(ast),
+  };
+}
+
+// Top-level await in a module AST. Function bodies are skipped outright: in
+// module code `await` inside any non-async function is a parse error, and
+// inside an async one it isn't top level, so only statements outside
+// functions can hold it. Most of a module's code sits in functions, which
+// makes this a small fraction of a full walk.
+function moduleAstHasTopLevelAwait(ast: any): boolean {
+  let found = false;
+  const walk = (node: any): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    switch (node.type) {
+      case "FunctionDeclaration":
+      case "FunctionExpression":
+      case "ArrowFunctionExpression":
+        return;
+      case "AwaitExpression":
+        found = true;
+        return;
+      case "ForOfStatement":
+        if (node.await) {
+          found = true;
+          return;
+        }
+        break;
+      default:
+        if (typeof node.type !== "string") return;
+    }
+    for (const key in node) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      const value = node[key];
+      if (value && typeof value === "object") walk(value);
+    }
+  };
+  walk(ast);
+  return found;
 }
 
 // stamped by convertModuleSyntax, stripped by buildModuleWrapper. #56
 const ESM_SENTINEL = "/*@nodepod-esm*/\n";
+
+const RE_AWAIT_WORD = /\bawait\b/;
+// `await (x)` / `await [x]` at the start of a line, outside any function:
+// sloppy-mode script parses it as a call of a function named await, so
+// nothing flags it; the full path detects and strips top-level await
+const RE_TOPLEVEL_AWAIT_CALL = /^(?:(?:const|let|var)\s+[\w$]+\s*=\s*|[\w$.]+\s*=\s*)?await\s*[([]/m;
+// the lexer's memory grows to about 4 bytes per source char and stays at
+// its peak: bigger sources take the AST path (their parse is transient)
+const LEXER_MAX_CHARS = 2_000_000;
+
+declare const __NODEPOD_BUILD_ID__: string | undefined;
+
+// Transform caches store this instead of code when the transform left the
+// source unchanged (most CommonJS in node_modules): the loader has the source
+// in hand already, so a second copy would only cost memory and transfer.
+const SAME_AS_SOURCE = "\u0000=";
+// shared-pack flag: see SAME_AS_SOURCE
+const FLAG_SAME_AS_SOURCE = 4;
+
+// ── Shared transform store (see threading/transform-store.ts) ──
+
+type SharedTransformClient = {
+  loadPack(scope: string): Array<[string, string, number]>;
+  put(scope: string, key: string, code: string, flags: number): void;
+};
+
+function getSharedTransformClient(): SharedTransformClient | null {
+  return (
+    (globalThis as { __nodepodSharedTransforms?: SharedTransformClient })
+      .__nodepodSharedTransforms ?? null
+  );
+}
+
+// packs fetched over each client (one per process); entries are handed out
+// once (each module loads once per process) so a pack's strings don't
+// outlive their use
+const _sharedPacks = new WeakMap<SharedTransformClient, Map<string, Map<string, [string, number]>>>();
+// the entries a process never takes (modules of a package it doesn't load)
+// are dropped once it stops loading modules; a later load asks again
+const SHARED_PACK_IDLE_MS = 5000;
+const _sharedPackRelease = new WeakMap<SharedTransformClient, { timer: ReturnType<typeof setTimeout>; at: number }>();
+
+function scheduleSharedPackRelease(client: SharedTransformClient): void {
+  const now = Date.now();
+  const pending = _sharedPackRelease.get(client);
+  if (pending && now - pending.at < 1000) return;
+  if (pending) clearTimeout(pending.timer);
+  const timer = setTimeout(() => {
+    _sharedPackRelease.delete(client);
+    _sharedPacks.delete(client);
+  }, SHARED_PACK_IDLE_MS);
+  // in process workers setTimeout is the node timers polyfill: this timer
+  // must not keep the process alive
+  (timer as unknown as { unref?: () => void }).unref?.();
+  _sharedPackRelease.set(client, { timer, at: now });
+}
+
+function takeSharedTransform(
+  client: SharedTransformClient,
+  scope: string,
+  key: string,
+): [string, number] | null {
+  scheduleSharedPackRelease(client);
+  let packs = _sharedPacks.get(client);
+  if (!packs) _sharedPacks.set(client, (packs = new Map()));
+  let pack = packs.get(scope);
+  if (!pack) {
+    pack = new Map();
+    for (const [k, code, flags] of client.loadPack(scope)) pack.set(k, [code, flags]);
+    packs.set(scope, pack);
+  }
+  const hit = pack.get(key);
+  if (!hit) return null;
+  pack.delete(key);
+  return hit;
+}
+
+// Digest of the transform implementation itself: persisted transforms made
+// by different transform code never match.
+let _transformSalt: string | null = null;
+function transformSalt(): string {
+  if (_transformSalt === null) {
+    // the build id changes with every build (a helper not listed below may
+    // change); the digest covers unbundled runs such as tests
+    const build = typeof __NODEPOD_BUILD_ID__ === "string" ? __NODEPOD_BUILD_ID__ : "dev";
+    _transformSalt = build + "." + quickDigest(
+      [
+        convertModuleSyntaxDetailed,
+        convertViaAst,
+        convertViaRegex,
+        collectEsmCjsPatches,
+        applyPatches,
+        demoteLexicalRequire,
+        pickModuleExportName,
+        fastCommonJsTransform,
+        patchDynamicImports,
+        stripTypeScript,
+      ]
+        .map(String)
+        .join("|"),
+    );
+  }
+  return _transformSalt;
+}
+
+/**
+ * Loader fast path for CommonJS: when the lexer finds no static
+ * import/export, the module only needs `import()` / `import.meta` rewritten,
+ * which the lexer's positions give directly. Returns null when the module
+ * needs the full AST transform: it has module syntax, or it lives in an ESM
+ * context (.mjs, `"type": "module"`) and may use top-level await.
+ */
+function fastCommonJsTransform(
+  code: string,
+  filePath: string,
+  isTypeModuleDir: (dir: string) => boolean,
+): string | null {
+  if (code.length > LEXER_MAX_CHARS) return null;
+  // .cts may keep import/export after type stripping: check it like .js
+  const explicitCjs = filePath.endsWith(".cjs");
+  if (!explicitCjs && RE_AWAIT_WORD.test(code)) {
+    if (/\.m[jt]s$/.test(filePath)) return null;
+    if (isTypeModuleDir(pathPolyfill.dirname(filePath))) return null;
+    if (RE_TOPLEVEL_AWAIT_CALL.test(code)) return null;
+  }
+  const lexed = lexModule(code);
+  if (!lexed) return null;
+  if (!explicitCjs && hasStaticModuleSyntax(lexed)) return null;
+  return patchDynamicImports(code, lexed);
+}
 
 // Demote `const/let require =` to plain assignment to avoid TDZ with esmToCjs-generated require() calls
 function demoteLexicalRequire(code: string): string {
@@ -1600,6 +1752,11 @@ function buildResolver(
   const readManifest = (manifestPath: string): PackageManifest | null => {
     if (manifestCache.has(manifestPath))
       return manifestCache.get(manifestPath)!;
+    // most lookups probe directories without a package.json; skip the ENOENT
+    if (!vol.existsSync(manifestPath)) {
+      manifestCache.set(manifestPath, null);
+      return null;
+    }
     try {
       const raw = vol.readFileSync(manifestPath, "utf8");
       const parsed = JSON.parse(raw) as PackageManifest;
@@ -1609,6 +1766,22 @@ function buildResolver(
       manifestCache.set(manifestPath, null);
       return null;
     }
+  };
+
+  // dir -> whether the nearest package.json declares "type": "module"
+  const typeModuleCache: Map<string, boolean> =
+    (cache as any).__typeModuleCache ??
+    ((cache as any).__typeModuleCache = new Map());
+  const isTypeModuleDir = (dir: string): boolean => {
+    const cached = typeModuleCache.get(dir);
+    if (cached !== undefined) return cached;
+    const mf = readManifest(dir === "/" ? "/package.json" : dir + "/package.json");
+    let result: boolean;
+    if (mf) result = mf.type === "module";
+    else if (dir === "/" || dir === "") result = false;
+    else result = isTypeModuleDir(pathPolyfill.dirname(dir));
+    typeModuleCache.set(dir, result);
+    return result;
   };
 
   const resolveId = (
@@ -1946,6 +2119,10 @@ function buildResolver(
     // Package dedup: reuse first instance of name@version:path to prevent
     // "Cannot use X from another module or realm" errors
     const nmIdx = resolved.lastIndexOf("/node_modules/");
+    // installed package this module belongs to: its transforms are shared
+    // with other processes through the main thread's transform store
+    let sharedScope: string | null = null;
+    let sharedRel = "";
     if (nmIdx !== -1) {
       const afterNm = resolved.slice(nmIdx + "/node_modules/".length);
       const parts = afterNm.split("/");
@@ -1953,10 +2130,10 @@ function buildResolver(
         ? parts[0] + "/" + parts[1]
         : parts[0];
       const pkgDir = resolved.slice(0, nmIdx) + "/node_modules/" + pkgName;
-      try {
-        const pkgJson = JSON.parse(
-          vol.readFileSync(pkgDir + "/package.json", "utf8"),
-        );
+      const pkgJson = readManifest(pkgDir + "/package.json");
+      if (pkgJson) {
+        sharedScope = `${transformSalt()}|${pkgName}@${pkgJson.version || "0.0.0"}`;
+        sharedRel = afterNm.slice(pkgName.length + 1);
         // Include file path so different subpath exports (svelte vs svelte/compiler) aren't deduped
         const identity =
           pkgName + "@" + (pkgJson.version || "0.0.0") + ":" + afterNm;
@@ -1970,8 +2147,6 @@ function buildResolver(
             return cache[canonical];
           }
         }
-      } catch {
-        /* no package.json */
       }
     }
 
@@ -2020,19 +2195,33 @@ function buildResolver(
     const dir = pathPolyfill.dirname(resolved);
     const moduleExportName = pickModuleExportName(rawSource);
 
-    const codeCacheKey = `${resolved}|${quickDigest(rawSource)}`;
+    const sourceDigest = contentDigest(rawSource);
+    const codeCacheKey = `${resolved}|${sourceDigest}`;
     let processedCode = codeCache?.get(codeCacheKey);
+    if (processedCode === SAME_AS_SOURCE) processedCode = rawSource;
     let moduleHasTLA = codeCache?.get(`${codeCacheKey}|tla`) === "1";
+    // "f" marks output of the lexer fast path, which is re-derived through
+    // the full AST path if V8 rejects it (see the eval below).
+    let usedFastPath = codeCache?.get(`${codeCacheKey}|fast`) === "1";
 
-    if (!processedCode) {
+    const transformSource = (allowFast: boolean): void => {
       processedCode = rawSource;
+      usedFastPath = false;
       if (processedCode.startsWith("#!")) {
         processedCode = processedCode.slice(processedCode.indexOf("\n") + 1);
       }
       if (isTypeScriptFile(resolved)) {
         processedCode = stripTypeScript(processedCode, resolved);
       }
-      if (resolved.endsWith(".cjs")) {
+      const fast =
+        allowFast && !deAsyncImports
+          ? fastCommonJsTransform(processedCode, resolved, isTypeModuleDir)
+          : null;
+      if (fast !== null) {
+        processedCode = fast;
+        moduleHasTLA = false;
+        usedFastPath = true;
+      } else if (resolved.endsWith(".cjs")) {
         // CJS: only rewrite import()/import.meta via AST, skip full ESM conversion
         try {
           const cjsAst = acorn.parse(processedCode, {
@@ -2066,15 +2255,7 @@ function buildResolver(
             }
           };
           walkCjs(cjsAst);
-          if (cjsPatches.length > 0) {
-            cjsPatches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-            for (const [start, end, replacement] of cjsPatches) {
-              processedCode =
-                processedCode.slice(0, start) +
-                replacement +
-                processedCode.slice(end);
-            }
-          }
+          processedCode = applyPatches(processedCode!, cjsPatches);
         } catch {
           /* can't parse — leave untransformed */
         }
@@ -2087,53 +2268,108 @@ function buildResolver(
         processedCode = converted.code;
         moduleHasTLA = converted.hasTLA;
       }
-      codeCache?.set(codeCacheKey, processedCode);
+      codeCache?.set(
+        codeCacheKey,
+        processedCode === rawSource ? SAME_AS_SOURCE : processedCode!,
+      );
       codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
+      codeCache?.set(`${codeCacheKey}|fast`, usedFastPath ? "1" : "0");
+    };
+
+    const sharedTransforms = sharedScope ? getSharedTransformClient() : null;
+    const sharedKey = sharedTransforms
+      ? `${sharedRel}|${rawSource.length}|${sourceDigest}`
+      : "";
+    if (processedCode === undefined && sharedTransforms) {
+      const hit = takeSharedTransform(sharedTransforms, sharedScope!, sharedKey);
+      if (hit) {
+        const same = (hit[1] & FLAG_SAME_AS_SOURCE) !== 0;
+        processedCode = same ? rawSource : hit[0];
+        moduleHasTLA = (hit[1] & 1) !== 0;
+        usedFastPath = (hit[1] & 2) !== 0;
+        codeCache?.set(codeCacheKey, same ? SAME_AS_SOURCE : processedCode);
+        codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
+        codeCache?.set(`${codeCacheKey}|fast`, usedFastPath ? "1" : "0");
+      }
+    }
+    const publishTransform = (): void => {
+      if (!sharedTransforms) return;
+      const same = processedCode === rawSource;
+      // a transform that baked this file's absolute location in (the regex
+      // fallback's import.meta values) only fits this path: keep it local
+      if (!same && processedCode!.includes(dir) && !rawSource.includes(dir)) return;
+      sharedTransforms.put(
+        sharedScope!,
+        sharedKey,
+        same ? "" : processedCode!,
+        (moduleHasTLA ? 1 : 0) | (usedFastPath ? 2 : 0) | (same ? FLAG_SAME_AS_SOURCE : 0),
+      );
+    };
+    if (processedCode === undefined) {
+      transformSource(true);
+      publishTransform();
     }
 
     const isCjs = resolved.endsWith(".cjs");
-    if (!isCjs && !codeCache?.has(`${codeCacheKey}|tla`)) {
-      moduleHasTLA = hasTopLevelAwait(processedCode);
-    }
-    const useFullDeAsync = deAsyncImports || moduleHasTLA;
-    if (!isCjs)
-      processedCode = stripTopLevelAwait(
-        processedCode,
-        deAsyncImports ? "full" : "topLevelOnly",
-      );
+    let useFullDeAsync = false;
+    let childResolver!: ResolverFn;
+    const finishTransform = (): void => {
+      if (!isCjs && !codeCache?.has(`${codeCacheKey}|tla`)) {
+        moduleHasTLA = hasTopLevelAwait(processedCode!);
+      }
+      useFullDeAsync = deAsyncImports || moduleHasTLA;
+      // Without top-level await (and outside de-async mode) the top-level-only
+      // strip is a no-op, so skip its full re-parse.
+      if (!isCjs && useFullDeAsync)
+        processedCode = stripTopLevelAwait(
+          processedCode!,
+          deAsyncImports ? "full" : "topLevelOnly",
+        );
 
-    const childResolver = buildResolver(
-      vol,
-      fsBridge,
-      proc,
-      dir,
-      cache,
-      opts,
-      codeCache,
-      useFullDeAsync,
-    );
-    childResolver.cache = cache;
-    childResolver._ownerRecord = record;
+      childResolver = buildResolver(
+        vol,
+        fsBridge,
+        proc,
+        dir,
+        cache,
+        opts,
+        codeCache,
+        useFullDeAsync,
+      );
+      childResolver.cache = cache;
+      childResolver._ownerRecord = record;
+    };
+    finishTransform();
 
     const wrappedConsole = wrapConsole(opts.onConsole);
 
     try {
-      const wrapper = buildModuleWrapper(processedCode, { moduleExportName });
+      let wrapper = buildModuleWrapper(processedCode!, { moduleExportName });
 
       let fn;
       try {
         fn = (0, eval)(wrapper);
       } catch (syntaxErr) {
-        const msg =
-          syntaxErr instanceof Error ? syntaxErr.message : String(syntaxErr);
-        throw new SyntaxError(`${msg} (in ${resolved})`);
-      }
-
-      {
-        const srcMap =
-          (globalThis as any).__dbgSrcMap ||
-          ((globalThis as any).__dbgSrcMap = new Map());
-        srcMap.set(resolved, wrapper);
+        if (usedFastPath && syntaxErr instanceof SyntaxError) {
+          // The lexer classified this as CommonJS but V8 disagrees (e.g.
+          // top-level await in a script-looking file). Re-derive it through
+          // the full AST transform.
+          transformSource(false);
+          publishTransform();
+          finishTransform();
+          wrapper = buildModuleWrapper(processedCode!, { moduleExportName });
+          try {
+            fn = (0, eval)(wrapper);
+          } catch (retryErr) {
+            const msg =
+              retryErr instanceof Error ? retryErr.message : String(retryErr);
+            throw new SyntaxError(`${msg} (in ${resolved})`);
+          }
+        } else {
+          const msg =
+            syntaxErr instanceof Error ? syntaxErr.message : String(syntaxErr);
+          throw new SyntaxError(`${msg} (in ${resolved})`);
+        }
       }
 
       const asyncLoader = makeDynamicLoader(childResolver);

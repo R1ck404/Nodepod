@@ -17,6 +17,7 @@ import type { IDBSnapshotCache } from "../persistence/idb-cache";
 import { canPageFrom, type PackContentSource } from "../persistence/pack-content-source";
 import type { VFSSnapshotEntry } from "../threading/worker-protocol";
 import { quickDigest } from "../helpers/digest";
+import { requestEsbuildPrefetch } from "../helpers/esbuild-wasm-module";
 import {
   createFilteredBinarySnapshot,
   restoreBinarySnapshot,
@@ -54,9 +55,20 @@ const WASI_SOURCE_EXTENSIONS = new Set([
   ".mts",
   ".ts",
 ]);
+const WASI_CONVENTION_RE = /-wasm32-wasi/i;
+// type declarations never load a binding at runtime
+const TYPE_DECLARATION_RE = /\.d\.[cm]?ts$/i;
+
+// name@version -> wasm32-wasi references found in that package's files. A
+// published version's files never change, so each is read once per session
+// instead of on every install and every companion pass.
+const wasiReferenceCache = new Map<string, string[]>();
 
 /** Return literal npm package references using the wasm32-wasi convention. */
 export function findWasiPackageReferences(source: string): string[] {
+  // literal search first: almost no file mentions the convention, and the
+  // capturing regex costs far more than this on megabytes of source
+  if (!WASI_CONVENTION_RE.test(source)) return [];
   const references = new Set<string>();
   for (const match of source.matchAll(WASI_PACKAGE_REFERENCE_RE)) {
     references.add(match[1]);
@@ -344,6 +356,9 @@ export class DependencyInstaller {
     }
     stopResolution?.();
     this.endProfileSpan(resolutionSpan);
+    // esbuild ships as ~10MB of wasm fetched on first use: when it is part of
+    // this install, download and compile it while the packages extract
+    if ([...tree.values()].some((d) => d.name === "esbuild" || d.name === "esbuild-wasm")) requestEsbuildPrefetch();
 
     // Prefer package-lock resolved URL + SRI for the root package (npm ci)
     if (flags.lockEntry) {
@@ -507,6 +522,9 @@ export class DependencyInstaller {
     }
     stopResolution?.();
     this.endProfileSpan(resolutionSpan);
+    // esbuild ships as ~10MB of wasm fetched on first use: when it is part of
+    // this install, download and compile it while the packages extract
+    if ([...tree.values()].some((d) => d.name === "esbuild" || d.name === "esbuild-wasm")) requestEsbuildPrefetch();
 
     const stopMaterialize = this._performance?.start("install.materialize");
     const materializeSpan = this.profileSpan("packages.materialize");
@@ -747,8 +765,13 @@ export class DependencyInstaller {
 
     for (const [parentPlacement, dependency] of tree) {
       const packageDir = path.join(nmRoot, parentPlacement);
-      const references = new Set<string>();
-      const files = [packageDir];
+      // one published version's files never change; the tarball URL tells
+      // apart same-named builds from elsewhere (git, pkg.pr.new)
+      const cacheKey = `${dependency.fetchName}@${dependency.version}|${dependency.tarballUrl ?? ""}`;
+      const cachedReferences = wasiReferenceCache.get(cacheKey);
+      const references = new Set<string>(cachedReferences ?? []);
+      const files = cachedReferences ? [] : [packageDir];
+      let scanned = false;
 
       while (files.length > 0) {
         const current = files.pop()!;
@@ -758,6 +781,7 @@ export class DependencyInstaller {
         } catch {
           continue;
         }
+        if (current === packageDir) scanned = true;
 
         for (const entry of entries) {
           if (entry === "node_modules" || entry === ".git") continue;
@@ -774,7 +798,11 @@ export class DependencyInstaller {
           }
 
           const extension = path.extname(entry).toLowerCase();
-          if (!WASI_SOURCE_EXTENSIONS.has(extension) || stat.size > 16 * 1024 * 1024) {
+          if (
+            !WASI_SOURCE_EXTENSIONS.has(extension) ||
+            stat.size > 16 * 1024 * 1024 ||
+            TYPE_DECLARATION_RE.test(entry)
+          ) {
             continue;
           }
           try {
@@ -788,6 +816,9 @@ export class DependencyInstaller {
           }
         }
       }
+
+      // an unreadable package directory (not materialized) proves nothing
+      if (!cachedReferences && scanned) wasiReferenceCache.set(cacheKey, [...references]);
 
       let packageJson: {
         name?: string;

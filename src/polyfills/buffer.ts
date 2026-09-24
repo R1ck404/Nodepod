@@ -35,6 +35,29 @@ const HEX_DECODE = new Uint8Array(128);
 for (let i = 0; i < 10; i++) HEX_DECODE[48 + i] = i;         // '0'-'9'
 for (let i = 0; i < 6; i++) { HEX_DECODE[65 + i] = 10 + i; HEX_DECODE[97 + i] = 10 + i; } // 'A'-'F', 'a'-'f'
 
+// Node's base64 decoder is lenient where atob isn't: characters outside the
+// alphabet are skipped, "-" and "_" are accepted, the first "=" ends the
+// data and a lone trailing character is dropped. Only used once the strict
+// decoder rejected the input.
+function lenientBase64(input: string): string {
+  let b64 = input
+    .split("=")[0]
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .replace(/[^A-Za-z0-9+/]/g, "");
+  const rem = b64.length % 4;
+  if (rem === 1) b64 = b64.slice(0, -1);
+  else if (rem === 2) b64 += "==";
+  else if (rem === 3) b64 += "=";
+  return b64;
+}
+
+// A Buffer over bytes that were just produced for it (an encode result):
+// wrap the same memory instead of copying it into a second allocation.
+function viewOf(bytes: Uint8Array): BufferPolyfill {
+  return new BufferPolyfill(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+}
+
 // ---- The main BufferPolyfill class ----
 
 class BufferPolyfill extends Uint8Array {
@@ -67,7 +90,13 @@ class BufferPolyfill extends Uint8Array {
           b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
           while (b64.length % 4 !== 0) b64 += '=';
         }
-        return new BufferPolyfill(base64ToBytes(b64));
+        let decoded: Uint8Array;
+        try {
+          decoded = base64ToBytes(b64);
+        } catch {
+          decoded = base64ToBytes(lenientBase64(b64));
+        }
+        return viewOf(decoded);
       }
 
       if (enc === 'hex') {
@@ -75,7 +104,7 @@ class BufferPolyfill extends Uint8Array {
         for (let i = 0; i < source.length; i += 2) {
           octets[i >>> 1] = (HEX_DECODE[source.charCodeAt(i)] << 4) | HEX_DECODE[source.charCodeAt(i + 1)];
         }
-        return new BufferPolyfill(octets);
+        return viewOf(octets);
       }
 
       if (enc === 'latin1' || enc === 'binary' || enc === 'ascii') {
@@ -83,15 +112,15 @@ class BufferPolyfill extends Uint8Array {
         for (let i = 0; i < source.length; i++) {
           octets[i] = source.charCodeAt(i) & 0xff;
         }
-        return new BufferPolyfill(octets);
+        return viewOf(octets);
       }
 
       if (enc === 'utf16le' || enc === 'utf-16le' || enc === 'ucs2' || enc === 'ucs-2') {
-        return new BufferPolyfill(encodeUtf16Le(source));
+        return viewOf(encodeUtf16Le(source));
       }
 
       // utf-8 default
-      return new BufferPolyfill(textEnc.encode(source));
+      return viewOf(textEnc.encode(source));
     }
 
     if (source instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer)) {
