@@ -132,8 +132,18 @@ export class ProcessHandle extends EventEmitter {
     }
   }
 
+  // last terminal size sent to this process; children that share its tty
+  // start from it (ProcessManager relays later resizes to them)
+  private _terminalSize: { cols: number; rows: number } | null = null;
+
+  get terminalSize(): { cols: number; rows: number } | null {
+    return this._terminalSize;
+  }
+
   resize(cols: number, rows: number): void {
+    this._terminalSize = { cols, rows };
     this.postMessage({ type: "resize", cols, rows });
+    this.emit("resize", cols, rows);
   }
 
   holdExit(): void {

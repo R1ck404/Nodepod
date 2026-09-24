@@ -99,6 +99,9 @@ export class ProcessManager extends EventEmitter {
   // pids of children that inherit their parent's stdin. stdin-forward only
   // routes to pids in this set. stdio:'pipe' kids get their own isolated stdin.
   private _inheritStdinChildren = new Set<number>();
+  // pids of children whose stdout is their parent's terminal: they start at
+  // the parent's size and get its resizes, like processes sharing a tty
+  private _ttyChildren = new Set<number>();
   private _httpCallbacks = new Map<
     number,
     { pid: number; fn: (resp: WorkerToMain_HttpResponse) => void }
@@ -427,6 +430,7 @@ export class ProcessManager extends EventEmitter {
     this._serverPorts.clear();
     this._childPids.clear();
     this._inheritStdinChildren.clear();
+    this._ttyChildren.clear();
     for (const [requestId, entry] of this._httpCallbacks) {
       entry.fn({
         type: "http-response",
@@ -449,6 +453,7 @@ export class ProcessManager extends EventEmitter {
       this._processPorts.delete(pid);
     }
     this._inheritStdinChildren.delete(pid);
+    this._ttyChildren.delete(pid);
     this._childPids.delete(pid);
     for (const children of this._childPids.values()) children.delete(pid);
     for (const [key, owned] of this._wasiWorkers) {
@@ -858,6 +863,14 @@ export class ProcessManager extends EventEmitter {
     };
   }
 
+  // called before the child is told to run, so its first read of
+  // process.stdout.columns is the real terminal width
+  private _shareTerminal(parent: ProcessHandle, child: ProcessHandle): void {
+    this._ttyChildren.add(child.pid);
+    const size = parent.terminalSize;
+    if (size) child.resize(size.cols, size.rows);
+  }
+
   private _createWorker(): HostWorker {
     return getRuntimeHost().createWorker({ type: "process" });
   }
@@ -883,6 +896,18 @@ export class ProcessManager extends EventEmitter {
           if (childHandle && childHandle.state !== "exited") {
             childHandle.sendStdin(data);
           }
+        }
+      }
+    });
+
+    handle.on("resize", (cols: number, rows: number) => {
+      const children = this._childPids.get(handle.pid);
+      if (!children) return;
+      for (const childPid of children) {
+        if (!this._ttyChildren.has(childPid)) continue;
+        const childHandle = this._processes.get(childPid);
+        if (childHandle && childHandle.state !== "exited") {
+          childHandle.resize(cols, rows);
         }
       }
     });
@@ -986,6 +1011,9 @@ export class ProcessManager extends EventEmitter {
         const inheritsStdin = msg.stdio === "inherit"
           || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
         if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+        if (msg.stdio === "inherit" || (Array.isArray(msg.stdio) && msg.stdio[1] === "inherit")) {
+          this._shareTerminal(handle, childHandle);
+        }
 
         // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
         handle.holdExit();
@@ -1087,6 +1115,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1224,6 +1253,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1364,6 +1394,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1543,6 +1574,7 @@ export class ProcessManager extends EventEmitter {
         // under create-vite).
         const stdinInherits = !msg.stdio || msg.stdio[0] === "inherit";
         if (stdinInherits) this._inheritStdinChildren.add(childHandle.pid);
+        if (!msg.stdio || msg.stdio[1] === "inherit") this._shareTerminal(handle, childHandle);
 
         handle.holdExit();
         handle.holdShellDone();
@@ -1606,6 +1638,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
 
           handle.releaseSync();
           handle.releaseExit();
@@ -1620,6 +1653,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseSync();
           handle.releaseExit();
           handle.releaseShellDone();
