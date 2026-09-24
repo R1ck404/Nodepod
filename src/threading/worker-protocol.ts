@@ -368,6 +368,12 @@ export interface WorkerToMain_SpawnSync {
   stdio?: Array<"pipe" | "inherit" | "ignore">;
 }
 
+// the worker read one chunk of a sync result and wants the next
+export interface WorkerToMain_SyncMore {
+  type: "sync-more";
+  syncSlot: number;
+}
+
 export interface WorkerToMain_ServerListen {
   type: "server-listen";
   port: number;
@@ -482,6 +488,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_WasiWorkerRequest
   | WorkerToMain_WasiWorkerTerminate
   | WorkerToMain_SpawnSync
+  | WorkerToMain_SyncMore
   | WorkerToMain_ServerListen
   | WorkerToMain_ServerClose
   | WorkerToMain_HttpRequest

@@ -304,6 +304,10 @@ export class ProcessHandle extends EventEmitter {
           this.emit("spawn-sync", msg);
           break;
 
+        case "sync-more":
+          this.emit("sync-more", msg.syncSlot);
+          break;
+
         case "sqlite-preload":
           this.emit("sqlite-preload", msg);
           break;

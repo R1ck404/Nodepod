@@ -2057,6 +2057,8 @@ export interface RunOptions {
   timeout?: number;
   maxBuffer?: number;
   shell?: string | boolean;
+  /** execSync / execFileSync only */
+  stdio?: "pipe" | "inherit" | "ignore" | Array<"pipe" | "inherit" | "ignore">;
 }
 
 export type RunCallback = (
@@ -2130,6 +2132,13 @@ export function exec(
   return child;
 }
 
+// node's execSync/execFileSync capture stdout and pass stderr through to
+// the parent. stdin stays shared with the terminal here: a piped stdin that
+// is never written would leave a child reading it waiting forever
+function execSyncStdio(stdio: unknown): Array<"pipe" | "inherit" | "ignore"> {
+  return stdio == null ? ["inherit", "pipe", "inherit"] : normalizeStdio(stdio as SpawnConfig["stdio"]);
+}
+
 function throwExecSyncFailed(cmd: string, status: number, stdout: string, stderr = ""): never {
   const err: any = new Error(`Command failed: ${cmd}\n${stderr || stdout}`);
   err.status = status;
@@ -2174,25 +2183,28 @@ export function execSync(cmd: string, opts?: RunOptions): string | Buffer {
     env,
     syncSlot: slot,
     shellCommand: trimmed,
+    stdio: execSyncStdio(opts?.stdio),
   });
 
   // blocks until main thread spawns child and child completes
-  const { exitCode, stdout } = _syncChannel.waitForResult(slot, 120_000);
+  const { exitCode, stdout, stderr } = _syncChannel.waitForResult(
+    slot,
+    120_000,
+    () => requestMoreSyncOutput(slot),
+  );
 
-  if (exitCode !== 0) {
-    const err: any = new Error(`Command failed: ${trimmed}\n${stdout}`);
-    err.status = exitCode;
-    err.stderr = Buffer.from("");
-    err.stdout = Buffer.from(stdout);
-    err.output = [null, err.stdout, err.stderr];
-    throw err;
-  }
+  if (exitCode !== 0) throwExecSyncFailed(trimmed, exitCode, stdout, stderr);
 
   if (encoding === "buffer") return Buffer.from(stdout);
   return stdout;
 }
 
 let _nextSyncRequestId = 1;
+
+// a sync result bigger than one slot arrives in chunks; ask for the next one
+function requestMoreSyncOutput(syncSlot: number): void {
+  (self as any).postMessage({ type: "sync-more", syncSlot });
+}
 
 const KNOWN_BINS: Record<string, string> = {
   node: "/usr/local/bin/node",
@@ -2695,9 +2707,13 @@ export function spawnSync(
 
   // blocks until main thread spawns child and child completes
   try {
-    const { exitCode, stdout: stdoutStr } = _syncChannel.waitForResult(slot, 120_000);
+    const { exitCode, stdout: stdoutStr, stderr: stderrStr } = _syncChannel.waitForResult(
+      slot,
+      120_000,
+      () => requestMoreSyncOutput(slot),
+    );
     const stdout = Buffer.from(stdoutStr);
-    const stderr = Buffer.from("");
+    const stderr = Buffer.from(stderrStr);
     return {
       stdout,
       stderr,
@@ -2708,7 +2724,7 @@ export function spawnSync(
     };
   } catch (e: any) {
     const stdout = Buffer.from(e?.stdout ?? "");
-    const stderr = Buffer.from(e?.message ?? "");
+    const stderr = Buffer.from(e?.stderr || e?.message || "");
     return {
       stdout,
       stderr,
@@ -2731,6 +2747,7 @@ export function execFileSync(
   const result = spawnSync(file, fileArgs, {
     cwd: opts?.cwd,
     env: opts?.env as Record<string, string> | undefined,
+    stdio: execSyncStdio(opts?.stdio) as SpawnConfig["stdio"],
   });
   if (result.status !== 0 || result.error) {
     throwExecSyncFailed(

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   SyncChannelController,
   SyncChannelWorker,
+  SyncResultWriter,
   encodeSyncSlot,
   decodeSyncSlot,
   MAX_SLOTS,
@@ -28,7 +29,7 @@ describe("SyncChannel free-list + generation", () => {
     const first = handles[0];
     ctrl.writeResult(first, 0, "done");
     const result = worker.waitForResult(first, 5_000);
-    expect(result).toEqual({ exitCode: 0, stdout: "done" });
+    expect(result).toEqual({ exitCode: 0, stdout: "done", stderr: "" });
 
     const reused = worker.allocateSlot();
     expect(decodeSyncSlot(reused).slot).toBe(decodeSyncSlot(first).slot);
@@ -57,6 +58,44 @@ describe("SyncChannel free-list + generation", () => {
     // stale write for the old handle must not complete the new lease
     ctrl.writeResult(handle, 99, "stale");
     ctrl.writeResult(next, 0, "fresh");
-    expect(worker.waitForResult(next, 5_000)).toEqual({ exitCode: 0, stdout: "fresh" });
+    expect(worker.waitForResult(next, 5_000)).toEqual({ exitCode: 0, stdout: "fresh", stderr: "" });
+  });
+
+  it("carries stderr next to stdout", () => {
+    const ctrl = new SyncChannelController();
+    const worker = new SyncChannelWorker(ctrl.buffer);
+    const handle = worker.allocateSlot();
+    ctrl.writeResult(handle, 1, "out", "npm error: nope");
+    expect(worker.waitForResult(handle, 5_000)).toEqual({ exitCode: 1, stdout: "out", stderr: "npm error: nope" });
+  });
+
+  it("hands over output bigger than a slot in chunks", () => {
+    const ctrl = new SyncChannelController();
+    const worker = new SyncChannelWorker(ctrl.buffer);
+    const handle = worker.allocateSlot();
+    // multi-byte characters so chunk boundaries fall inside one
+    const stdout = "é".repeat(40_000) + "end-of-stdout";
+    const stderr = "warn ".repeat(10_000);
+    const writer = new SyncResultWriter(ctrl.buffer, handle, 0, stdout, stderr);
+    let requests = 0;
+    expect(writer.writeNext()).toBe(true);
+    // single thread: answer each request right away, before the next wait
+    const result = worker.waitForResult(handle, 5_000, () => {
+      requests++;
+      writer.writeNext();
+    });
+    expect(result.stdout).toBe(stdout);
+    expect(result.stderr).toBe(stderr);
+    expect(requests).toBeGreaterThan(3);
+  });
+
+  it("returns what fit in the first chunk when nobody can ask for more", () => {
+    const ctrl = new SyncChannelController();
+    const worker = new SyncChannelWorker(ctrl.buffer);
+    const handle = worker.allocateSlot();
+    expect(ctrl.writeResult(handle, 0, "x".repeat(50_000))).not.toBeNull();
+    const result = worker.waitForResult(handle, 5_000);
+    expect(result.stdout.length).toBeGreaterThan(16_000);
+    expect(result.stdout.length).toBeLessThan(50_000);
   });
 });
