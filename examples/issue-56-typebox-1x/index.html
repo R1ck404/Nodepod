@@ -285,12 +285,13 @@ try {
           new Promise((r) => setTimeout(() => r({ exitCode: '<timeout>', __t: true }), 30000)),
         ]);
         if (piRes.__t) { try { piProc.kill(); } catch {} }
-        log(`\npi exit=${piRes.exitCode}`,
-          (piRes.exitCode === 0) ? 'pass' : 'fail');
-        log(piRes.exitCode === 0
+        // still running after 30s means pi loaded and is waiting for input
+        const started = piRes.exitCode === 0 || piRes.__t;
+        log(`\npi exit=${piRes.exitCode}`, started ? 'pass' : 'fail');
+        log(started
           ? `NOT reproduced - pi started cleanly.`
           : `REPRODUCED issue #56: pi threw during typebox module load.`,
-          piRes.exitCode === 0 ? 'pass' : 'fail');
+          started ? 'pass' : 'fail');
       } catch (e) {
         log(`uncaught: ${e?.stack || e}`, 'fail');
       } finally {

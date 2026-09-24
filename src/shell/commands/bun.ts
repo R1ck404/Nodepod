@@ -53,13 +53,9 @@ export function createBunCommand(deps: PmDeps): ShellCommand {
           return deps.runScript([...silent, "test"], ctx);
         case "install":
         case "i": {
-          const rejected = deps.rejectGlobal(params.slice(1), "bun");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "bun");
         }
         case "add": {
-          const rejected = deps.rejectGlobal(params.slice(1), "bun");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "bun");
         }
         case "remove":

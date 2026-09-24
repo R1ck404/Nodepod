@@ -36,14 +36,10 @@ export function createYarnCommand(deps: PmDeps): ShellCommand {
 
       switch (sub) {
         case "add": {
-          const rejected = deps.rejectGlobal(params.slice(1), "yarn");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "yarn");
         }
         case "install":
         case "i": {
-          const rejected = deps.rejectGlobal(params.slice(1), "yarn");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "yarn");
         }
         case "remove":

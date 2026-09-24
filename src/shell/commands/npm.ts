@@ -1,6 +1,7 @@
 import type { ShellCommand } from "../shell-types";
 import { splitLeadingSilentFlags, type PmDeps } from "./pm-types";
 import { VERSIONS } from "../../constants/config";
+import { GLOBAL_BIN, GLOBAL_LIB, GLOBAL_PREFIX, hasGlobalFlag } from "../../packages/pm-cli";
 
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";
@@ -53,8 +54,6 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
         case "install":
         case "i":
         case "add": {
-          const rejected = deps.rejectGlobal(params.slice(1), "npm");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx);
         }
         case "ci":
@@ -66,7 +65,7 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
           return deps.uninstallPackages(params.slice(1), ctx);
         case "ls":
         case "list":
-          return deps.listPackages(ctx);
+          return deps.listPackages(ctx, "npm", params.slice(1));
         case "init":
         case "create":
           return deps.npmInitOrCreate(params.slice(1), sub, ctx);
@@ -81,16 +80,20 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
         case "exec":
           return deps.npxExecute(params.slice(1), ctx);
         case "prefix":
-          return { stdout: ctx.cwd + "\n", stderr: "", exitCode: 0 };
+          return {
+            stdout: (hasGlobalFlag(params) ? GLOBAL_PREFIX : ctx.cwd) + "\n",
+            stderr: "",
+            exitCode: 0,
+          };
         case "root":
           return {
-            stdout: ctx.cwd + "/node_modules\n",
+            stdout: (hasGlobalFlag(params) ? GLOBAL_LIB : ctx.cwd) + "/node_modules\n",
             stderr: "",
             exitCode: 0,
           };
         case "bin":
           return {
-            stdout: ctx.cwd + "/node_modules/.bin\n",
+            stdout: (hasGlobalFlag(params) ? GLOBAL_BIN : ctx.cwd + "/node_modules/.bin") + "\n",
             stderr: "",
             exitCode: 0,
           };
