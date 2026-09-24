@@ -187,7 +187,10 @@ describe("MemoryVolume mutation journal", () => {
     vol.setMissHandler(
       {
         readFile: () => new TextEncoder().encode("remote"),
-        readdir: () => [{ name: "x.js", isDirectory: false, size: 6 }],
+        readdir: (p) =>
+          p === "/node_modules"
+            ? [{ name: "dep", isDirectory: true }]
+            : [{ name: "x.js", isDirectory: false, size: 6 }],
         stat: (p) =>
           p.endsWith(".js")
             ? { isFile: true, isDirectory: false, size: 6 }

@@ -53,6 +53,9 @@ export interface MainToWorker_Init {
   // during init. "engine": full engine boot before ready (forced anyway when
   // the worker has no SharedArrayBuffer, since the sync path needs it).
   sqliteStartup?: "lazy" | "bytes" | "engine";
+  // shared transform store packs that exist (see transform-store.ts)
+  /** persisted transform packs; null when unknown (ask for every package) */
+  transformScopes?: string[] | null;
 }
 
 export interface MainToWorker_Probe {
@@ -112,6 +115,13 @@ export interface MainToWorker_VFSInvalidate {
   path: string;
 }
 
+// the main thread mounted entries in these directories without per-file
+// broadcasts (package cache restores): listed copies are stale
+export interface MainToWorker_VFSRelist {
+  type: "vfs-relist";
+  paths: string[];
+}
+
 export interface MainToWorker_VFSChunk {
   type: "vfs-chunk";
   chunkIndex: number;
@@ -149,7 +159,7 @@ export interface MainToWorker_HttpRequest {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: string | null;
+  body: string | ArrayBuffer | null;
 }
 
 export interface MainToWorker_HttpClientResponse {
@@ -191,7 +201,15 @@ export interface MainToWorker_WsClose {
   code: number;
 }
 
+// Session-wide compiled esbuild-wasm module (null when unavailable), sent in
+// reply to WorkerToMain_EsbuildModuleRequest.
+export interface MainToWorker_EsbuildModule {
+  type: "esbuild-module";
+  module: WebAssembly.Module | null;
+}
+
 export type MainToWorkerMessage =
+  | MainToWorker_EsbuildModule
   | MainToWorker_Init
   | MainToWorker_Probe
   | MainToWorker_Exec
@@ -201,6 +219,7 @@ export type MainToWorkerMessage =
   | MainToWorker_VFSSync
   | MainToWorker_VFSSnapshot
   | MainToWorker_VFSInvalidate
+  | MainToWorker_VFSRelist
   | MainToWorker_VFSChunk
   | MainToWorker_SpawnResult
   | MainToWorker_ChildOutput
@@ -439,7 +458,12 @@ export interface WorkerToMain_WsFrame {
   message?: string;
 }
 
+export interface WorkerToMain_EsbuildModuleRequest {
+  type: "esbuild-module-request";
+}
+
 export type WorkerToMainMessage =
+  | WorkerToMain_EsbuildModuleRequest
   | WorkerToMain_Ready
   | WorkerToMain_ProbeReady
   | WorkerToMain_Stdout

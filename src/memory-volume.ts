@@ -4,6 +4,7 @@ import type { VolumeSnapshot, VolumeEntry } from './engine-types';
 import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding';
 import { MOCK_IDS, MOCK_FS } from './constants/config';
 import type { MemoryHandler } from './memory-handler';
+import pako from 'pako';
 
 export interface VolumeNode {
   kind: 'file' | 'directory' | 'symlink';
@@ -40,6 +41,9 @@ interface VolumeFileInode {
   // where evictable content can be read back from (package packs). cleared
   // as soon as the file is written: the bytes are then the user's own
   src?: ContentRef;
+  // content kept deflated in memory (enableContentPacking); `content` is
+  // undefined while this is set
+  packed?: PackedRef;
 }
 
 /** A byte range inside a stored package pack. */
@@ -48,6 +52,52 @@ export interface ContentRef {
   offset: number;
   length: number;
 }
+
+// ---- Packed content ----
+// Installed package files are mostly never read (type declarations, source
+// maps, alternate builds, docs), yet each held its own buffer on the main
+// thread: a UI-kit install kept 120MB of package bytes, about 165MB with
+// per-buffer overhead. With packing enabled, a background round deflates
+// node_modules files nobody has read since the previous round into shared
+// chunks, about 4x smaller. Reading a packed file inflates its chunk (about
+// half a millisecond) and keeps that file unpacked from then on; stat,
+// listings and sizes never inflate.
+interface PackedChunk {
+  bytes: Uint8Array; // deflate-raw
+}
+
+interface PackedRef {
+  chunk: PackedChunk;
+  offset: number;
+  length: number;
+}
+
+interface PackState {
+  timer: ReturnType<typeof setTimeout> | null;
+  running: boolean;
+  lastActivity: number;
+  lastRoundStart: number;
+  // completed rounds; a file read during generation G is hot until round G
+  // completes, so an aborted round doesn't forget what was in use
+  generation: number;
+  lastRead: WeakMap<VolumeFileInode, number>;
+}
+
+// uncompressed bytes per shared chunk
+const PACK_CHUNK_BYTES = 128 * 1024;
+// files at least this big are deflated on their own, a piece per slice
+const PACK_SOLO_BYTES = 512 * 1024;
+// smaller files cost about as much to reference as they save
+const PACK_MIN_FILE_BYTES = 256;
+// no reads or writes for this long before a round starts
+const PACK_QUIET_MS = 15_000;
+const PACK_MIN_INTERVAL_MS = 60_000;
+// main-thread time per slice before yielding
+const PACK_SLICE_MS = 8;
+// recently inflated shared chunks (a process loading a package reads its
+// files in dependency order, not chunk order), dropped once reads stop
+const INFLATED_CHUNK_CACHE = 48;
+const INFLATED_CHUNK_IDLE_MS = 3000;
 
 /**
  * Async reader for paged-out file content (main thread, see
@@ -183,7 +233,10 @@ function countPathSegments(path: string): number {
 // snapshot). Implementations block on a SAB round-trip to the main thread.
 export interface VolumeMissHandler {
   readFile(path: string): Uint8Array | null;
-  readdir(path: string): Array<{ name: string; isDirectory: boolean; size?: number }> | null;
+  /** Entries of a directory; symlinks are reported as such (lstat) with their target. */
+  readdir(
+    path: string,
+  ): Array<{ name: string; isDirectory: boolean; size?: number; isSymlink?: boolean; target?: string }> | null;
   stat(path: string): { isFile: boolean; isDirectory: boolean; size: number } | null;
   statMany?(paths: string[]): Array<{ isFile: boolean; isDirectory: boolean; size: number } | null> | null;
 }
@@ -379,6 +432,7 @@ export class MemoryVolume {
   private _inodePaths = new Map<VolumeFileInode, Set<string>>();
   private _mutationListeners = new Set<(mutation: VolumeMutation) => void>();
   private _metaListeners = new Set<(path: string, change: MetaChange) => void>();
+  private _silentMountListeners = new Set<(paths: string[]) => void>();
   private _journalMute = 0;
   // main-thread eviction of pack-backed content (enableEviction)
   private _contentSource: VolumeContentSource | null = null;
@@ -391,6 +445,12 @@ export class MemoryVolume {
   private _packIndex = new Map<number, VolumeFileInode[]>();
   private _packIndexDirty = new Set<number>();
   private _pagedOutSyncMisses = 0;
+  // enableContentPacking
+  private _packState: PackState | null = null;
+  private _inflatedChunks: Array<{ chunk: PackedChunk; bytes: Uint8Array }> = [];
+  private _inflatedTimer: ReturnType<typeof setTimeout> | null = null;
+  // peekFileSync reading through readFileSync: a copy, not a use
+  private _peeking = false;
 
   private get _journaling(): boolean {
     return this._journalMute === 0 && this._mutationListeners.size > 0;
@@ -567,7 +627,9 @@ export class MemoryVolume {
     data: ArrayBuffer;
   }) => void) | null = null;
 
-  constructor(handler?: MemoryHandler | null, lazyResidentMaxBytes = 64 * 1024 * 1024) {
+  // lazily hydrated package content kept per worker; older bytes are
+  // dropped (LRU) and re-read from the main thread if touched again
+  constructor(handler?: MemoryHandler | null, lazyResidentMaxBytes = 32 * 1024 * 1024) {
     this._handler = handler ?? null;
     this._lazyResidentMaxBytes = Math.max(1, lazyResidentMaxBytes);
     this.tree = {
@@ -612,6 +674,16 @@ export class MemoryVolume {
   }
 
   /** Subscribe to every logical mutation (see VolumeMutation). Returns an unsubscribe fn. */
+  /**
+   * Entries mounted without notify (bulk restores) fire no watchers: `cb`
+   * gets their paths, so processes that listed those directories earlier
+   * can look again. Cheaper than onMutation, which journals every change.
+   */
+  onSilentMount(cb: (paths: string[]) => void): () => void {
+    this._silentMountListeners.add(cb);
+    return () => { this._silentMountListeners.delete(cb); };
+  }
+
   onMutation(cb: (mutation: VolumeMutation) => void): () => void {
     this._mutationListeners.add(cb);
     return () => { this._mutationListeners.delete(cb); };
@@ -660,19 +732,29 @@ export class MemoryVolume {
       };
     }
     const inode = this._fileInodeAt(norm, node);
-    const resident = !node.lazy && inode.content !== undefined;
-    return {
+    const packed = inode.packed;
+    const resident = !node.lazy && (inode.content !== undefined || !!packed);
+    const info: VolumeNodeInfo = {
       kind: 'file',
       mode: inode.mode,
       uid: inode.uid ?? node.uid,
       gid: inode.gid ?? node.gid,
       mtimeMs: inode.mtime,
       atimeMs: inode.atime,
-      size: inode.content?.byteLength ?? node.lazySize ?? inode.src?.length ?? 0,
+      size: inode.content?.byteLength ?? packed?.length ?? node.lazySize ?? inode.src?.length ?? 0,
       resident,
       inode,
       content: resident ? inode.content : undefined,
     };
+    // a packed file's bytes are only inflated if the caller wants them
+    if (resident && packed && inode.content === undefined) {
+      const volume = this;
+      Object.defineProperty(info, 'content', {
+        enumerable: true,
+        get: () => volume._peekPacked(packed),
+      });
+    }
+    return info;
   }
 
   /** Rebuild internal inode indexes after an external tree replacement. */
@@ -723,12 +805,18 @@ export class MemoryVolume {
     pagedOutBytes: number;
     residentPackBytes: number;
     pagedOutSyncMisses: number;
+    packedFiles: number;
+    packedBytes: number;
+    packedStoredBytes: number;
   } {
     let fileCount = 0;
     let totalBytes = 0;
     let dirCount = 0;
     let pagedOutFiles = 0;
     let pagedOutBytes = 0;
+    let packedFiles = 0;
+    let packedBytes = 0;
+    const chunks = new Set<PackedChunk>();
     const walk = (node: VolumeNode) => {
       if (node.kind === 'file') {
         fileCount++;
@@ -737,6 +825,11 @@ export class MemoryVolume {
         if (inode.content === undefined && inode.src) {
           pagedOutFiles++;
           pagedOutBytes += inode.src.length;
+        }
+        if (inode.packed) {
+          packedFiles++;
+          packedBytes += inode.packed.length;
+          chunks.add(inode.packed.chunk);
         }
       } else if (node.kind === 'directory') {
         dirCount++;
@@ -758,6 +851,9 @@ export class MemoryVolume {
       pagedOutBytes,
       residentPackBytes: this._srcResidentBytes,
       pagedOutSyncMisses: this._pagedOutSyncMisses,
+      packedFiles,
+      packedBytes,
+      packedStoredBytes: [...chunks].reduce((sum, chunk) => sum + chunk.bytes.byteLength, 0),
     };
   }
 
@@ -784,6 +880,11 @@ export class MemoryVolume {
     this._hydrating.clear();
     this._packIndex.clear();
     this._packIndexDirty.clear();
+    if (this._packState?.timer) clearTimeout(this._packState.timer);
+    this._packState = null;
+    if (this._inflatedTimer) clearTimeout(this._inflatedTimer);
+    this._inflatedTimer = null;
+    this._inflatedChunks = [];
     this._inos.clear();
     this._inodePaths.clear();
     this.tree = {
@@ -824,7 +925,7 @@ export class MemoryVolume {
       if (node.lazy) return;
       let data = '';
       const inode = this._fileInodeAt(currentPath, node);
-      const content = inode.content;
+      const content = inode.content ?? (inode.packed ? this._peekPacked(inode.packed) : undefined);
       if (content && content.length > 0) {
         data = bytesToBase64(content);
       }
@@ -998,6 +1099,7 @@ export class MemoryVolume {
    */
   mountEntries(entries: ReadonlyArray<MountEntry>, opts: { notify?: boolean } = {}): number {
     const notify = opts.notify === true;
+    this._notePackActivity();
     const groups = new Map<string | number, VolumeFileInode>();
     const sorted = entries
       .map((entry, index) => ({ entry, index, depth: countPathSegments(entry.path) }))
@@ -1020,6 +1122,16 @@ export class MemoryVolume {
       if (!notify) this._journalMute--;
     }
     if (!notify && this._journaling) this._journal({ op: 'mount', entries });
+    if (!notify && this._silentMountListeners.size > 0 && entries.length > 0) {
+      const paths = entries.map((entry) => entry.path);
+      for (const cb of this._silentMountListeners) {
+        try {
+          cb(paths);
+        } catch (e) {
+          console.error('Volume mount listener error:', e);
+        }
+      }
+    }
     return mounted;
   }
 
@@ -1339,9 +1451,11 @@ export class MemoryVolume {
     if (existing?.kind === 'directory') throw makeSystemError('EISDIR', 'open', norm);
 
     const now = Date.now();
+    this._notePackActivity();
     if (existing?.kind === 'file') {
       const inode = this._fileInodeAt(norm, existing);
       if (inode.src) this._forgetSource(inode);
+      inode.packed = undefined;
       inode.content = bytes;
       inode.mtime = now;
       inode.ctime = now;
@@ -1390,6 +1504,279 @@ export class MemoryVolume {
   }
 
   // ---- Main-thread eviction of pack-backed content ----
+
+  /**
+   * Keep node_modules files that nobody reads deflated in memory (see
+   * PackedChunk). Main thread only: rounds run after the volume has been
+   * quiet for a while and yield between slices; reads stay synchronous.
+   */
+  enableContentPacking(): void {
+    if (this._packState || this._missHandler || this._disposed) return;
+    this._packState = {
+      timer: null,
+      running: false,
+      lastActivity: Date.now(),
+      lastRoundStart: -Infinity,
+      generation: 0,
+      lastRead: new WeakMap(),
+    };
+    this._schedulePackCheck(PACK_QUIET_MS);
+  }
+
+  get contentPackingEnabled(): boolean {
+    return this._packState !== null;
+  }
+
+  /**
+   * A file's bytes for bulk copies (snapshots): like readFileSync, but the
+   * file isn't counted as in use, and a packed file is inflated for the
+   * caller and stays packed.
+   */
+  peekFileSync(p: string): Uint8Array {
+    const norm = this.normalize(p);
+    const node = this.locate(norm);
+    if (node?.kind === 'file' && !node.lazy) {
+      const inode = node.inode;
+      if (inode?.packed && inode.content === undefined) return this._peekPacked(inode.packed);
+      const bytes = inode ? inode.content : node.content;
+      if (bytes && !inode?.src) return bytes;
+    }
+    this._peeking = true;
+    try {
+      return this.readFileSync(p);
+    } finally {
+      this._peeking = false;
+    }
+  }
+
+  /** Run a packing round now (tests; normally rounds start on their own). */
+  packContentNow(): Promise<void> {
+    if (!this._packState || this._packState.running) return Promise.resolve();
+    return this._packRound();
+  }
+
+  private _noteRead(inode: VolumeFileInode): void {
+    const state = this._packState!;
+    state.lastRead.set(inode, state.generation);
+    this._notePackActivity();
+    if (inode.packed) this._unpack(inode);
+  }
+
+  private _notePackActivity(): void {
+    const state = this._packState;
+    if (!state) return;
+    state.lastActivity = Date.now();
+    if (!state.timer && !state.running) this._schedulePackCheck(PACK_QUIET_MS);
+  }
+
+  private _schedulePackCheck(delay: number): void {
+    const state = this._packState;
+    if (!state) return;
+    const timer = setTimeout(() => {
+      state.timer = null;
+      if (this._packState !== state || state.running) return;
+      const wait =
+        Math.max(state.lastActivity + PACK_QUIET_MS, state.lastRoundStart + PACK_MIN_INTERVAL_MS) - Date.now();
+      if (wait > 0) {
+        this._schedulePackCheck(wait);
+        return;
+      }
+      void this._packRound();
+    }, delay);
+    // never keep a Node host alive for this
+    (timer as unknown as { unref?: () => void }).unref?.();
+    state.timer = timer;
+  }
+
+  private _packable(inode: VolumeFileInode, state: PackState): boolean {
+    const content = inode.content;
+    return (
+      !!content &&
+      content.byteLength >= PACK_MIN_FILE_BYTES &&
+      !inode.packed &&
+      !inode.src &&
+      // not read since the last completed round
+      state.lastRead.get(inode) !== state.generation
+    );
+  }
+
+  private async _packRound(): Promise<void> {
+    const state = this._packState;
+    if (!state || state.running) return;
+    state.running = true;
+    const started = Date.now();
+    state.lastRoundStart = started;
+    this._inflatedChunks = [];
+    let completed = false;
+    try {
+      let sliceStart = Date.now();
+      // yield between slices; stop the round when the volume is in use again
+      const proceed = async (): Promise<boolean> => {
+        if (Date.now() - sliceStart >= PACK_SLICE_MS) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          sliceStart = Date.now();
+        }
+        return this._packState === state && state.lastActivity <= started;
+      };
+
+      // walk for candidates (no content is touched), yielding like the rest
+      const candidates: VolumeNode[] = [];
+      // files mounted from a pack are views into its one big buffer: any of
+      // them left unpacked would keep all of it alive next to the chunks
+      const views: VolumeNode[] = [];
+      const stack: Array<[VolumeNode, string, boolean]> = [[this.tree, '', false]];
+      let visited = 0;
+      while (stack.length > 0) {
+        if (++visited % 2048 === 0 && !(await proceed())) return;
+        const [node, name, inPackages] = stack.pop()!;
+        if (node.kind === 'directory') {
+          if (!node.children) continue;
+          const under = inPackages || name === 'node_modules';
+          for (const [childName, child] of node.children) stack.push([child, childName, under]);
+          continue;
+        }
+        if (!inPackages || node.kind !== 'file' || node.lazy) continue;
+        const bytes = node.inode ? node.inode.content : node.content;
+        if (!bytes) continue;
+        if (bytes.byteLength !== bytes.buffer.byteLength) views.push(node);
+        // package.json: read by every resolver. wasm: a tool's engine,
+        // loaded whole at its startup, and it only halves
+        if (name === 'package.json' || name.endsWith('.wasm') || bytes.byteLength < PACK_MIN_FILE_BYTES) continue;
+        if (node.inode && !this._packable(node.inode, state)) continue;
+        candidates.push(node);
+      }
+
+      let group: VolumeFileInode[] = [];
+      let groupBytes = 0;
+      // hard links: one inode, several candidate nodes
+      const grouped = new Set<VolumeFileInode>();
+      for (const node of candidates) {
+        // groups are built and packed without yielding: their bytes can't
+        // change underneath
+        if (group.length === 0 && !(await proceed())) return;
+        if (node.kind !== 'file' || node.lazy) continue;
+        const inode = this._fileInode(node);
+        if (grouped.has(inode) || !this._packable(inode, state)) continue;
+        const size = inode.content!.byteLength;
+        if (size >= PACK_SOLO_BYTES) {
+          // it yields: pack what's pending first
+          if (group.length > 0) {
+            this._packGroup(group, groupBytes);
+            group = [];
+            groupBytes = 0;
+            grouped.clear();
+          }
+          if (!(await this._packSolo(inode, state, proceed))) return;
+          continue;
+        }
+        group.push(inode);
+        grouped.add(inode);
+        groupBytes += size;
+        if (groupBytes >= PACK_CHUNK_BYTES) {
+          this._packGroup(group, groupBytes);
+          group = [];
+          groupBytes = 0;
+          grouped.clear();
+        }
+      }
+      if (group.length > 0) this._packGroup(group, groupBytes);
+      // what stays unpacked gets buffers of its own
+      for (const node of views) {
+        if (node.kind !== 'file') continue;
+        const holder = node.inode ?? node;
+        const bytes = holder.content;
+        if (bytes && bytes.byteLength !== bytes.buffer.byteLength) holder.content = new Uint8Array(bytes);
+      }
+      completed = true;
+    } finally {
+      if (completed) state.generation++;
+      state.running = false;
+      this._inflatedChunks = [];
+      // in use again since the round started: go again after the next quiet period
+      if (this._packState === state && state.lastActivity > started && !state.timer) {
+        this._schedulePackCheck(PACK_QUIET_MS);
+      }
+    }
+  }
+
+  private _packGroup(group: VolumeFileInode[], size: number): void {
+    const joined = new Uint8Array(size);
+    const offsets: number[] = [];
+    let offset = 0;
+    for (const inode of group) {
+      offsets.push(offset);
+      joined.set(inode.content!, offset);
+      offset += inode.content!.byteLength;
+    }
+    const chunk: PackedChunk = { bytes: pako.deflateRaw(joined, { level: 1 }) };
+    for (let i = 0; i < group.length; i++) {
+      const inode = group[i];
+      inode.packed = { chunk, offset: offsets[i], length: inode.content!.byteLength };
+      inode.content = undefined;
+    }
+  }
+
+  // a big file deflates in pieces across slices, then replaces the content
+  // only if nothing touched the file meanwhile
+  private async _packSolo(
+    inode: VolumeFileInode,
+    state: PackState,
+    proceed: () => Promise<boolean>,
+  ): Promise<boolean> {
+    const bytes = inode.content!;
+    const deflater = new pako.Deflate({ level: 1, raw: true });
+    const PIECE = 256 * 1024;
+    for (let offset = 0; offset < bytes.byteLength; offset += PIECE) {
+      if (!(await proceed())) return false;
+      const end = Math.min(bytes.byteLength, offset + PIECE);
+      deflater.push(bytes.subarray(offset, end), end === bytes.byteLength);
+    }
+    if (deflater.err || !(deflater.result instanceof Uint8Array)) return true;
+    if (inode.content !== bytes || !this._packable(inode, state)) return true;
+    inode.packed = { chunk: { bytes: deflater.result }, offset: 0, length: bytes.byteLength };
+    inode.content = undefined;
+    return true;
+  }
+
+  private _inflateChunk(chunk: PackedChunk): Uint8Array {
+    const cache = this._inflatedChunks;
+    for (let i = 0; i < cache.length; i++) {
+      if (cache[i].chunk !== chunk) continue;
+      const hit = cache[i];
+      if (i > 0) {
+        cache.splice(i, 1);
+        cache.unshift(hit);
+      }
+      return hit.bytes;
+    }
+    const bytes = pako.inflateRaw(chunk.bytes);
+    cache.unshift({ chunk, bytes });
+    if (cache.length > INFLATED_CHUNK_CACHE) cache.pop();
+    if (!this._inflatedTimer) {
+      const timer = setTimeout(() => {
+        this._inflatedTimer = null;
+        this._inflatedChunks = [];
+      }, INFLATED_CHUNK_IDLE_MS);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this._inflatedTimer = timer;
+    }
+    return bytes;
+  }
+
+  // a packed file's bytes in a buffer of their own
+  private _peekPacked(ref: PackedRef): Uint8Array {
+    // a file deflated on its own: inflating yields exactly its bytes
+    if (ref.offset === 0 && ref.length >= PACK_SOLO_BYTES) return pako.inflateRaw(ref.chunk.bytes);
+    return this._inflateChunk(ref.chunk).slice(ref.offset, ref.offset + ref.length);
+  }
+
+  // the file is in use: keep it unpacked from now on
+  private _unpack(inode: VolumeFileInode): void {
+    const ref = inode.packed;
+    if (!ref) return;
+    inode.content = this._peekPacked(ref);
+    inode.packed = undefined;
+  }
 
   /**
    * Let content mounted with a `src` (package packs) be dropped from memory
@@ -1787,13 +2174,40 @@ export class MemoryVolume {
     for (const [path, size] of moved) this._lazyResident.set(path, size);
   }
 
+  // A local mutation at `norm`: the node there is new or gone, so a listing
+  // merged for the old one no longer applies (a directory created here may
+  // still have unhydrated children on the main thread). Its ancestors stay
+  // listed: creating, removing or moving an entry locally doesn't hide any
+  // remote child from them, and re-listing a large directory like
+  // node_modules after every write made each package extraction pay a full
+  // listing round trip for the next lookup.
   private _invalidateLazyListedFor(norm: string): void {
+    this._lazyListed.delete(norm);
+  }
+
+  // The main thread changed `norm` and the local entry was dropped: the
+  // parent chain must be listed again to rediscover it.
+  private _invalidateLazyListedChain(norm: string): void {
     this._lazyListed.delete(norm);
     let parent = this.parentOf(norm);
     for (;;) {
       this._lazyListed.delete(parent);
       if (parent === '/') break;
       parent = this.parentOf(parent);
+    }
+  }
+
+  // After a move the subtree is complete locally (a lazy source was hydrated
+  // first, anything else was local to begin with): record its directories as
+  // listed so lookups under the new location don't round-trip.
+  private _markLazyTreeListed(norm: string, node: VolumeNode): void {
+    if (node.kind !== 'directory') return;
+    if (this._isUnderLazy(norm)) this._lazyListed.add(norm);
+    if (!node.children) return;
+    for (const [name, child] of node.children) {
+      if (child.kind === 'directory') {
+        this._markLazyTreeListed(norm === '/' ? '/' + name : norm + '/' + name, child);
+      }
     }
   }
 
@@ -1841,6 +2255,17 @@ export class MemoryVolume {
     this._lazyResident.set(path, size);
   }
 
+  /**
+   * The main thread mounted entries in these directories without per-file
+   * notifications: forget their listings (and every cached miss) so the
+   * next lookup lists them again and finds the new entries.
+   */
+  relistLazy(dirs: string[]): void {
+    if (!this._missHandler) return;
+    for (const dir of dirs) this._lazyListed.delete(this.normalize(dir));
+    this._lazyNegative.clear();
+  }
+
   // Main broadcast said this file changed but was too large to ship bytes.
   // Drop the local copy silently; the next read pulls fresh content through
   // the miss handler (works for any path, not just lazy dir names). No-op
@@ -1851,7 +2276,7 @@ export class MemoryVolume {
     this._untrackLazyTree(norm);
     this._lazyNegative.delete(norm);
     this._lazyInvalidated.add(norm);
-    this._invalidateLazyListedFor(norm);
+    this._invalidateLazyListedChain(norm);
     const parent = this.locate(this.parentOf(norm));
     if (parent?.kind === 'directory') {
       parent.children?.delete(this.nameOf(norm));
@@ -1876,15 +2301,81 @@ export class MemoryVolume {
   }
 
   // Try to materialize a missing path from the miss handler. Returns true if
-  // the path exists locally afterwards. Never notifies watchers (hydration is
-  // not a "change" — the file logically existed all along).
-  private _hydrateMiss(norm: string): boolean {
+  // the path exists locally afterwards (possibly as a lazy stub). Never
+  // notifies watchers (hydration is not a "change" — the file logically
+  // existed all along).
+  //
+  // Misses are answered from directory listings: walk to the deepest local
+  // ancestor. If the spawn snapshot shipped that directory whole (it is not
+  // lazy) or its listing was already merged, the child is known to be
+  // missing without asking the main thread. Otherwise one readdir round trip
+  // lists it, creating stubs that answer every later probe in that directory.
+  // Module resolution probes a handful of candidate paths per directory
+  // level, so this turns one blocking round trip per probe into roughly one
+  // per directory.
+  private _hydrateMiss(norm: string, depth = 0): boolean {
     if (!this._missHandler || this._lazyNegative.has(norm) || !this._isUnderLazy(norm)) {
       return false;
     }
+    // main said this exact path changed: fetch it directly
+    if (this._lazyInvalidated.has(norm)) return this._hydrateMissDirect(norm);
+    // a node_modules .wasm the main thread doesn't have (big binaries are
+    // skipped at install) is fetched from the CDN when asked for by path
+    // (see isRecoverableWasmPath): no listing would show it
+    if (norm.endsWith('.wasm')) return this._hydrateMissDirect(norm);
+
+    const segments = this.segments(norm);
+    let node: VolumeNode = this.tree;
+    let path = '';
+    for (let i = 0; i < segments.length; i++) {
+      if (node.kind !== 'directory') {
+        // listings record symlinks as file stubs; one may be a linked dir
+        return node.lazy ? this._hydrateMissDirect(norm) : false;
+      }
+      const name = segments[i];
+      let child = node.children?.get(name);
+      if (!child) {
+        const dirPath = path || '/';
+        if (!this._isUnderLazy(dirPath)) {
+          // a lazy root (node_modules) that didn't exist when this process
+          // started: nothing above it is listed, so ask for it by path
+          if (!this._isUnderLazy(`${path}/${name}`) || !this._hydrateMissDirect(`${path}/${name}`)) return false;
+        } else {
+          if (this._lazyListed.has(dirPath)) return false;
+          this._lazyList(dirPath, node);
+        }
+        child = node.children?.get(name);
+        if (!child) return false;
+      }
+      if (child.kind === 'symlink') {
+        // a linked package (workspaces, pnpm layouts): continue at the
+        // link's target, where the rest of the path actually lives
+        if (depth >= 16 || child.target === undefined) return false;
+        const base = path || '/';
+        const target = child.target.startsWith('/') ? child.target : `${base}/${child.target}`;
+        const rest = segments.slice(i + 1).join('/');
+        this._hydrateMiss(this.normalize(rest ? `${target}/${rest}` : target), depth + 1);
+        // the target may be local (a workspace package) or just hydrated
+        try {
+          return this.locate(norm) !== undefined;
+        } catch {
+          return false; // a link loop
+        }
+      }
+      node = child;
+      path += '/' + name;
+    }
+    return true;
+  }
+
+  // Per-path fetch: stat, then content. Used for explicitly invalidated
+  // paths and anything the listing walk can't answer.
+  private _hydrateMissDirect(norm: string): boolean {
+    const handler = this._missHandler;
+    if (!handler) return false;
     let st: { isFile: boolean; isDirectory: boolean; size: number } | null = null;
     try {
-      st = this._missHandler.stat(norm);
+      st = handler.stat(norm);
     } catch (e) {
       if (isTransientMiss(e)) return false;
       st = null;
@@ -1901,7 +2392,7 @@ export class MemoryVolume {
       }
       let bytes: Uint8Array | null = null;
       try {
-        bytes = this._missHandler.readFile(norm);
+        bytes = handler.readFile(norm);
       } catch (e) {
         if (isTransientMiss(e)) return false;
         bytes = null;
@@ -1911,6 +2402,10 @@ export class MemoryVolume {
         return false;
       }
       this.writeInternal(norm, bytes, false);
+    } catch {
+      // a local entry of another kind is in the way (ensureDir/writeInternal
+      // throw): a miss, never an exception out of existsSync/statSync
+      return false;
     } finally {
       this._journalMute--;
     }
@@ -1964,19 +2459,23 @@ export class MemoryVolume {
   // Fully hydrate a subtree before structural changes (rename/link). A moved
   // lazy stub would otherwise try to fetch content under its NEW path, which
   // the main thread doesn't know about.
-  private _hydrateTree(norm: string, node: VolumeNode): void {
-    if (!this._missHandler) return;
+  // Returns false when part of the tree couldn't be fetched (it stays lazy
+  // or unlisted).
+  private _hydrateTree(norm: string, node: VolumeNode): boolean {
+    if (!this._missHandler) return true;
     if (node.kind === 'file') {
       if (node.lazy) this._hydrateStub(norm, node);
-      return;
+      return !node.lazy;
     }
-    if (node.kind !== 'directory') return;
+    if (node.kind !== 'directory') return true;
     this._lazyList(norm, node);
-    if (!node.children) return;
+    let complete = !this._isUnderLazy(norm) || this._lazyListed.has(norm);
+    if (!node.children) return complete;
     for (const [name, child] of node.children) {
       const childPath = norm === '/' ? `/${name}` : `${norm}/${name}`;
-      this._hydrateTree(childPath, child);
+      if (!this._hydrateTree(childPath, child)) complete = false;
     }
+    return complete;
   }
 
   // Populate a lazy directory's listing once: union of proxy entries and any
@@ -1987,7 +2486,7 @@ export class MemoryVolume {
       return;
     }
     this._lazyListed.add(norm);
-    let entries: Array<{ name: string; isDirectory: boolean; size?: number }> | null = null;
+    let entries: ReturnType<VolumeMissHandler['readdir']> = null;
     try {
       entries = this._missHandler.readdir(norm);
     } catch (e) {
@@ -1997,8 +2496,19 @@ export class MemoryVolume {
     }
     if (!entries) return;
     if (!node.children) node.children = new Map();
+    let complete = true;
     for (const entry of entries) {
       if (node.children.has(entry.name)) continue;
+      if (entry.isSymlink) {
+        // a linked package (workspaces, pnpm layouts) or a .bin entry: keep
+        // it a link so it resolves (and realpaths) to its target
+        if (entry.target === undefined) {
+          complete = false; // resolved per path on lookup instead
+          continue;
+        }
+        node.children.set(entry.name, { kind: 'symlink', target: entry.target, modified: Date.now() });
+        continue;
+      }
       node.children.set(
         entry.name,
         entry.isDirectory
@@ -2006,6 +2516,7 @@ export class MemoryVolume {
           : { kind: 'file', lazy: true, lazySize: entry.size, modified: Date.now() },
       );
     }
+    if (!complete) this._lazyListed.delete(norm);
   }
 
   // ---- Public synchronous API ----
@@ -2035,7 +2546,9 @@ export class MemoryVolume {
     if (node.lazy) this._hydrateStubStat(norm, node);
 
     const inode = node.kind === 'file' ? this._fileInodeAt(norm, node) : null;
-    const fileSize = node.kind === 'file' ? (inode?.content?.length ?? node.lazySize ?? inode?.src?.length ?? 0) : 0;
+    const fileSize = node.kind === 'file'
+      ? (inode?.content?.length ?? inode?.packed?.length ?? node.lazySize ?? inode?.src?.length ?? 0)
+      : 0;
     const ts = inode?.mtime ?? node.modified;
     const uid = inode?.uid ?? node.uid ?? MOCK_IDS.UID;
     const gid = inode?.gid ?? node.gid ?? MOCK_IDS.GID;
@@ -2134,6 +2647,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'read', p);
     const inode = this._fileInodeAt(norm, node);
+    if (this._packState && !this._peeking) this._noteRead(inode);
     // hydrate when lazy OR content was evicted via a hardlink sibling's LRU path
     if (node.lazy || (inode.content == null && (this._missHandler || inode.src))) {
       this._hydrateStub(norm, node);
@@ -2158,6 +2672,7 @@ export class MemoryVolume {
     if (!node) throw makeSystemError('ENOENT', 'open', p);
     if (node.kind !== 'file') throw makeSystemError('EISDIR', 'open', p);
     const inode = this._fileInodeAt(norm, node);
+    if (this._packState) this._noteRead(inode);
     if (node.lazy || (inode.content == null && (this._missHandler || inode.src))) {
       this._hydrateStub(norm, node);
     }
@@ -2165,9 +2680,14 @@ export class MemoryVolume {
       throw makeSystemError('ENOENT', 'open', p);
     }
     return {
-      read: () => inode.content ?? new Uint8Array(0),
+      read: () => {
+        // packed again by a round while the handle stayed open
+        if (inode.packed) this._unpack(inode);
+        return inode.content ?? new Uint8Array(0);
+      },
       write: (data: Uint8Array) => {
         if (inode.src) this._forgetSource(inode);
+        inode.packed = undefined;
         inode.content = data;
         inode.mtime = Date.now();
         inode.ctime = inode.mtime;
@@ -2181,7 +2701,7 @@ export class MemoryVolume {
         }
       },
       stat: () => ({
-        size: inode.content?.length ?? 0,
+        size: inode.content?.length ?? inode.packed?.length ?? 0,
         mode: inode.mode,
         atimeMs: inode.atime,
         mtimeMs: inode.mtime,
@@ -2374,7 +2894,7 @@ export class MemoryVolume {
 
     // a moved lazy subtree would hydrate under the wrong (new) path — pull
     // everything local before the move
-    if (this._missHandler) this._hydrateTree(normFrom, node);
+    const hydrated = this._missHandler ? this._hydrateTree(normFrom, node) : true;
 
     const toParent = this.ensureDir(this.parentOf(normTo));
     const toName = this.nameOf(normTo);
@@ -2422,6 +2942,8 @@ export class MemoryVolume {
     this._remapLazyTree(normFrom, normTo);
     this._invalidateLazyListedFor(normFrom);
     this._invalidateLazyListedFor(normTo);
+    // a complete local copy: lookups under the new location needn't list
+    if (this._missHandler && hydrated) this._markLazyTreeListed(normTo, node);
 
     if (this._handler) {
       this._handler.invalidateStat(normFrom);
@@ -2749,7 +3271,9 @@ export class MemoryVolume {
     const node = this.locate(norm);
     if (node && node.kind === 'file') {
       if (node.lazy) this._hydrateStub(norm, node);
-      existing = this._fileInodeAt(norm, node).content || new Uint8Array(0);
+      const inode = this._fileInodeAt(norm, node);
+      if (inode.packed) this._unpack(inode);
+      existing = inode.content || new Uint8Array(0);
     }
     const bytes = this.toBytes(data);
     const combined = new Uint8Array(existing.length + bytes.length);
@@ -2766,6 +3290,7 @@ export class MemoryVolume {
     if (node.lazy) this._hydrateStub(norm, node);
     const inode = this._fileInodeAt(norm, node);
     if (inode.src) this._forgetSource(inode);
+    if (inode.packed) this._unpack(inode);
     const content = inode.content || new Uint8Array(0);
     if (len < content.length) {
       inode.content = content.slice(0, len);

@@ -3,8 +3,11 @@
 // without a MemoryHandler fall back to an unbounded Map that grows for the
 // lifetime of the worker.
 
-const DEFAULT_MAX_ENTRIES = 512;
-const DEFAULT_MAX_BYTES = 24 * 1024 * 1024; // UTF-16 estimate: value.length * 2
+// Every process worker holds one of these next to the module sources V8
+// already retains, and the main thread's shared transform store (lean spawns)
+// serves repeat loads across processes, so keep the local copy modest.
+const DEFAULT_MAX_ENTRIES = 384;
+const DEFAULT_MAX_BYTES = 12 * 1024 * 1024; // UTF-16 estimate: value.length * 2
 
 export class LruTransformCache {
   private _map = new Map<string, string>();

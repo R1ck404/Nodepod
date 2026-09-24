@@ -4,6 +4,7 @@
 import { MemoryVolume } from "../memory-volume";
 import type { CompletedResponse } from "../polyfills/http";
 import {
+  installBodyReadLifetime,
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
 } from "../polyfills/fetch-response";
@@ -20,8 +21,10 @@ import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
+installBodyReadLifetime();
 import { SyncChannelWorker } from "./sync-channel";
-import { createLazyFsClient } from "./lazy-fs-client";
+import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client";
+import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp";
 import type {
   MainToWorkerMessage,
   MainToWorker_Init,
@@ -130,6 +133,25 @@ function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
   (self as unknown as Worker).postMessage(msg, transfer ?? []);
 }
 
+// esbuild-engine asks the main thread for the session's compiled esbuild
+// module instead of fetching and compiling its own copy. Once received it is
+// kept: a recycled esbuild instance (see esbuild-engine.ts) starts from it
+// again, and it stays alive anyway while this process runs esbuild.
+let _esbuildModule: WebAssembly.Module | null = null;
+let _esbuildModuleWaiters: Array<(mod: WebAssembly.Module | null) => void> | null = null;
+(globalThis as any).__nodepodRequestEsbuildModule = (): Promise<WebAssembly.Module | null> =>
+  new Promise((resolve) => {
+    if (_esbuildModule) {
+      resolve(_esbuildModule);
+      return;
+    }
+    if (!_esbuildModuleWaiters) {
+      _esbuildModuleWaiters = [];
+      post({ type: "esbuild-module-request" });
+    }
+    _esbuildModuleWaiters.push(resolve);
+  });
+
 function postStdout(data: string): void {
   post({ type: "stdout", data });
 }
@@ -162,6 +184,13 @@ self.addEventListener("message", (ev: MessageEvent) => {
     case "probe":
       post({ type: "probe-ready" });
       break;
+    case "esbuild-module": {
+      if (msg.module) _esbuildModule = msg.module;
+      const waiters = _esbuildModuleWaiters ?? [];
+      _esbuildModuleWaiters = null;
+      for (const resolve of waiters) resolve(msg.module);
+      break;
+    }
     case "init":
       void handleInit(msg);
       break;
@@ -210,6 +239,9 @@ self.addEventListener("message", (ev: MessageEvent) => {
           _suppressVFSWatch = false;
         }
       }
+      break;
+    case "vfs-relist":
+      _volume?.relistLazy(msg.paths);
       break;
     case "vfs-chunk":
       handleVFSChunk(msg);
@@ -265,6 +297,9 @@ self.addEventListener("message", (ev: MessageEvent) => {
 });
 
 async function handleInit(msg: MainToWorker_Init): Promise<void> {
+  // WASI/napi-rs modules loaded by this process start with the memory they
+  // declare instead of their loader's fixed (often 1 GiB) reservation
+  installWasmMemoryClamp();
   _pid = msg.pid;
   _cwd = msg.cwd || "/";
   _env = msg.env || {};
@@ -289,6 +324,9 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
       createLazyFsClient(msg.lazyFsPort),
       msg.snapshot.lazyDirNames,
     );
+    // module loader: share package transforms with every other process
+    (globalThis as { __nodepodSharedTransforms?: unknown }).__nodepodSharedTransforms =
+      createSharedTransformClient(msg.lazyFsPort, msg.transformScopes);
   }
 
   // watch local writes and forward to main — suppressed during inbound vfs-sync to prevent echo
@@ -718,7 +756,7 @@ async function handleHttpRequest(msg: {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: string | null;
+  body: string | ArrayBuffer | null;
 }): Promise<void> {
   try {
     const httpMod = await import("../polyfills/http");
@@ -736,7 +774,8 @@ async function handleHttpRequest(msg: {
     }
 
     const { Buffer } = await import("../polyfills/buffer");
-    const bodyBuf = msg.body ? Buffer.from(msg.body) : undefined;
+    // binary request bodies arrive as a transferred ArrayBuffer (wrapped, not copied)
+    const bodyBuf = msg.body ? (Buffer.from(msg.body as string) as any) : undefined;
     const result = await server.dispatchRequest(
       msg.method,
       msg.path,

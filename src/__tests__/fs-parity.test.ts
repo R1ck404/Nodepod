@@ -319,3 +319,30 @@ describe("memory-volume ownership helpers", () => {
     expect(vol.lstatSync("/p/l").mode & 0o777).toBe(0o777);
   });
 });
+
+describe("fs callback scheduling", () => {
+  it("runs each callback in its own task, like node's I/O callbacks", async () => {
+    const { vol, fs } = makeFs();
+    vol.writeFileSync("/a.txt", "a");
+    vol.writeFileSync("/b.txt", "b");
+    const order: string[] = [];
+    await new Promise<void>((resolve) => {
+      fs.readFile("/a.txt", { encoding: "utf8" }, (_err: unknown, data?: string) => {
+        order.push("cb:" + data);
+        void Promise.resolve().then(() => order.push("microtask after a"));
+      });
+      fs.readFile("/b.txt", { encoding: "utf8" }, (_err: unknown, data?: string) => {
+        order.push("cb:" + data);
+        resolve();
+      });
+      order.push("sync");
+    });
+    expect(order).toEqual(["sync", "cb:a", "microtask after a", "cb:b"]);
+  });
+
+  it("keeps callback errors reportable", async () => {
+    const { fs } = makeFs();
+    const err = await new Promise<NodeJS.ErrnoException | null>((resolve) => fs.readFile("/missing", (e: NodeJS.ErrnoException | null) => resolve(e)));
+    expect(err?.code).toBe("ENOENT");
+  });
+});

@@ -5,7 +5,7 @@
 import type { MemoryVolume } from "./memory-volume";
 import { offload, profiledOffload, taskId, TaskPriority } from "./threading/offload";
 import type { TransformBatchResult, TransformBatchTask, TransformResult } from "./threading/offload-types";
-import { getEsbuild, getEsbuildIfReady } from "./helpers/esbuild-engine";
+import { getEsbuild, getEsbuildIfReady, acquireEsbuild, type EsbuildEngine } from "./helpers/esbuild-engine";
 import type { NodepodProfilerImpl } from "./profiling/profiler";
 import { chunkTransformFiles } from "./threading/transform-batching";
 import { containsJsx } from "./threading/jsx-detection";
@@ -96,10 +96,20 @@ export async function convertFileDirect(
   filePath: string,
 ): Promise<string> {
   if (!inBrowser) return source;
+  // leased: the engine may retire an instance, never under a running call
+  const leased = await acquireEsbuild();
+  try {
+    return await convertFileDirectWith(leased.engine, source, filePath);
+  } finally {
+    leased.release(source.length);
+  }
+}
 
-  const engine = await getEsbuild();
-  if (!engine) throw new Error("esbuild engine not available");
-
+async function convertFileDirectWith(
+  engine: EsbuildEngine,
+  source: string,
+  filePath: string,
+): Promise<string> {
   const loader = detectLoader(filePath, source);
 
   try {

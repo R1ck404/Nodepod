@@ -332,7 +332,8 @@ export class VFSBridge {
           this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
           if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
         } else {
-          const data = this._volume.readFileSync(absPath);
+          // a copy for other threads, not a use: packed files stay packed
+          const data = this._volume.peekFileSync(absPath);
           // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
           const buffer = new ArrayBuffer(data.byteLength);
           new Uint8Array(buffer).set(data);
@@ -379,7 +380,8 @@ export class VFSBridge {
             if (excludeDirNames?.has(name)) continue;
             this._walkVolume(fullPath, visitor, excludeDirNames);
           } else {
-            const content = this._volume.readFileSync(fullPath);
+            // a bulk copy: packed package files stay packed
+            const content = this._volume.peekFileSync(fullPath);
             visitor(fullPath, false, content, metadata);
           }
         } catch (e) {

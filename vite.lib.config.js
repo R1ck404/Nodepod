@@ -9,6 +9,10 @@ import { gzipSync } from "node:zlib";
 const pkg = JSON.parse(
   readFileSync(resolve(__dirname, "package.json"), "utf-8"),
 );
+// Identifies this build in persisted caches (see transformSalt in
+// script-engine.ts): one value for the library and the worker bundle.
+const BUILD_ID = `${pkg.version}+${Date.now().toString(36)}`;
+const buildDefines = { __NODEPOD_BUILD_ID__: JSON.stringify(BUILD_ID) };
 // Only peer deps and Node.js builtins are external.
 // Runtime deps (pako, acorn, etc.) are inlined so the bundle is self-contained
 // and works in any environment (bundler, browser, etc.) without extra config.
@@ -47,7 +51,8 @@ function inlineProcessWorkerPlugin() {
         platform: "browser",
         target: "esnext",
         write: false,
-        minify: true,
+        minify: process.env.NODEPOD_UNMINIFIED !== "1",
+        define: buildDefines,
         legalComments: "none",
         sourcemap: false,
         // Don't externalize anything — the worker must be fully self-contained
@@ -74,6 +79,7 @@ function inlineProcessWorkerPlugin() {
 }
 
 export default defineConfig({
+  define: buildDefines,
   plugins: [wasm(), topLevelAwait(), inlineProcessWorkerPlugin()],
   worker: {
     format: "es",
@@ -113,6 +119,14 @@ export default defineConfig({
       preserveEntrySignatures: "strict",
     },
     sourcemap: true,
-    minify: "esbuild",
+    minify: process.env.NODEPOD_UNMINIFIED === "1" ? false : "esbuild",
+    // zlib.ts require()s the pure-JS brotli decoder at first use so process
+    // workers (bundled by esbuild above) skip its import-time dictionary
+    // decode; let the library bundle resolve that require as well.
+    commonjsOptions: {
+      include: [/node_modules/, /src[\\/]polyfills[\\/]zlib\.ts$/],
+      extensions: [".js", ".cjs", ".ts"],
+      transformMixedEsModules: true,
+    },
   },
 });

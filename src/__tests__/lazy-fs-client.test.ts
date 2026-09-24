@@ -63,6 +63,7 @@ describe("lazy filesystem SAB client", () => {
           bytes: encoder.encode(JSON.stringify([
             { name: "package.json", _isFile: true, _isDir: false, size: 42 },
             { name: "dist", _isFile: false, _isDir: true, size: 0 },
+            { name: "linked", _isFile: false, _isDir: false, _isSymlink: true, _target: "../other", size: 0 },
           ])),
         };
       }
@@ -79,6 +80,7 @@ describe("lazy filesystem SAB client", () => {
     expect(client.readdir("/pkg")).toEqual([
       { name: "package.json", isDirectory: false, size: 42 },
       { name: "dist", isDirectory: true, size: 0 },
+      { name: "linked", isDirectory: false, size: 0, isSymlink: true, target: "../other" },
     ]);
     expect(client.statMany?.(["/pkg/package.json", "/missing"])).toEqual([
       { isFile: true, isDirectory: false, size: 42 },

@@ -21,7 +21,7 @@ interface EsbuildTransformOutput {
 }
 
 declare module 'esbuild-wasm' {
-  export function initialize(options?: { wasmURL?: string; worker?: boolean }): Promise<void>;
+  export function initialize(options?: { wasmURL?: string; wasmModule?: WebAssembly.Module; worker?: boolean }): Promise<void>;
   export function transform(input: string, options?: EsbuildTransformConfig): Promise<EsbuildTransformOutput>;
   export function build(options: unknown): Promise<unknown>;
   export function formatMessages(messages: unknown[], options: unknown): Promise<string[]>;

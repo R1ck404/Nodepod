@@ -3,9 +3,52 @@
 
 import { splitCookiesString } from "set-cookie-parser";
 import type { ServerResponse } from "./http";
+import { getRegistry } from "../helpers/event-loop";
 
 const HEADERS_PATCH = Symbol.for("nodepod.fetchHeadersSetCookieParity");
 const FETCH_CLASS_PATCH = Symbol.for("nodepod.fetchClassHeaderParity");
+const BODY_READ_PATCH = Symbol.for("nodepod.bodyReadLifetime");
+
+/**
+ * A process whose only pending work is reading a Blob or a Response/Request
+ * body (`new Blob([...]).text().then(...)`) must not be judged drained and
+ * exit before the read settles: those reads complete from browser tasks no
+ * tracked handle refs. Hold a handle for the duration of each read, as for
+ * fetch() bodies. Patches this realm's prototypes: process workers only.
+ */
+export function installBodyReadLifetime(): void {
+  const hold = (proto: object | undefined, names: readonly string[]): void => {
+    if (!proto || (proto as Record<symbol, unknown>)[BODY_READ_PATCH]) return;
+    Object.defineProperty(proto, BODY_READ_PATCH, { value: true });
+    for (const name of names) {
+      const desc = Object.getOwnPropertyDescriptor(proto, name);
+      if (!desc || typeof desc.value !== "function") continue;
+      const read = desc.value as (this: unknown, ...args: unknown[]) => unknown;
+      Object.defineProperty(proto, name, {
+        ...desc,
+        value: function (this: unknown, ...args: unknown[]) {
+          const result = read.apply(this, args);
+          if (!result || typeof (result as Promise<unknown>).then !== "function") return result;
+          const handle = getRegistry().register("FetchRequest");
+          return (result as Promise<unknown>).then(
+            (value) => {
+              handle.close();
+              return value;
+            },
+            (err) => {
+              handle.close();
+              throw err;
+            },
+          );
+        },
+      });
+    }
+  };
+  const bodyReads = ["text", "json", "arrayBuffer", "blob", "bytes", "formData"] as const;
+  hold(typeof Blob === "function" ? Blob.prototype : undefined, ["text", "arrayBuffer", "bytes"]);
+  hold(typeof Response === "function" ? Response.prototype : undefined, bodyReads);
+  hold(typeof Request === "function" ? Request.prototype : undefined, bodyReads);
+}
 
 type IterableHeaders = Headers & {
   entries(): IterableIterator<[string, string]>;

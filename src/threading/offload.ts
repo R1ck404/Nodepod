@@ -106,10 +106,27 @@ async function mainThreadTransformBatch(
   return { type: "transformBatch", id: task.id, results };
 }
 
+// gzip via the platform's native inflater; pako (JavaScript, several times
+// slower, with a JS CRC pass on top) only if that's missing or rejects the
+// stream (e.g. trailing bytes after the gzip member)
+async function gunzip(compressed: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === "function") {
+    try {
+      const stream = new Blob([compressed as BlobPart])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      /* fall back below */
+    }
+  }
+  const pako = await import("pako");
+  return pako.inflate(compressed);
+}
+
 async function mainThreadExtract(
   task: ExtractTask,
 ): Promise<ExtractResult> {
-  const pako = await import("pako");
   const { parseTarArchive } = await import("../packages/archive-extractor");
   const { bytesToBase64 } = await import("../helpers/byte-encoding");
 
@@ -125,7 +142,7 @@ async function mainThreadExtract(
     }
     compressed = new Uint8Array(await response.arrayBuffer());
   }
-  const tarBytes = pako.inflate(compressed);
+  const tarBytes = await gunzip(compressed);
 
   const files: ExtractResult["files"] = [];
   for (const entry of parseTarArchive(tarBytes)) {

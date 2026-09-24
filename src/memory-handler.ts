@@ -124,6 +124,13 @@ export interface MemoryHandlerOptions {
   evictPackageContent?: boolean;
   /** Package content kept in main-thread memory with evictPackageContent. Default: 128 */
   residentContentBudgetMB?: number;
+  /**
+   * Keep node_modules files that no process has read lately deflated in
+   * main-thread memory (about 4x smaller), inflating each on its next read.
+   * Rounds run in the background once the pod has been quiet for a while.
+   * Needs lean spawn snapshots (SharedArrayBuffer). Default: true.
+   */
+  packPackageContent?: boolean;
 }
 
 const DEFAULTS: Required<MemoryHandlerOptions> = {
@@ -140,6 +147,7 @@ const DEFAULTS: Required<MemoryHandlerOptions> = {
   maxProcessOutputBytes: 4_194_304,
   evictPackageContent: false,
   residentContentBudgetMB: 128,
+  packPackageContent: true,
 };
 
 /* ---- MemoryHandler ---- */

@@ -9,6 +9,7 @@ import { Buffer } from "./buffer";
 import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
 import { getWorkerTransformCache } from "../threading/worker-transform-cache";
+import { prewarmEsbuild } from "../helpers/esbuild-engine";
 import type { PackageManifest } from "../types/manifest";
 import { resetActiveInterfaceCount } from "./readline";
 import {
@@ -1219,6 +1220,38 @@ async function npmCi(
 
 // Direct node binary execution (shared by node command & npx)
 
+// The tool package owning an entry script depends on esbuild (vite, tsx,
+// tsup, vitest, ...): it will call esbuild early, so start esbuild-wasm on
+// its own thread while the package's modules load rather than after. Only
+// installed tools: a project's own script (`node server.js`) may never call
+// esbuild, and an idle instance costs tens of MB.
+function prewarmEsbuildFor(entry: string): void {
+  if (!_vol || (globalThis as { __nodepodEsbuild?: unknown }).__nodepodEsbuild) return;
+  if (!entry.includes("/node_modules/")) return;
+  let dir = entry.slice(0, entry.lastIndexOf("/")) || "/";
+  for (let depth = 0; depth < 6 && dir && dir !== "/"; depth++) {
+    const manifestPath = dir + "/package.json";
+    if (_vol.existsSync(manifestPath)) {
+      try {
+        const mf = JSON.parse(_vol.readFileSync(manifestPath, "utf8")) as PackageManifest & {
+          optionalDependencies?: Record<string, string>;
+          peerDependencies?: Record<string, string>;
+        };
+        const deps = {
+          ...mf.dependencies,
+          ...mf.optionalDependencies,
+          ...mf.peerDependencies,
+        };
+        if ("esbuild" in deps || "esbuild-wasm" in deps) prewarmEsbuild();
+      } catch {
+        /* unreadable manifest: nothing to prewarm */
+      }
+      return;
+    }
+    dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+  }
+}
+
 export async function executeNodeBinary(
   filePath: string,
   args: string[],
@@ -1267,6 +1300,8 @@ export async function executeNodeBinary(
       exitCode: 1,
     };
   }
+
+  prewarmEsbuildFor(resolved);
 
   let out = "";
   let err = "";

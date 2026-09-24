@@ -54,6 +54,7 @@ function call(
   type: string,
   payload: unknown[],
   payloadCapacity: number,
+  envelope = "__fs__",
 ): ProxyResult | null {
   let sab: SharedArrayBuffer;
   const retained = payloadCapacity <= MAX_RETAINED_PAYLOAD;
@@ -74,7 +75,7 @@ function call(
   Atomics.store(ctrl, 3, ++state.sequence);
 
   try {
-    port.postMessage({ __fs__: { sab: ctrl, type, payload } });
+    port.postMessage({ [envelope]: { sab: ctrl, type, payload } });
   } catch {
     return null;
   }
@@ -131,6 +132,68 @@ function decodeJson(bytes: Uint8Array): unknown {
   } catch {
     return null;
   }
+}
+
+/** [key, code, flags]: see threading/transform-store.ts */
+export type SharedTransformEntry = [key: string, code: string, flags: number];
+
+export interface SharedTransformClient {
+  /** Every cached transform of a package pack (one blocking round trip). */
+  loadPack(scope: string): SharedTransformEntry[];
+  /** Queue new transforms for the pack; sent after the current burst. */
+  put(scope: string, key: string, code: string, flags: number): void;
+}
+
+// Client for the main thread's shared transform store, over the same port as
+// the lazy fs proxy (its own SAB, so the two never share a request slot).
+export function createSharedTransformClient(
+  port: MessagePort,
+  knownScopes: string[] | null = [],
+): SharedTransformClient {
+  const state: CallState = { sab: null, capacity: 0, sequence: 0 };
+  // null: the main thread couldn't say yet which packs exist
+  const known = knownScopes ? new Set(knownScopes) : null;
+  let pending: Map<string, SharedTransformEntry[]> | null = null;
+  const flush = () => {
+    const batch = pending;
+    pending = null;
+    if (!batch) return;
+    for (const [scope, entries] of batch) {
+      try {
+        // serialized here: the main thread stores and forwards the text as is
+        port.postMessage({ __tcput__: { scope, text: JSON.stringify(entries) } });
+      } catch {
+        /* best effort */
+      }
+    }
+  };
+  return {
+    loadPack(scope: string): SharedTransformEntry[] {
+      if (known && !known.has(scope)) return [];
+      let res: ProxyResult | null = null;
+      try {
+        res = call(state, port, "transformPack", [scope], DEFAULT_PAYLOAD, "__tc__");
+        if (res && res.truncated) {
+          res = call(state, port, "transformPack", [scope], res.fullLength + 1024, "__tc__");
+        }
+      } catch {
+        return [];
+      }
+      if (!res || !res.ok || res.truncated) return [];
+      const entries = decodeJson(res.bytes);
+      return Array.isArray(entries) ? (entries as SharedTransformEntry[]) : [];
+    },
+    put(scope: string, key: string, code: string, flags: number): void {
+      if (!pending) {
+        pending = new Map();
+        // module loading is synchronous: one message per require() burst
+        queueMicrotask(flush);
+      }
+      let list = pending.get(scope);
+      if (!list) pending.set(scope, (list = []));
+      list.push([key, code, flags]);
+    },
+  };
 }
 
 // Builds a VolumeMissHandler backed by a dedicated MessagePort to the tab's
@@ -209,15 +272,23 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
       }
       if (!res || !res.ok) return null;
       const entries = decodeJson(res.bytes) as
-        | Array<{ name?: string; _isDir?: boolean; size?: number }>
+        | Array<{ name?: string; _isDir?: boolean; _isSymlink?: boolean; _target?: string; size?: number }>
         | null;
       if (!Array.isArray(entries)) return null;
-      const out: Array<{ name: string; isDirectory: boolean; size?: number }> = [];
+      const out: Array<{ name: string; isDirectory: boolean; size?: number; isSymlink?: boolean; target?: string }> = [];
       for (const e of entries) {
         if (!e || typeof e.name !== "string") continue;
-        const entry = { name: e.name, isDirectory: !!e._isDir, size: e.size };
+        const entry: { name: string; isDirectory: boolean; size?: number; isSymlink?: boolean; target?: string } = {
+          name: e.name,
+          isDirectory: !!e._isDir,
+          size: e.size,
+        };
+        if (e._isSymlink) {
+          entry.isSymlink = true;
+          if (typeof e._target === "string") entry.target = e._target;
+        }
         out.push(entry);
-        if (!entry.isDirectory && entry.size !== undefined) {
+        if (!entry.isDirectory && !entry.isSymlink && entry.size !== undefined) {
           const child = path === "/" ? `/${entry.name}` : `${path}/${entry.name}`;
           knownSizes.set(child, entry.size);
         }

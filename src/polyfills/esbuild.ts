@@ -2,7 +2,12 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { CDN_ESBUILD_BINARY, PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
-import { getEsbuild, getEsbuildIfReady } from "../helpers/esbuild-engine";
+import {
+  getEsbuild,
+  getEsbuildIfReady,
+  acquireEsbuild,
+  runEsbuildTransform,
+} from "../helpers/esbuild-engine";
 import { stripTopLevelAwait } from "../syntax-transforms";
 import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config";
 import { getRegistry } from "../helpers/event-loop";
@@ -115,7 +120,6 @@ export interface BundleOutput {
   };
 }
 
-let engine: typeof import("esbuild-wasm") | null = null;
 let wasmBinaryUrl: string = CDN_ESBUILD_BINARY;
 let volumeRef: MemoryVolume | null = null;
 
@@ -129,8 +133,15 @@ export function setWasmUrl(url: string): void {
 
 // delegates to the realm-wide singleton (shared with module-transformer)
 export async function initialize(opts?: { wasmURL?: string }): Promise<void> {
-  if (engine) return;
-  engine = await getEsbuild({ wasmURL: opts?.wasmURL || wasmBinaryUrl });
+  await getEsbuild({ wasmURL: opts?.wasmURL || wasmBinaryUrl });
+}
+
+// The current instance. Not cached here: the engine retires instances that
+// grew large (see esbuild-engine.ts), so each call asks for the live one.
+async function currentEngine(): Promise<typeof import("esbuild-wasm")> {
+  const ready = getEsbuildIfReady();
+  if (ready) return ready;
+  return getEsbuild({ wasmURL: wasmBinaryUrl });
 }
 
 export async function transform(
@@ -139,28 +150,72 @@ export async function transform(
 ): Promise<TransformOutput> {
   const h = getRegistry().register("EsbuildOp");
   try {
-    if (!engine) engine = getEsbuildIfReady();
-    if (!engine) await initialize();
-    if (!engine) throw new Error("esbuild: engine not ready");
-    return await engine.transform(source, cfg);
+    await currentEngine();
+    return await runEsbuildTransform(
+      (engine) => engine.transform(source, cfg),
+      typeof source === "string" ? source.length : 0,
+    );
   } finally {
     h.close();
   }
+}
+
+// Wrap plugins so the source of every module the build loads is counted
+// (esbuild-wasm has no filesystem: all of it comes back from onLoad). The
+// total sizes the instance's memory high-water mark (see esbuild-engine.ts).
+function countingLoads(plugins: unknown[], count: (bytes: number) => void): unknown[] {
+  const measure = (result: unknown): unknown => {
+    const contents = (result as { contents?: string | Uint8Array } | null | undefined)?.contents;
+    if (contents) count(contents.length);
+    return result;
+  };
+  return plugins.map((plugin) => {
+    const p = plugin as { setup?: (build: Record<string, unknown>) => unknown } | null;
+    if (!p || typeof p.setup !== "function") return plugin;
+    const setup = p.setup;
+    // inherits everything else (a class instance's name getter included)
+    const wrapped = Object.create(p) as Record<string, unknown>;
+    Object.defineProperty(wrapped, "setup", {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value(build: Record<string, unknown>) {
+        const onLoad = build.onLoad as (options: unknown, callback: (args: unknown) => unknown) => void;
+        return setup.call(p, {
+          ...build,
+          onLoad(options: unknown, callback: (args: unknown) => unknown) {
+            onLoad(options, (args) => {
+              const result = callback(args);
+              return result && typeof (result as PromiseLike<unknown>).then === "function"
+                ? Promise.resolve(result).then(measure)
+                : measure(result);
+            });
+          },
+        });
+      },
+    });
+    return wrapped;
+  });
 }
 
 export async function build(cfg: BundleConfig): Promise<BundleOutput> {
   // register before initialize() - the cdn import inside isn't tracked
   // so the loop can drain mid-await if we do it the other way round
   const h = getRegistry().register("EsbuildOp");
+  let inputBytes = cfg.stdin?.contents?.length ?? 0;
+  let leased: Awaited<ReturnType<typeof acquireEsbuild>> | null = null;
   try {
-    if (!engine) engine = getEsbuildIfReady();
-    if (!engine) await initialize();
-    if (!engine) throw new Error("esbuild: engine not ready");
+    await currentEngine();
+    leased = await acquireEsbuild();
+    const engine = leased.engine;
 
     const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions);
-    const allPlugins = [...(cfg.plugins || [])];
+    const userPlugins = [...(cfg.plugins || [])];
     // volume plugin goes last so other plugins' onLoad handlers run first
-    if (volumePlugin) allPlugins.push(volumePlugin);
+    if (volumePlugin) userPlugins.push(volumePlugin);
+    const allPlugins = countingLoads(userPlugins, (bytes) => {
+      inputBytes += bytes;
+    });
 
     let entries = cfg.entryPoints;
     if (entries && volumeRef) {
@@ -196,21 +251,32 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
 
     return raw;
   } finally {
+    leased?.release(inputBytes);
     h.close();
   }
 }
 
-export function formatMessages(
+export async function formatMessages(
   messages: unknown[],
   opts?: { kind?: "error" | "warning"; color?: boolean },
 ): Promise<string[]> {
-  if (!engine) engine = getEsbuildIfReady();
-  if (!engine) throw new Error("esbuild: engine not ready");
-  return (
-    engine as unknown as {
-      formatMessages: (m: unknown[], o?: unknown) => Promise<string[]>;
+  // leased like any call: right after a large build the instance that ran
+  // it is being replaced, which is exactly when a tool formats its errors
+  const h = getRegistry().register("EsbuildOp");
+  try {
+    const leased = await acquireEsbuild({ wasmURL: wasmBinaryUrl });
+    try {
+      return await (
+        leased.engine as unknown as {
+          formatMessages: (m: unknown[], o?: unknown) => Promise<string[]>;
+        }
+      ).formatMessages(messages, opts);
+    } finally {
+      leased.release();
     }
-  ).formatMessages(messages, opts);
+  } finally {
+    h.close();
+  }
 }
 
 // single source of truth: the pinned CDN version we actually load
@@ -226,7 +292,7 @@ export async function context(cfg: BundleConfig): Promise<{
 }> {
   const initHandle = getRegistry().register("EsbuildOp");
   try {
-    if (!engine) await initialize();
+    await currentEngine();
   } finally {
     initHandle.close();
   }

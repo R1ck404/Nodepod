@@ -50,6 +50,37 @@ export interface ESMToCJSOptions {
   exportTarget?: string;
 }
 
+/**
+ * Apply `[start, end, replacement]` patches in one linear pass.
+ *
+ * Output matches the previous back-to-front `slice + concat` loop (sorted
+ * by descending start, then descending end, stable): at equal positions the
+ * later-pushed patch lands first. That loop re-flattened the whole string
+ * per patch, which made large files quadratic.
+ */
+export function applyPatches(
+  source: string,
+  patches: Array<[number, number, string]>,
+): string {
+  if (patches.length === 0) return source;
+  const order = patches.map((_, i) => i);
+  order.sort((a, b) => {
+    const pa = patches[a];
+    const pb = patches[b];
+    return pa[0] - pb[0] || pa[1] - pb[1] || b - a;
+  });
+  const parts: string[] = [];
+  let pos = 0;
+  for (const i of order) {
+    const [s, e, r] = patches[i];
+    if (s < pos) continue;
+    parts.push(source.slice(pos, s), r);
+    pos = e;
+  }
+  parts.push(source.slice(pos));
+  return parts.join("");
+}
+
 export function esmToCjs(
   code: string,
   options: ESMToCJSOptions = {},
@@ -290,11 +321,7 @@ function esmToCjsViaAst(code: string, options: ESMToCJSOptions): string {
   const patches: Array<[number, number, string]> = [];
   collectEsmCjsPatches(ast as any, code, patches, options);
 
-  let output = code;
-  patches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-  for (const [s, e, r] of patches)
-    output = output.slice(0, s) + r + output.slice(e);
-  return output;
+  return applyPatches(code, patches);
 }
 
 // extract all bound names from a destructuring pattern or identifier
@@ -490,14 +517,7 @@ export function stripTopLevelAwait(
 
     walk(ast);
 
-    if (patches.length === 0) return code;
-
-    let output = code;
-    patches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-    for (const [start, end, replacement] of patches) {
-      output = output.slice(0, start) + replacement + output.slice(end);
-    }
-    return output;
+    return applyPatches(code, patches);
   } catch {
     if (full) {
       let out = code.replace(RE_AWAIT_LOOKAHEAD_G, "");

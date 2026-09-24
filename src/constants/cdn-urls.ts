@@ -8,6 +8,10 @@ export const PINNED_WA_SQLITE = '1.0.0';
 
 export const CDN_ESBUILD_ESM = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}`;
 export const CDN_ESBUILD_BINARY = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/esbuild.wasm`;
+// The module CDN_ESBUILD_ESM re-exports. Importing it under a distinct query
+// yields a separate module instance, i.e. a separate esbuild service (see
+// esbuild-engine.ts recycling).
+export const CDN_ESBUILD_BUNDLE = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/es2022/esbuild-wasm.mjs`;
 export const CDN_ROLLUP_BROWSER = `https://esm.sh/@rollup/browser@${PINNED_ROLLUP_BROWSER}`;
 // jsdelivr serves raw files without rebundling. esm.sh rebundles everything
 // which breaks brotli-wasm's circular WASM/JS-glue dependencies, causing

@@ -61,7 +61,8 @@ export function createFilteredBinarySnapshot(
       } else if (filter(fullPath)) {
         let content: Uint8Array;
         try {
-          content = vol.readFileSync(fullPath);
+          // a bulk copy: packed package files stay packed
+          content = vol.peekFileSync(fullPath);
         } catch {
           continue;
         }

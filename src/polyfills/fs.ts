@@ -17,12 +17,51 @@ import {
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
-import { getRegistry } from "../helpers/event-loop";
+import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop";
+import { setImmediate as scheduleImmediate } from "./timers";
 
 export type { FileStat, FileWatchHandle, WatchCallback, WatchEventKind };
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
+
+// Callback-style fs completions, like node's I/O callbacks: each runs in a
+// task of its own (so promise continuations and nextTicks run between two
+// of them) and keeps the event loop alive until it has. One MessageChannel
+// message per callback: setTimeout(0) cost >= 1ms per call and browsers
+// clamp nested timers to 4ms, which made callback-driven directory walks
+// crawl.
+const _fsCallbacks: Array<{ handle: Handle; fn: () => void }> = [];
+let _fsCallbackPort: MessagePort | null = null;
+
+function runNextFsCallback(): void {
+  const next = _fsCallbacks.shift();
+  if (!next) return;
+  next.handle.close();
+  try {
+    next.fn();
+  } catch (e) {
+    if (isExitSentinel(e)) return;
+    // an uncaught error in a callback, as in node
+    queueMicrotask(() => {
+      throw e;
+    });
+  }
+}
+
+function deferCallback(fn: () => void): void {
+  if (typeof MessageChannel === "undefined") {
+    scheduleImmediate(fn);
+    return;
+  }
+  if (!_fsCallbackPort) {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = runNextFsCallback;
+    _fsCallbackPort = channel.port2;
+  }
+  _fsCallbacks.push({ handle: getRegistry().register("FSReqCallback"), fn });
+  _fsCallbackPort.postMessage(0);
+}
 
 export type PathArg = string | URL;
 
@@ -1790,7 +1829,11 @@ export function buildFileSystemBridge(
     },
 
     statSync(target: unknown, opts?: StatOptions): FileStat | undefined {
-      return runStat(() => volume.statSync(abs(target)), opts);
+      const p = abs(target);
+      // probing callers (vite's tryStatSync, resolvers) mostly miss: answer
+      // those without constructing and unwinding an ENOENT error
+      if (opts?.throwIfNoEntry === false && !volume.existsSync(p)) return undefined;
+      return runStat(() => volume.statSync(p), opts);
     },
 
     lstatSync(target: unknown, opts?: StatOptions): FileStat | undefined {
@@ -2289,9 +2332,9 @@ export function buildFileSystemBridge(
       try {
         const raw = volume.readFileSync(p);
         const data = decodeBytes(raw, enc);
-        if (actualCb) setTimeout(() => actualCb(null, data), 0);
+        if (actualCb) deferCallback(() => actualCb(null, data));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2311,9 +2354,9 @@ export function buildFileSystemBridge(
           : undefined;
       try {
         bridge.writeFileSync(target as PathArg, data as any, opts);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2330,9 +2373,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = runStat(() => volume.statSync(abs(target)), opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2349,9 +2392,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = runStat(() => volume.lstatSync(abs(target)), opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2379,9 +2422,9 @@ export function buildFileSystemBridge(
         const files = opts?.withFileTypes
           ? toDirents(p, names)
           : encodeReaddirNames(names, opts?.encoding);
-        if (actualCb) setTimeout(() => actualCb(null, files), 0);
+        if (actualCb) deferCallback(() => actualCb(null, files));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2396,18 +2439,18 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         const created = volume.mkdirSync(abs(target), opts);
-        if (actualCb) setTimeout(() => actualCb(null, created), 0);
+        if (actualCb) deferCallback(() => actualCb(null, created));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
     unlink(target: unknown, cb?: (err: Error | null) => void): void {
       try {
         volume.unlinkSync(abs(target));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2417,18 +2460,18 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         volume.rmdirSync(abs(target));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
     rename(oldPath: unknown, newPath: unknown, cb?: (err: Error | null) => void): void {
       try {
         volume.renameSync(abs(oldPath), abs(newPath));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2462,9 +2505,9 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         volume.appendFileSync(abs(target), data);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2478,9 +2521,9 @@ export function buildFileSystemBridge(
       const type = typeof typeOrCb === "string" ? typeOrCb : undefined;
       try {
         volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
-        if (actualCb) setTimeout(() => actualCb(null), 0);
+        if (actualCb) deferCallback(() => actualCb(null));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2494,9 +2537,9 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         const result = volume.readlinkSync(abs(target));
-        if (cb) setTimeout(() => cb(null, result), 0);
+        if (cb) deferCallback(() => cb(null, result));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2507,9 +2550,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.linkSync(abs(existingPath), abs(newPath));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2520,9 +2563,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.chmodSync(abs(target), mode as number);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2534,9 +2577,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.chownSync(abs(target), uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2548,9 +2591,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lchownSync(abs(target), uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2562,9 +2605,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2576,9 +2619,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
     open(
@@ -2603,18 +2646,18 @@ export function buildFileSystemBridge(
       }
       try {
         const fd = bridge.openSync(abs(target), flags, mode);
-        if (callback) setTimeout(() => callback(null, fd), 0);
+        if (callback) deferCallback(() => callback(null, fd));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
     close(fd: number, cb?: (err: Error | null) => void): void {
       try {
         bridge.closeSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2677,9 +2720,9 @@ export function buildFileSystemBridge(
 
       try {
         const n = bridge.readSync(fd, buf, off, len, pos);
-        if (callback) setTimeout(() => callback(null, n, buf), 0);
+        if (callback) deferCallback(() => callback(null, n, buf));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buf), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buf));
       }
     },
 
@@ -2717,9 +2760,9 @@ export function buildFileSystemBridge(
         callback = offsetOrCb;
         try {
           const n = bridge.writeSync(fd, buf);
-          setTimeout(() => callback(null, n, buf), 0);
+          deferCallback(() => callback(null, n, buf));
         } catch (e) {
-          setTimeout(() => callback(e as Error, 0, buf), 0);
+          deferCallback(() => callback(e as Error, 0, buf));
         }
         return;
       }
@@ -2733,9 +2776,9 @@ export function buildFileSystemBridge(
         const len = typeof lengthOrEnc === "number" ? lengthOrEnc : undefined;
         const pos = typeof positionOrCb === "number" ? positionOrCb : undefined;
         const n = bridge.writeSync(fd, buf, off, len, pos);
-        if (callback) setTimeout(() => callback(null, n, buf), 0);
+        if (callback) deferCallback(() => callback(null, n, buf));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buf), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buf));
       }
     },
 
@@ -2757,9 +2800,9 @@ export function buildFileSystemBridge(
           const n = bridge.writeSync(fd, u8 as unknown as Buffer, 0, u8.length, pos !== null ? pos + totalWritten : undefined);
           totalWritten += n;
         }
-        if (callback) setTimeout(() => callback(null, totalWritten, buffers), 0);
+        if (callback) deferCallback(() => callback(null, totalWritten, buffers));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buffers), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buffers));
       }
     },
 
@@ -2772,9 +2815,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = bridge.fstatSync(fd, opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2786,14 +2829,14 @@ export function buildFileSystemBridge(
     ): void {
       const entry = openFiles.get(fd);
       if (!entry) {
-        if (cb) setTimeout(() => cb(makeBadfError("futimes")), 0);
+        if (cb) deferCallback(() => cb(makeBadfError("futimes")));
         return;
       }
       try {
         volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2805,9 +2848,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         bridge.fchownSync(fd, uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2818,9 +2861,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         bridge.fchmodSync(fd, mode);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
     // function constructor, not class -- graceful-fs calls fs$ReadStream.apply(this, args)
@@ -3224,7 +3267,7 @@ export function buildFileSystemBridge(
     },
     exists(target: unknown, cb: (exists: boolean) => void): void {
       const result = volume.existsSync(abs(target));
-      setTimeout(() => cb(result), 0);
+      deferCallback(() => cb(result));
     },
     lchmodSync(target: unknown, mode: number): void {
       volume.lchmodSync(abs(target), mode);
@@ -3237,26 +3280,26 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lchmodSync(abs(target), mode);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
     fdatasync(fd: number, cb: (err: Error | null) => void): void {
       try {
         bridge.fdatasyncSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
     fsync(fd: number, cb: (err: Error | null) => void): void {
       try {
         bridge.fsyncSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -3269,9 +3312,9 @@ export function buildFileSystemBridge(
       const len = typeof lenOrCb === "number" ? lenOrCb : 0;
       try {
         bridge.ftruncateSync(fd, len);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
@@ -3284,9 +3327,9 @@ export function buildFileSystemBridge(
       const len = typeof lenOrCb === "number" ? lenOrCb : 0;
       try {
         volume.truncateSync(abs(target), len);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
@@ -3300,9 +3343,9 @@ export function buildFileSystemBridge(
         : cb;
       try {
         const result = bridge.mkdtempSync(prefix);
-        if (callback) setTimeout(() => callback(null, result), 0);
+        if (callback) deferCallback(() => callback(null, result));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     readvSync(fd: number, buffers: ArrayBufferView[], pos?: number | null): number {
@@ -3335,9 +3378,9 @@ export function buildFileSystemBridge(
       const pos = typeof positionOrCb === "number" ? positionOrCb : null;
       try {
         const n = bridge.readvSync(fd, buffers, pos);
-        if (callback) setTimeout(() => callback(null, n, buffers), 0);
+        if (callback) deferCallback(() => callback(null, n, buffers));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buffers), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buffers));
       }
     },
     cpSync(
@@ -3429,9 +3472,9 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         bridge.cpSync(src, dest, opts);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     statfsSync(_target: unknown, _opts?: unknown): StatFs {
@@ -3447,7 +3490,7 @@ export function buildFileSystemBridge(
         ? optsOrCb as (err: Error | null, stats?: StatFs) => void
         : cb;
       const result = new StatFs();
-      if (callback) setTimeout(() => callback(null, result), 0);
+      if (callback) deferCallback(() => callback(null, result));
     },
     globSync(
       pattern: string | string[],
@@ -3467,9 +3510,9 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         const result = bridge.globSync(pattern, opts);
-        if (callback) setTimeout(() => callback(null, result), 0);
+        if (callback) deferCallback(() => callback(null, result));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     openAsBlob(target: unknown, _opts?: { type?: string }): Promise<Blob> {
