@@ -15,7 +15,7 @@ import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
 import { getSharedTransformStore, type TransformEntry } from "./transform-store";
-import { isRecoverableWasmPath, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
+import { isRecoverableWasmPath, isWasmResolverProbe, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import type {
   SpawnConfig,
   ProcessInfo,
@@ -771,7 +771,8 @@ export class ProcessManager extends EventEmitter {
     }
     const canRecover = (request.type === "statSync" || request.type === "readFileSync")
       && isRecoverableWasmPath(path)
-      && !this._volume.existsSync(path);
+      && !this._volume.existsSync(path)
+      && !isWasmResolverProbe(this._volume, path);
     if (!canRecover) {
       handleFsProxy(request, bridge);
       return;

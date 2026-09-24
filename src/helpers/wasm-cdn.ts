@@ -68,6 +68,43 @@ export function isRecoverableWasmPath(vfsPath: unknown): vfsPath is string {
     && vfsPath.includes("/node_modules/");
 }
 
+const RESOLVER_PROBE_RE = /\.(?:[cm]?js|jsx|tsx?|json|node)\.wasm$/;
+
+/**
+ * True when a missing `.wasm` path can only be a module resolver trying
+ * extensions: webpack resolves with `.wasm` among its extensions, so
+ * `global-error.js` is also stat'ed as `global-error.js.wasm` and the
+ * `react` directory as `react.wasm`. Only positive evidence counts: a
+ * sibling module or a missing directory can't rule out a real binary
+ * (emscripten ships foo.js next to foo.wasm, and a worker's install may not
+ * have reached this volume yet).
+ */
+export function isWasmResolverProbe(volume: MemoryVolume, vfsPath: string): boolean {
+  if (RESOLVER_PROBE_RE.test(vfsPath)) return true;
+  try {
+    return volume.statSync(vfsPath.slice(0, -".wasm".length)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// package@version the CDN refused as a whole (jsdelivr answers 403 when a
+// package is too large to serve, e.g. next): every other path in it would be
+// refused too, so don't ask again.
+const _refusedPackages = new Set<string>();
+
+function cdnPackageKey(cdnUrl: string): string {
+  const rest = cdnUrl.slice(cdnUrl.indexOf("/npm/") + "/npm/".length);
+  const at = rest.indexOf("@", rest.startsWith("@") ? 1 : 0);
+  const slash = rest.indexOf("/", at);
+  return slash < 0 ? rest : rest.slice(0, slash);
+}
+
+/** Forget packages the CDN refused (tests). */
+export function resetCdnRefusals(): void {
+  _refusedPackages.clear();
+}
+
 /**
  * Fetch a missing node_modules .wasm from the CDN, write it to the VFS, and
  * warm the compile caches. Deduplicated per path; never throws.
@@ -80,10 +117,15 @@ export function prefetchWasmFromCdn(volume: MemoryVolume, vfsPath: string): Prom
   const promise = (async (): Promise<boolean> => {
     const cdnUrl = buildCdnWasmUrl(volume, assetPath);
     if (!cdnUrl || typeof fetch === "undefined") return false;
+    const packageKey = cdnPackageKey(cdnUrl);
+    if (_refusedPackages.has(packageKey)) return false;
 
     try {
       const resp = await fetch(cdnUrl);
-      if (!resp.ok) return false;
+      if (!resp.ok) {
+        if (resp.status === 403) _refusedPackages.add(packageKey);
+        return false;
+      }
 
       // Compile in parallel with the byte read when the browser supports
       // streaming compilation; register the module once we have the bytes.
