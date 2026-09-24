@@ -8,6 +8,32 @@ import {
 } from "../polyfills/stream";
 
 describe("Readable", () => {
+  it("closes after end when EOF is pushed to a flowing stream", async () => {
+    // how a child process's stdout ends: data first, then push(null)
+    const r = new Readable();
+    const events: string[] = [];
+    r.on("data", () => events.push("data"));
+    r.on("end", () => events.push("end"));
+    r.on("close", () => events.push("close"));
+    r.push("chunk");
+    await new Promise((res) => setTimeout(res, 0));
+    r.push(null);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(events).toEqual(["data", "end", "close"]);
+  });
+
+  it("keeps a duplex open while its writable side is still open", async () => {
+    const p = new PassThrough();
+    const events: string[] = [];
+    p.on("data", () => {});
+    p.on("end", () => events.push("end"));
+    p.on("close", () => events.push("close"));
+    p.push(null);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(events).toEqual(["end"]);
+    expect(p.destroyed).toBe(false);
+  });
+
   it("push() queues data, data event fires in flowing mode", () => {
     const r = new Readable({ read() {} });
     const chunks: string[] = [];

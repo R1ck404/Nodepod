@@ -233,6 +233,11 @@ Readable.prototype.push = function push(chunk: any): boolean {
         queueMicrotask(() => {
           this._endEmitted = true;
           this.emit("end");
+          // auto-destroy ('close') like the other end paths; a duplex waits
+          // for its writable side, as in node
+          if (this._autoDestroy && !(this.writable && !this.writableFinished)) {
+            this.destroy();
+          }
         });
       }
     }
