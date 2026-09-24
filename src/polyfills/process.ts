@@ -12,6 +12,7 @@ import {
 } from "../constants/config";
 import {
   getRegistry,
+  isExitSentinel,
   ProcessExitSentinel,
   type Handle,
 } from "./../helpers/event-loop";
@@ -680,33 +681,41 @@ export function buildProcessEnv(config?: {
     // queue (including nextTicks queued during the drain), so chained
     // nextTick callbacks run before already-queued promise callbacks.
     // A raw queueMicrotask would interleave them FIFO instead.
-    // A throwing callback must not drop the rest of the batch (Node runs
-    // them, then surfaces the error): collect and rethrow async.
+    // A throwing callback goes to 'uncaughtException' listeners and the
+    // drain continues, like node. Without a listener the error is rethrown
+    // as uncaught (node dies there); anything left runs on a later pump in
+    // case the process survives it. process.exit() ends the drain.
     nextTick: (() => {
       const pending: Array<() => void> = [];
       let pumpScheduled = false;
       const drain = () => {
         pumpScheduled = false;
-        let batch = pending.splice(0);
-        let firstError: unknown = null;
-        let sawError = false;
-        while (batch.length > 0) {
-          for (const cb of batch) {
+        let i = 0;
+        try {
+          while (i < pending.length) {
+            const cb = pending[i++];
             try {
               cb();
             } catch (e) {
-              if (!sawError) {
-                sawError = true;
-                firstError = e;
+              // process.exit() already ran; the sentinel only unwinds.
+              // Drop the rest of the queue, as timers do.
+              if (isExitSentinel(e)) {
+                i = pending.length;
+                return;
               }
+              if (bus.listenerCount("uncaughtException") > 0) {
+                bus.emit("uncaughtException", e, "uncaughtException");
+                continue;
+              }
+              throw e;
             }
           }
-          batch = pending.splice(0);
-        }
-        if (sawError) {
-          queueMicrotask(() => {
-            throw firstError;
-          });
+        } finally {
+          pending.splice(0, i);
+          if (pending.length > 0 && !pumpScheduled) {
+            pumpScheduled = true;
+            queueMicrotask(drain);
+          }
         }
       };
       return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {

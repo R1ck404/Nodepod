@@ -391,6 +391,26 @@ export function hasTopLevelAwait(code: string): boolean {
   }
 }
 
+// true when `node` has a yield that belongs to the enclosing function
+function containsYield(node: any): boolean {
+  if (!node || typeof node !== "object") return false;
+  if (Array.isArray(node)) return node.some(containsYield);
+  if (node.type === "YieldExpression") return true;
+  if (
+    node.type === "FunctionDeclaration" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression"
+  ) {
+    return false;
+  }
+  for (const key in node) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    const val = node[key];
+    if (val && typeof val === "object" && containsYield(val)) return true;
+  }
+  return false;
+}
+
 export function stripTopLevelAwait(
   code: string,
   mode: "topLevelOnly" | "full" = "topLevelOnly",
@@ -463,8 +483,15 @@ export function stripTopLevelAwait(
           // Thunk form: the whole argument (including any `.then` chains)
           // evaluates inside syncAwaitFn's scope, so chained promises
           // unwrap synchronously like the rest of the sync fast-paths.
-          patches.push([node.start, awaitEnd, "__syncAwaitFn(() => ("]);
-          patches.push([node.end, node.end, "))"]);
+          // An arrow can't contain `yield` (await inside an async
+          // generator), so those keep the plain call form.
+          if (containsYield(node.argument)) {
+            patches.push([node.start, awaitEnd, "__syncAwait("]);
+            patches.push([node.end, node.end, ")"]);
+          } else {
+            patches.push([node.start, awaitEnd, "__syncAwaitFn(() => ("]);
+            patches.push([node.end, node.end, "))"]);
+          }
         }
       }
 

@@ -155,4 +155,13 @@ describe("stripTopLevelAwait", () => {
     const code = "const x = 1 + 2;";
     expect(stripTopLevelAwait(code)).toBe(code);
   });
+
+  it("keeps await (yield x) in an async generator parseable in full mode", () => {
+    const out = stripTopLevelAwait(
+      "async function* g() { const x = await (yield 1); return x; }",
+      "full",
+    );
+    expect(out).not.toContain("await");
+    expect(() => new Function(out)).not.toThrow();
+  });
 });
