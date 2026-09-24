@@ -12,6 +12,7 @@ import {
 } from "../constants/config";
 import {
   getRegistry,
+  isExitSentinel,
   ProcessExitSentinel,
   type Handle,
 } from "./../helpers/event-loop";
@@ -676,9 +677,55 @@ export function buildProcessEnv(config?: {
       throw new ProcessExitSentinel(resolved);
     },
 
-    nextTick(fn, ...args) {
-      queueMicrotask(() => fn(...args));
-    },
+    // Node drains the entire nextTick queue before the promise microtask
+    // queue (including nextTicks queued during the drain), so chained
+    // nextTick callbacks run before already-queued promise callbacks.
+    // A raw queueMicrotask would interleave them FIFO instead.
+    // A throwing callback goes to 'uncaughtException' listeners and the
+    // drain continues, like node. Without a listener the error is rethrown
+    // as uncaught (node dies there); anything left runs on a later pump in
+    // case the process survives it. process.exit() ends the drain.
+    nextTick: (() => {
+      const pending: Array<() => void> = [];
+      let pumpScheduled = false;
+      const drain = () => {
+        pumpScheduled = false;
+        let i = 0;
+        try {
+          while (i < pending.length) {
+            const cb = pending[i++];
+            try {
+              cb();
+            } catch (e) {
+              // process.exit() already ran; the sentinel only unwinds.
+              // Drop the rest of the queue, as timers do.
+              if (isExitSentinel(e)) {
+                i = pending.length;
+                return;
+              }
+              if (bus.listenerCount("uncaughtException") > 0) {
+                bus.emit("uncaughtException", e, "uncaughtException");
+                continue;
+              }
+              throw e;
+            }
+          }
+        } finally {
+          pending.splice(0, i);
+          if (pending.length > 0 && !pumpScheduled) {
+            pumpScheduled = true;
+            queueMicrotask(drain);
+          }
+        }
+      };
+      return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {
+        pending.push(() => fn(...args));
+        if (!pumpScheduled) {
+          pumpScheduled = true;
+          queueMicrotask(drain);
+        }
+      };
+    })(),
 
     stdout: stdoutStream,
     stderr: stderrStream,

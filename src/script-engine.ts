@@ -550,6 +550,7 @@ var import_meta = $importMeta;
 var __asyncLoad = $asyncLoad;
 var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
+var __syncAwaitFn = $syncAwaitFn;
 var Promise = ${promiseVar};
 var global = globalThis;
 `;
@@ -584,7 +585,7 @@ async function __wasmInstantiate(moduleOrBytes, imports) {
 `;
   }
 
-  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $SyncPromise) {
+  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $syncAwaitFn, $SyncPromise) {
 ${vars}return (${fnKeyword}() {
 ${code}
 }).call(this);
@@ -982,17 +983,55 @@ class SyncThenable<T> {
 
 // Try to synchronously unwrap a thenable. Returns the value if .then() fires sync,
 // otherwise returns the original value (possibly a native Promise).
+// The synchronous fast-path in SyncPromise.then below is gated on this scope:
+// user-code .then calls outside of it keep native microtask timing (Node parity),
+// while require() machinery unwrapping inside it keeps working synchronously.
+let syncScopeDepth = 0;
+function inSyncScope<T>(fn: () => T): T {
+  syncScopeDepth++;
+  try {
+    return fn();
+  } finally {
+    syncScopeDepth--;
+  }
+}
 function syncAwait(val: unknown): unknown {
   if (val && typeof (val as any).then === "function") {
     let resolved: unknown;
     let gotSync = false;
-    (val as any).then((v: unknown) => {
-      resolved = v;
-      gotSync = true;
-    });
+    let rejected = false;
+    let error: unknown;
+    // only a SyncPromise can report a rejection synchronously; a rejection
+    // handler on a pending native promise would just swallow its error
+    const onRejected =
+      (val as any)._force === (SyncPromiseClass.prototype as any)._force
+        ? (e: unknown) => {
+            error = e;
+            rejected = true;
+          }
+        : undefined;
+    inSyncScope(() =>
+      (val as any).then((v: unknown) => {
+        resolved = v;
+        gotSync = true;
+      }, onRejected),
+    );
     if (gotSync) return resolved;
+    // `await` of a rejected promise throws at the await site
+    if (rejected) throw error;
   }
   return val;
+}
+
+/**
+ * Thunk form emitted by the TLA transform: `await EXPR` compiles to
+ * `__syncAwaitFn(() => (EXPR))`. The whole argument — including any
+ * `.then` chains — evaluates inside the sync scope, so chained promises
+ * unwrap synchronously exactly like values passed to `syncAwait`.
+ * Genuinely async values behave as before (returned pending).
+ */
+function syncAwaitFn(thunk: () => unknown): unknown {
+  return inSyncScope(() => syncAwait(thunk()));
 }
 
 // Promise subclass that resolves .then() synchronously when the executor resolves sync.
@@ -1007,12 +1046,26 @@ function createSyncPromise(): typeof Promise {
   // async plugin hooks (rolldown/vite and other napi clients) are awaited
   // instead of being decoded as ordinary objects.
   const NativePromise = asyncCtxPolyfill.getNativePromiseConstructor();
+  const noop = (): void => {};
+  const markHandled = (p: Promise<unknown>): void => {
+    NativePromise.prototype.then.call(p, undefined, noop);
+  };
+  const isSyncPromise = (v: unknown): v is SyncPromise<any> =>
+    !!v &&
+    typeof v === "object" &&
+    (v as any)._force === SyncPromise.prototype._force;
 
   class SyncPromise<T> extends NativePromise<T> {
     private _syncValue: T | undefined;
     private _syncResolved = false;
     private _syncRejected = false;
     private _syncError: any;
+
+    // Set on promises whose value can be computed ahead of native timing:
+    // .then() results created outside a sync scope, and promises adopting
+    // one of those. syncAwait forces them so a chain built before a
+    // top-level `await` still unwraps synchronously.
+    private _lazy?: () => void;
 
     constructor(
       executor: (
@@ -1024,10 +1077,18 @@ function createSyncPromise(): typeof Promise {
       let syncResolved = false;
       let syncRejected = false;
       let syncErr: any;
+      let adopted: SyncPromise<T> | undefined;
 
       super((resolve, reject) => {
         executor(
           (value) => {
+            // Adopting a SyncPromise outside a sync scope: keep native
+            // adoption timing, but remember the source so it can be forced.
+            if (syncScopeDepth === 0 && isSyncPromise(value)) {
+              adopted = value;
+              resolve(value);
+              return;
+            }
             // Try sync unwrap. If it can't resolve sync, let native handle it.
             // Without this, p-limit's resolve(asyncPromise) gets treated as
             // sync-resolved with the Promise object as the value.
@@ -1082,17 +1143,135 @@ function createSyncPromise(): typeof Promise {
       this._syncRejected = syncRejected;
       this._syncError = syncErr;
 
-      // Suppress native unhandledrejection — our .then() handles these sync
-      if (syncRejected) {
-        NativePromise.prototype.catch.call(this, () => {});
+      // No blanket rejection suppression here: an unhandled rejection has to
+      // reach the host's unhandledrejection event (node exits 1 on it).
+      // Rejections consumed on a sync path are marked handled there instead.
+      if (adopted) {
+        const src = adopted;
+        this._lazy = () => {
+          src._force();
+          if (src._syncResolved) {
+            this._syncResolved = true;
+            this._syncValue = src._syncValue;
+          } else if (src._syncRejected) {
+            this._syncRejected = true;
+            this._syncError = src._syncError;
+          }
+        };
       }
+    }
+
+    _force(): void {
+      const lazy = this._lazy;
+      if (lazy && !this._syncResolved && !this._syncRejected) {
+        lazy();
+        // settled: drop the link so a long chain doesn't keep its parents alive
+        if (this._syncResolved || this._syncRejected) this._lazy = undefined;
+      }
+    }
+
+    // .then() outside a sync scope on a promise whose value is (or can be)
+    // known synchronously. The reaction is a real native one, so timing
+    // matches node; _lazy lets syncAwait compute the same result early.
+    // Either way the callback runs at most once.
+    private _lazyThen(
+      onFulfilled?: ((value: T) => any) | null,
+      onRejected?: ((reason: any) => any) | null,
+    ): Promise<any> {
+      let state = 0; // 0 pending, 1 fulfilled, 2 rejected
+      let out: any;
+      const settle = (ok: boolean, v: any): void => {
+        if (state !== 0) return;
+        try {
+          if (ok) out = onFulfilled ? onFulfilled(v) : v;
+          else if (onRejected) out = onRejected(v);
+          else {
+            state = 2;
+            out = v;
+            return;
+          }
+          state = 1;
+        } catch (e) {
+          state = 2;
+          out = e;
+        }
+      };
+      // runs as the native reaction: the result is final now, so record it
+      // and drop the lazy link (which holds the parent) — a queue built as
+      // `q = q.then(task)` must not keep every earlier step reachable
+      const result = (): any => {
+        derived._lazy = undefined;
+        if (state === 2) {
+          derived._syncRejected = true;
+          derived._syncError = out;
+          throw out;
+        }
+        if (!(out && typeof out.then === "function")) {
+          derived._syncResolved = true;
+          derived._syncValue = out;
+        }
+        return out;
+      };
+      const derived: SyncPromise<any> = super.then(
+        (v) => {
+          settle(true, v);
+          return result();
+        },
+        (e) => {
+          settle(false, e);
+          return result();
+        },
+      ) as SyncPromise<any>;
+      const parent = this;
+      derived._lazy = () => {
+        parent._force();
+        if (parent._syncResolved) settle(true, parent._syncValue);
+        else if (parent._syncRejected) settle(false, parent._syncError);
+        else return;
+        if (state === 2) {
+          derived._syncRejected = true;
+          derived._syncError = out;
+          return;
+        }
+        if (out && typeof out.then === "function") {
+          let ok = false;
+          let bad = false;
+          let v: any;
+          out.then(
+            (x: any) => {
+              ok = true;
+              v = x;
+            },
+            (e: any) => {
+              bad = true;
+              v = e;
+            },
+          );
+          if (ok) {
+            derived._syncResolved = true;
+            derived._syncValue = v;
+          } else if (bad) {
+            derived._syncRejected = true;
+            derived._syncError = v;
+          }
+          return;
+        }
+        derived._syncResolved = true;
+        derived._syncValue = out;
+      };
+      return derived;
     }
 
     then<TResult1 = T, TResult2 = never>(
       onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
       onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
     ): Promise<TResult1 | TResult2> {
-      if (this._syncResolved && onFulfilled) {
+      // Sync fast-path ONLY inside an explicit sync scope (syncAwait above):
+      // it exists so require() machinery can unwrap synchronously. Everywhere
+      // else, fall through to native microtask timing so user-visible .then
+      // ordering matches Node (sync statements, then nextTick, then promises).
+      if (syncScopeDepth > 0) this._force();
+      if (syncScopeDepth > 0 && this._syncResolved && onFulfilled) {
         try {
           const result = onFulfilled(this._syncValue as T);
           if (
@@ -1142,7 +1321,15 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && onRejected) {
+      if (this._syncRejected && syncScopeDepth > 0) {
+        // consumed synchronously: the native promise must not also report
+        // an unhandled rejection
+        markHandled(this);
+        if (!onRejected) {
+          return new SyncPromise<TResult2>((_, rej) =>
+            rej(this._syncError),
+          ) as any;
+        }
         try {
           const result = onRejected(this._syncError);
           return new SyncPromise<TResult2>((res) =>
@@ -1152,10 +1339,8 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && !onRejected) {
-        return new SyncPromise<TResult2>((_, rej) =>
-          rej(this._syncError),
-        ) as any;
+      if (this._lazy || this._syncResolved || this._syncRejected) {
+        return this._lazyThen(onFulfilled, onRejected);
       }
       return super.then(onFulfilled, onRejected);
     }
@@ -1180,9 +1365,25 @@ function createSyncPromise(): typeof Promise {
   (SyncPromise as any).reject = (reason: any) =>
     new SyncPromise((_, rej) => rej(reason));
 
+  // Inside a sync scope, lazy .then() results are forced so a combinator over
+  // promises built earlier can still settle synchronously.
+  const collect = (iterable: Iterable<any>): any[] => {
+    const arr = Array.from(iterable);
+    if (syncScopeDepth > 0) {
+      for (const v of arr) if (isSyncPromise(v)) v._force();
+    }
+    return arr;
+  };
+  // A sync result stands in for the native combinator, which would have
+  // attached a handler to every input: do the same so a rejected input
+  // doesn't also surface as an unhandled rejection.
+  const consumed = (arr: any[]): void => {
+    for (const v of arr) if (v instanceof NativePromise) markHandled(v);
+  };
+
   // all/race/allSettled/any return SyncPromise so __syncAwait can unwrap them
   (SyncPromise as any).all = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     const results: any[] = new Array(arr.length);
     let allSync = true;
     for (let i = 0; i < arr.length; i++) {
@@ -1191,6 +1392,7 @@ function createSyncPromise(): typeof Promise {
         if ((v as any)._syncResolved) {
           results[i] = (v as any)._syncValue;
         } else if ((v as any)._syncRejected) {
+          consumed(arr);
           return new SyncPromise((_, rej) => rej((v as any)._syncError));
         } else {
           allSync = false;
@@ -1222,7 +1424,7 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).allSettled = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     const results: any[] = new Array(arr.length);
     let allSync = true;
     for (let i = 0; i < arr.length; i++) {
@@ -1244,6 +1446,7 @@ function createSyncPromise(): typeof Promise {
       }
     }
     if (allSync) {
+      consumed(arr);
       return new SyncPromise((res: any) => res(results));
     }
     return new SyncPromise((res: any, rej: any) => {
@@ -1252,18 +1455,21 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).race = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     for (const v of arr) {
       if (v instanceof SyncPromise) {
         if ((v as any)._syncResolved) {
+          consumed(arr);
           return new SyncPromise((res: any) => res((v as any)._syncValue));
         }
         if ((v as any)._syncRejected) {
+          consumed(arr);
           return new SyncPromise((_, rej: any) => rej((v as any)._syncError));
         }
       } else if (
         !(v && typeof v === "object" && typeof v.then === "function")
       ) {
+        consumed(arr);
         return new SyncPromise((res: any) => res(v));
       }
     }
@@ -1273,12 +1479,14 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).any = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     for (const v of arr) {
       if (v instanceof SyncPromise && (v as any)._syncResolved) {
+        consumed(arr);
         return new SyncPromise((res: any) => res((v as any)._syncValue));
       }
       if (!(v && typeof v === "object" && typeof v.then === "function")) {
+        consumed(arr);
         return new SyncPromise((res: any) => res(v));
       }
     }
@@ -1293,6 +1501,7 @@ function createSyncPromise(): typeof Promise {
       }
     }
     if (allSyncRejected && arr.length > 0) {
+      consumed(arr);
       return new SyncPromise((_, rej: any) =>
         rej(new AggregateError(errors, "All promises were rejected")),
       );
@@ -2384,6 +2593,7 @@ function buildResolver(
         importMetaForModule(childResolver, resolved, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
 
@@ -2434,6 +2644,7 @@ function buildResolver(
             importMetaForModule(childResolver, resolved, dir),
             asyncLoader,
             syncAwait,
+            syncAwaitFn,
             SyncPromiseClass,
           );
           record.loaded = true;
@@ -3492,6 +3703,7 @@ export class ScriptEngine {
         importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
 
@@ -3623,6 +3835,7 @@ export class ScriptEngine {
           importMetaForModule(resolver, filename, dir),
           asyncLoader,
           syncAwait,
+          syncAwaitFn,
           SyncPromiseClass,
         );
         mod.loaded = true;
@@ -3651,6 +3864,7 @@ export class ScriptEngine {
         importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
       mod.loaded = true;
