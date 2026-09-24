@@ -71,3 +71,14 @@ describe("terminal size for child processes", () => {
     expect(resizes(piped)).toEqual([]);
   });
 });
+
+describe("child process environment", () => {
+  it("drops undefined values and stringifies the rest, like node", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const env = { KEPT: "yes", GONE: undefined, COUNT: 3 } as unknown as Record<string, string>;
+    manager.spawn({ command: "sh", args: [], cwd: "/", env });
+    const init = FakeWorker.instances.at(-1)!.messages.find((m) => m?.type === "init");
+    expect(init.env).toEqual({ KEPT: "yes", COUNT: "3" });
+    expect("GONE" in init.env).toBe(false);
+  });
+});

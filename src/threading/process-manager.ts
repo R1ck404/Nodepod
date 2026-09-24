@@ -40,6 +40,20 @@ import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
 
+// A child's environment as node builds it: entries whose value is undefined
+// are dropped and the rest become strings. process.env here is a plain
+// object, so `process.env.X = undefined` (next dev does this) leaves an
+// undefined value that a child's shell can't handle.
+function childEnv(env: Record<string, unknown> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!env) return out;
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (value !== undefined) out[key] = String(value);
+  }
+  return out;
+}
+
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
 
@@ -211,7 +225,7 @@ export class ProcessManager extends EventEmitter {
       command: config.command,
       args: config.args ?? [],
       cwd: config.cwd ?? "/",
-      env: config.env ?? {},
+      env: childEnv(config.env),
       shell: config.shell,
       snapshot,
       syncBuffer: this._syncBuffer ?? undefined,
@@ -996,7 +1010,7 @@ export class ProcessManager extends EventEmitter {
           command: msg.command,
           args: msg.args,
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           shell: msg.shell,
           parentPid: handle.pid,
         });
@@ -1040,7 +1054,7 @@ export class ProcessManager extends EventEmitter {
               filePath: msg.args[0],
               args: msg.args.slice(1),
               cwd: msg.cwd,
-              env: msg.env,
+              env: childEnv(msg.env),
               isShell: false,
             });
           } else {
@@ -1049,7 +1063,7 @@ export class ProcessManager extends EventEmitter {
               filePath: "",
               args: msg.args,
               cwd: msg.cwd,
-              env: msg.env,
+              env: childEnv(msg.env),
               isShell: true,
               shellCommand: fullCmd,
             });
@@ -1135,7 +1149,7 @@ export class ProcessManager extends EventEmitter {
           command: "node",
           args: [msg.modulePath, ...msg.args],
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1158,7 +1172,7 @@ export class ProcessManager extends EventEmitter {
             filePath: msg.modulePath,
             args: msg.args,
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: false,
             isFork: true,
           });
@@ -1287,7 +1301,7 @@ export class ProcessManager extends EventEmitter {
           command: "node",
           args: [modulePath],
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1310,7 +1324,7 @@ export class ProcessManager extends EventEmitter {
             filePath: modulePath,
             args: msg.args || [],
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: false,
             isFork: true,
             isWorkerThread: true,
@@ -1559,7 +1573,7 @@ export class ProcessManager extends EventEmitter {
           command: msg.command,
           args: msg.args,
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1586,7 +1600,7 @@ export class ProcessManager extends EventEmitter {
             filePath: "",
             args: msg.args,
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: true,
             shellCommand: fullCmd,
           });
