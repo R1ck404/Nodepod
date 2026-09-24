@@ -34,7 +34,11 @@ import { closeAllServers, getAllServers } from "./http";
 import { disposeAllTimers } from "./timers";
 import type { SyncChannelWorker } from "../threading/sync-channel";
 import {
-  rejectGlobal,
+  hasGlobalFlag,
+  withoutGlobalFlags,
+  globalContext,
+  linkGlobalBins,
+  unlinkGlobalBins,
   npmConfig as pmNpmConfig,
   npmPkg as pmNpmPkg,
   npmPack as pmNpmPack,
@@ -379,7 +383,6 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
     hasFile: (p) => !!_vol && _vol.existsSync(p),
     readFile: (p) => _vol!.readFileSync(p, "utf8") as string,
     writeFile: (p, data) => _vol!.writeFileSync(p, data),
-    rejectGlobal,
   };
 
   _shell.registerCommand(createNodeCommand(pmDeps));
@@ -833,8 +836,7 @@ async function installPackages(
   pm: PkgManager = "npm",
   opts?: { persist?: boolean },
 ): Promise<ShellResult> {
-  const globalReject = rejectGlobal(args, pm);
-  if (globalReject) return globalReject;
+  if (hasGlobalFlag(args)) return installGlobal(withoutGlobalFlags(args), ctx, pm, opts);
 
   const { DependencyInstaller } = await import("../packages/installer");
   const snapshotCache = await getShellSnapshotCache();
@@ -915,11 +917,43 @@ async function installPackages(
   }
 }
 
+// npm i -g: install into the global tree, then link the named packages'
+// commands onto PATH
+async function installGlobal(
+  args: string[],
+  ctx: ShellContext,
+  pm: PkgManager,
+  opts?: { persist?: boolean },
+): Promise<ShellResult> {
+  const names = installPackageNames(args).map(specPackageName);
+  if (names.length === 0) {
+    return { stdout: "", stderr: formatErr("-g needs a package name", pm), exitCode: 1 };
+  }
+  const result = await installPackages(args, globalContext(_vol!, ctx), pm, opts);
+  if (result.exitCode !== 0) return result;
+  let out = result.stdout;
+  for (const name of names) {
+    for (const cmd of linkGlobalBins(_vol!, name)) out += `linked ${cmd} -> ${name}\n`;
+  }
+  return { ...result, stdout: out };
+}
+
+// package name from an install spec: "pkg@^1", "@scope/pkg@1", "alias@npm:real@1"
+function specPackageName(spec: string): string {
+  const at = spec.indexOf("@", spec.startsWith("@") ? 1 : 0);
+  return at > 0 ? spec.slice(0, at) : spec;
+}
+
 async function uninstallPackages(
   args: string[],
   ctx: ShellContext,
   pm: PkgManager = "npm",
 ): Promise<ShellResult> {
+  if (hasGlobalFlag(args)) {
+    const names = args.filter((a) => !a.startsWith("-"));
+    for (const name of names) unlinkGlobalBins(_vol!, name);
+    return uninstallPackages(withoutGlobalFlags(args), globalContext(_vol!, ctx), pm);
+  }
   const names = args.filter((a) => !a.startsWith("-"));
   if (names.length === 0)
     return {
@@ -982,7 +1016,9 @@ async function uninstallPackages(
 async function listPackages(
   ctx: ShellContext,
   pm: PkgManager = "npm",
+  args: string[] = [],
 ): Promise<ShellResult> {
+  if (hasGlobalFlag(args)) ctx = globalContext(_vol!, ctx);
   const { DependencyInstaller } = await import("../packages/installer");
   const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd });
   const pkgs = installer.listInstalled();

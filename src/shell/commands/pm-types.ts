@@ -16,7 +16,7 @@ export interface PmDeps {
     ctx: ShellContext,
     pm?: PkgManager,
   ) => Promise<ShellResult>;
-  listPackages: (ctx: ShellContext, pm?: PkgManager) => Promise<ShellResult>;
+  listPackages: (ctx: ShellContext, pm?: PkgManager, args?: string[]) => Promise<ShellResult>;
   runScript: (args: string[], ctx: ShellContext) => Promise<ShellResult>;
   npmInitOrCreate: (
     args: string[],
@@ -49,7 +49,6 @@ export interface PmDeps {
   hasFile: (path: string) => boolean;
   readFile: (path: string) => string;
   writeFile: (path: string, data: string) => void;
-  rejectGlobal: (args: string[], pm: PkgManager) => ShellResult | null;
 }
 
 // `npm -s run build` / `pnpm --silent run build`: the global flag precedes

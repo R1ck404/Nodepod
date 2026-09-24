@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryVolume } from "../memory-volume";
 import type { ShellContext } from "../shell/shell-types";
 import {
-  rejectGlobal,
   npmPkg,
   npmConfig,
   npmPack,
@@ -10,6 +9,12 @@ import {
   packageJsonDepsMatchLock,
   writeNpmPackageLock,
   hasGlobalFlag,
+  withoutGlobalFlags,
+  globalContext,
+  linkGlobalBins,
+  unlinkGlobalBins,
+  GLOBAL_BIN,
+  GLOBAL_LIB,
 } from "../packages/pm-cli";
 import { packTarGz } from "../packages/tar-pack";
 import pako from "pako";
@@ -31,10 +36,39 @@ describe("pm-cli", () => {
     vol.mkdirSync("/app", { recursive: true });
   });
 
-  it("rejectGlobal detects -g", () => {
+  it("detects and strips the global flags", () => {
     expect(hasGlobalFlag(["-g", "lodash"])).toBe(true);
-    expect(rejectGlobal(["--global", "x"], "npm")?.exitCode).toBe(1);
-    expect(rejectGlobal(["lodash"], "npm")).toBeNull();
+    expect(hasGlobalFlag(["--location=global", "x"])).toBe(true);
+    expect(hasGlobalFlag(["lodash"])).toBe(false);
+    expect(withoutGlobalFlags(["i", "-g", "x", "--global"])).toEqual(["i", "x"]);
+  });
+
+  it("links and unlinks a global package's commands on PATH", () => {
+    const ctx = globalContext(vol, makeCtx(vol));
+    expect(ctx.cwd).toBe(GLOBAL_LIB);
+    expect(JSON.parse(vol.readFileSync(GLOBAL_LIB + "/package.json", "utf8") as string).dependencies).toEqual({});
+
+    const pkgDir = GLOBAL_LIB + "/node_modules/@acme/tool";
+    vol.mkdirSync(pkgDir + "/dist", { recursive: true });
+    vol.writeFileSync(pkgDir + "/package.json", JSON.stringify({
+      name: "@acme/tool",
+      bin: { tool: "./dist/cli.js", "tool-dev": "dist/dev.js" },
+    }));
+    expect(linkGlobalBins(vol, "@acme/tool").sort()).toEqual(["tool", "tool-dev"]);
+    expect(vol.readFileSync(GLOBAL_BIN + "/tool", "utf8")).toBe(`node "${pkgDir}/dist/cli.js" "$@"\n`);
+
+    // a command another package owns is left alone
+    vol.writeFileSync(GLOBAL_BIN + "/tool-dev", 'node "/usr/local/lib/node_modules/other/x.js" "$@"\n');
+    unlinkGlobalBins(vol, "@acme/tool");
+    expect(vol.existsSync(GLOBAL_BIN + "/tool")).toBe(false);
+    expect(vol.existsSync(GLOBAL_BIN + "/tool-dev")).toBe(true);
+  });
+
+  it("names a string bin after the unscoped package name", () => {
+    const pkgDir = GLOBAL_LIB + "/node_modules/@acme/single";
+    vol.mkdirSync(pkgDir, { recursive: true });
+    vol.writeFileSync(pkgDir + "/package.json", JSON.stringify({ name: "@acme/single", bin: "cli.js" }));
+    expect(linkGlobalBins(vol, "@acme/single")).toEqual(["single"]);
   });
 
   it("npmPkg get/set/delete", () => {

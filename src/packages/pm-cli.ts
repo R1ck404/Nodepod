@@ -25,23 +25,80 @@ const fail = (stderr: string, exitCode = 1): ShellResult => ({
 });
 
 /* ------------------------------------------------------------------ */
-/*  Global install rejection                                           */
+/*  Global installs                                                    */
 /* ------------------------------------------------------------------ */
 
+// npm's layout on Linux: global packages under {prefix}/lib/node_modules,
+// their commands linked into {prefix}/bin, which is on the shell's PATH.
+// {prefix}/lib keeps a package.json listing them, so every global install
+// resolves one consistent tree.
+export const GLOBAL_PREFIX = "/usr/local";
+export const GLOBAL_LIB = `${GLOBAL_PREFIX}/lib`;
+export const GLOBAL_BIN = `${GLOBAL_PREFIX}/bin`;
+
+const isGlobalFlag = (a: string): boolean =>
+  a === "-g" || a === "--global" || a === "--location=global";
+
 export function hasGlobalFlag(args: string[]): boolean {
-  return args.some(
-    (a) => a === "-g" || a === "--global" || a === "--location=global",
-  );
+  return args.some(isGlobalFlag);
 }
 
-export function rejectGlobal(
-  args: string[],
-  pm: PkgManager,
-): ShellResult | null {
-  if (!hasGlobalFlag(args)) return null;
-  return fail(
-    `${pm}: global installs (-g/--global) are not supported in nodepod\n`,
-  );
+export function withoutGlobalFlags(args: string[]): string[] {
+  return args.filter((a) => !isGlobalFlag(a));
+}
+
+/** Context for running a package command against the global tree. */
+export function globalContext(vol: MemoryVolume, ctx: ShellContext): ShellContext {
+  const manifest = `${GLOBAL_LIB}/package.json`;
+  if (!vol.existsSync(manifest)) {
+    vol.mkdirSync(GLOBAL_LIB, { recursive: true });
+    vol.writeFileSync(
+      manifest,
+      JSON.stringify({ name: "nodepod-global", private: true, dependencies: {} }, null, 2) + "\n",
+    );
+  }
+  return { ...ctx, cwd: GLOBAL_LIB };
+}
+
+function binEntries(vol: MemoryVolume, name: string): Array<[string, string]> {
+  const pkgDir = `${GLOBAL_LIB}/node_modules/${name}`;
+  try {
+    const pkg = JSON.parse(vol.readFileSync(`${pkgDir}/package.json`, "utf8") as string);
+    const bin: Record<string, string> =
+      typeof pkg.bin === "string"
+        ? { [String(pkg.name || name).split("/").pop()!]: pkg.bin }
+        : pkg.bin && typeof pkg.bin === "object" ? pkg.bin : {};
+    return Object.entries(bin)
+      .filter(([cmd, rel]) => typeof rel === "string" && /^[\w.@-]+$/.test(cmd))
+      .map(([cmd, rel]) => [cmd, `${pkgDir}/${rel.replace(/^\.\//, "")}`]);
+  } catch {
+    return [];
+  }
+}
+
+/** Link a global package's commands into GLOBAL_BIN. Returns the names. */
+export function linkGlobalBins(vol: MemoryVolume, name: string): string[] {
+  const linked: string[] = [];
+  for (const [cmd, target] of binEntries(vol, name)) {
+    vol.mkdirSync(GLOBAL_BIN, { recursive: true });
+    // same stub format as node_modules/.bin, which PATH lookup understands
+    vol.writeFileSync(`${GLOBAL_BIN}/${cmd}`, `node "${target}" "$@"\n`);
+    linked.push(cmd);
+  }
+  return linked;
+}
+
+/** Remove the GLOBAL_BIN links that point into a global package. */
+export function unlinkGlobalBins(vol: MemoryVolume, name: string): void {
+  const pkgDir = `${GLOBAL_LIB}/node_modules/${name}/`;
+  for (const [cmd] of binEntries(vol, name)) {
+    const link = `${GLOBAL_BIN}/${cmd}`;
+    try {
+      if ((vol.readFileSync(link, "utf8") as string).includes(`"${pkgDir}`)) vol.unlinkSync(link);
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */

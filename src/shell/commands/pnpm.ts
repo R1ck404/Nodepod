@@ -37,14 +37,10 @@ export function createPnpmCommand(deps: PmDeps): ShellCommand {
 
       switch (sub) {
         case "add": {
-          const rejected = deps.rejectGlobal(params.slice(1), "pnpm");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "pnpm");
         }
         case "install":
         case "i": {
-          const rejected = deps.rejectGlobal(params.slice(1), "pnpm");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx, "pnpm");
         }
         case "remove":
