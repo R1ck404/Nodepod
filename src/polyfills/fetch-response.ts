@@ -17,6 +17,9 @@ const BODY_READ_PATCH = Symbol.for("nodepod.bodyReadLifetime");
  * fetch() bodies. Patches this realm's prototypes: process workers only.
  */
 export function installBodyReadLifetime(): void {
+  // a read implemented on top of another one (node 20's Blob#text calls
+  // this.arrayBuffer()) holds one handle, not two
+  let reading = 0;
   const hold = (proto: object | undefined, names: readonly string[]): void => {
     if (!proto || (proto as Record<symbol, unknown>)[BODY_READ_PATCH]) return;
     Object.defineProperty(proto, BODY_READ_PATCH, { value: true });
@@ -27,7 +30,14 @@ export function installBodyReadLifetime(): void {
       Object.defineProperty(proto, name, {
         ...desc,
         value: function (this: unknown, ...args: unknown[]) {
-          const result = read.apply(this, args);
+          if (reading > 0) return read.apply(this, args);
+          let result: unknown;
+          reading++;
+          try {
+            result = read.apply(this, args);
+          } finally {
+            reading--;
+          }
           if (!result || typeof (result as Promise<unknown>).then !== "function") return result;
           const handle = getRegistry().register("FetchRequest");
           return (result as Promise<unknown>).then(
