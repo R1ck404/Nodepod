@@ -1,6 +1,6 @@
 // Pinned CDN versions and URLs
 
-export const PINNED_ESBUILD_WASM = '0.20.0';
+export const PINNED_ESBUILD_WASM = '0.28.2';
 export const PINNED_ROLLUP_BROWSER = '4.44.0';
 export const PINNED_BROTLI_WASM = '3.0.1';
 export const PINNED_LIGHTNINGCSS_WASM = '1.31.1';
@@ -12,6 +12,9 @@ export const CDN_ESBUILD_BINARY = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_
 // yields a separate module instance, i.e. a separate esbuild service (see
 // esbuild-engine.ts recycling).
 export const CDN_ESBUILD_BUNDLE = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/es2022/esbuild-wasm.mjs`;
+// esbuild's browser build as a classic script, evaluated once per instance
+// (see esbuild-engine.ts)
+export const CDN_ESBUILD_BROWSER_SCRIPT = `https://esm.sh/esbuild-wasm@${PINNED_ESBUILD_WASM}/lib/browser.min.js?raw`;
 export const CDN_ROLLUP_BROWSER = `https://esm.sh/@rollup/browser@${PINNED_ROLLUP_BROWSER}`;
 // jsdelivr serves raw files without rebundling. esm.sh rebundles everything
 // which breaks brotli-wasm's circular WASM/JS-glue dependencies, causing

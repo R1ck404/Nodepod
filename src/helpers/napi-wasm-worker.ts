@@ -949,9 +949,17 @@ function __fsSyncCall(type, args, sabSize) {
   const message = { __fs__: { sab: ctrl, type: type, payload: args || [], requestId: requestId } };
   __nativePostMessage(message);
 
-  const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
-  if (result === 'timed-out') {
-    throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
+  // wait until this call is answered, not just until woken: the answer to
+  // the call before can have been read before its notify came (the host
+  // notifies after storing it), and that notify then wakes this wait
+  const deadline = Date.now() + 30000; // 30s timeout
+  while (Atomics.load(ctrl, 0) === -1) {
+    const left = deadline - Date.now();
+    if (left <= 0 || Atomics.wait(ctrl, 0, -1, left) === 'timed-out') {
+      // a late answer must not land in the next call
+      if (__fsReusableSab === sab) __fsReusableSab = null;
+      throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
+    }
   }
 
   const status = Atomics.load(ctrl, 0);

@@ -1,5 +1,6 @@
 import { MemoryVolume } from "../memory-volume";
-import { DependencyInstaller } from "../packages/installer";
+import { DependencyInstaller, isPackFile } from "../packages/installer";
+import { collectBinarySnapshotParts, saveSnapshotParts } from "../persistence/binary-snapshot";
 import {
   RequestProxy,
   getProxyInstance,
@@ -70,6 +71,8 @@ import {
   adoptMountedPack,
   canPageFrom,
 } from "../persistence/pack-content-source";
+import { watchToolCaches } from "../persistence/tool-cache";
+import { createOffThreadDeflater, type OffThreadDeflater } from "../helpers/deflate-worker";
 
 let activeNodepodCount = 0;
 
@@ -147,6 +150,8 @@ export class Nodepod {
   private _httpIngress: HttpIngress | null = null;
   private _snapshotCache: IDBSnapshotCache | null = null;
   private _persistence: WorkspacePersistence | null = null;
+  private _unwatchToolCaches: (() => void) | null = null;
+  private _deflater: OffThreadDeflater | null = null;
   private _headless = false;
   private _rewriteTerminalUrls: boolean;
   private _terminalUrlOutputStreams = new Set<TerminalServerUrlOutputStream>();
@@ -420,8 +425,11 @@ export class Nodepod {
     // memory.packPackageContent: package files nobody reads stay deflated.
     // A full spawn snapshot copies every file into each process, which would
     // inflate them all on every spawn.
+    let deflater: OffThreadDeflater | null = null;
     if (handler.options.packPackageContent && sabEnabled && opts.spawnSnapshot !== "full") {
-      volume.enableContentPacking();
+      deflater = createOffThreadDeflater();
+      volume.enableContentPacking(deflater ? { deflate: (bytes) => deflater!.deflate(bytes) } : {});
+      if (deflater) onFailure.push(() => deflater?.dispose());
     }
 
     const packages = new DependencyInstaller(volume, {
@@ -459,6 +467,32 @@ export class Nodepod {
     );
     nodepod._headless = headless;
     nodepod._snapshotCache = snapshotCache;
+    if (snapshotCache) {
+      nodepod._unwatchToolCaches = watchToolCaches(volume, snapshotCache);
+      const cache = snapshotCache;
+      // a process's install hands its package pack over: its files are in
+      // this volume too, so it is saved from here once this thread is idle
+      // (and before packing gets to them, or the copy inflates them again)
+      nodepod._processManager.setPackSaver((key) => {
+        const release = volume.holdContentPacking();
+        const save = (): void => {
+          try {
+            if (nodepod._disposed) return;
+            void saveSnapshotParts(cache, key, collectBinarySnapshotParts(volume, isPackFile)).catch(() => {});
+          } catch {
+            /* the next install saves it */
+          } finally {
+            release();
+          }
+        };
+        const ric = (globalThis as {
+          requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+        }).requestIdleCallback;
+        if (typeof ric === "function") ric(save, { timeout: 3000 });
+        else setTimeout(save, 0);
+      });
+    }
+    nodepod._deflater = deflater;
     nodepod._persistence = persistence;
     if (packSource && canPageFrom(snapshotCache)) {
       const source = packSource;
@@ -1188,6 +1222,10 @@ export class Nodepod {
     // captures pending changes synchronously, so disposing the volume
     // right after doesn't lose them
     const persistenceClosed = this._persistence?.close();
+    this._unwatchToolCaches?.();
+    this._unwatchToolCaches = null;
+    this._deflater?.dispose();
+    this._deflater = null;
     this._snapshotCache?.close();
     this._snapshotCache = null;
     this._volume.dispose();

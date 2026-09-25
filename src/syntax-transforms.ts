@@ -481,6 +481,17 @@ export function stripTopLevelAwait(
       if (isAsyncFn) insideAsync++;
 
       if (full && isAsyncFn && !node.generator) {
+        // the body runs right away (its awaits unwrapped below) and the
+        // function still returns a promise, already settled with the
+        // outcome: callers may .then() or .catch() it
+        const body = node.body;
+        if (node.type === "ArrowFunctionExpression" && node.expression) {
+          patches.push([body.start, body.start, "__asyncBody(() => ("]);
+          patches.push([body.end, body.end, "))"]);
+        } else if (body && body.type === "BlockStatement") {
+          patches.push([body.start + 1, body.start + 1, "return __asyncBody(() => {"]);
+          patches.push([body.end - 1, body.end - 1, "});"]);
+        }
         if (code.slice(node.start, node.start + 5) === "async") {
           let end = node.start + 5;
           while (end < code.length && (code[end] === " " || code[end] === "\t")) end++;
@@ -650,4 +661,41 @@ function esmToCjsViaRegex(
   out = out.replace(RE_EXPORT_CLASS, `${namedTarget}.$1 = class $1`);
   out = out.replace(RE_EXPORT_VAR, `${namedTarget}.$1 =`);
   return out;
+}
+
+// With import.meta and import() found by the lexer, the conversion only
+// looks at top-level statements (imports, exports, top-level await), none of
+// which can sit in a function body. This parser skips function bodies at
+// the token level: every token is still read (only the tokenizer can tell a
+// regex from a division), but no nodes are built for them, which is most of
+// a module's code.
+let _topLevelParser: typeof acorn.Parser | null = null;
+export function topLevelParser(): typeof acorn.Parser {
+  if (_topLevelParser) return _topLevelParser;
+  const tt = acorn.tokTypes;
+  const skipBodies = (Base: typeof acorn.Parser): typeof acorn.Parser =>
+    class extends (Base as any) {
+      parseFunctionBody(node: any, isArrowFunction: boolean, isMethod: boolean, forInit: unknown): void {
+        const self = this as any;
+        // an arrow's expression body: parsed as usual
+        if (self.type !== tt.braceL) {
+          super.parseFunctionBody(node, isArrowFunction, isMethod, forInit);
+          return;
+        }
+        const body = self.startNode();
+        let depth = 0;
+        do {
+          if (self.type === tt.braceL || self.type === tt.dollarBraceL) depth++;
+          else if (self.type === tt.braceR) depth--;
+          else if (self.type === tt.eof) self.unexpected();
+          self.next();
+        } while (depth > 0);
+        body.body = [];
+        node.body = self.finishNode(body, "BlockStatement");
+        node.expression = false;
+        self.exitScope();
+      }
+    } as unknown as typeof acorn.Parser;
+  _topLevelParser = acorn.Parser.extend(skipBodies as never);
+  return _topLevelParser;
 }

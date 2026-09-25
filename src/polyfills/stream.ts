@@ -1309,6 +1309,17 @@ export const PassThrough = function PassThrough(this: any, opts?: any) {
 
 Object.setPrototypeOf(PassThrough.prototype, Duplex.prototype);
 
+// its readable side ends with its writable side, like any Transform: without
+// this nothing reading a PassThrough to the end (a child's output combined
+// for readline, say) ever got 'end'
+PassThrough.prototype._final = function _final(
+  this: any,
+  callback: (err?: Error | null) => void,
+): void {
+  callback(null);
+  this.push(null);
+};
+
 PassThrough.prototype.write = function write(
   chunk: any,
   encOrCb?: string | ((err?: Error | null) => void),

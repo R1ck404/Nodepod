@@ -251,7 +251,7 @@ export interface Interface extends EventEmitter {
   write(data: string | null, _key?: { ctrl?: boolean; name?: string; meta?: boolean; shift?: boolean; sequence?: string }): void;
   clearLine(dir?: number): void;
   getCursorPos(): { rows: number; cols: number };
-  [Symbol.asyncIterator](): AsyncGenerator<string, void, undefined>;
+  [Symbol.asyncIterator](): AsyncIterableIterator<string>;
 }
 
 interface InterfaceConstructor {
@@ -269,16 +269,17 @@ export const Interface = function Interface(this: any, cfg?: InterfaceConfig) {
   this.closed = false;
   this._lineBuffer = "";
   this._pendingQuestions = [];
-  // node auto-detects terminal from input.isTTY (and output.isTTY when
-  // output is set). without this, createInterface({input: process.stdin})
-  // falls back to line mode and emitKeypressEvents never runs, which
-  // breaks vite's q-shortcut handler.
+  // like node: a terminal interface only when the output is a TTY. One with
+  // just an input (vite's shortcuts: createInterface({ input: process.stdin })
+  // reading "q"/"h" lines) stays in line mode, so stdin stays cooked and
+  // Ctrl+C is a SIGINT that ends the process. In raw mode the keystroke went
+  // to the process as data and nothing ended it.
   if (cfg?.terminal !== undefined) {
     this.terminal = cfg.terminal;
   } else {
     const inputIsTTY = !!(cfg?.input as any)?.isTTY;
     const outputIsTTY = !!(cfg?.output as any)?.isTTY;
-    this.terminal = inputIsTTY && (cfg?.output == null || outputIsTTY);
+    this.terminal = inputIsTTY && cfg?.output != null && outputIsTTY;
   }
   this.line = "";
   this.cursor = 0;
@@ -1051,20 +1052,54 @@ Interface.prototype.getCursorPos = function getCursorPos(this: any): { rows: num
   };
 };
 
-Interface.prototype[Symbol.asyncIterator] = async function*(this: any): AsyncGenerator<string, void, undefined> {
+// Lines are queued from the moment the iterator is created: a chunk holding
+// several lines emits them all at once, before the loop asks for the next.
+// Leaving the loop early closes the interface, as in node.
+Interface.prototype[Symbol.asyncIterator] = function (this: any): AsyncIterableIterator<string> {
   const self = this;
-  while (!self.closed) {
-    const line = await new Promise<string | null>((resolve) => {
-      if (self.closed) {
-        resolve(null);
-        return;
-      }
-      self.once("line", (l: string) => resolve(l));
-      self.once("close", () => resolve(null));
-    });
-    if (line === null) break;
-    yield line;
+  const queued: string[] = [];
+  // next() calls made before their line arrived, oldest first
+  const waiting: Array<(result: IteratorResult<string>) => void> = [];
+  let done = !!self.closed;
+  const finish = () => {
+    for (const resolve of waiting.splice(0)) resolve({ value: undefined, done: true });
+  };
+  const onLine = (line: string) => {
+    const resolve = waiting.shift();
+    if (resolve) resolve({ value: line, done: false });
+    else queued.push(line);
+  };
+  const onClose = () => {
+    done = true;
+    self.removeListener("line", onLine);
+    finish();
+  };
+  if (!done) {
+    self.on("line", onLine);
+    self.once("close", onClose);
   }
+  const iterator: AsyncIterableIterator<string> = {
+    next(): Promise<IteratorResult<string>> {
+      if (queued.length > 0) return Promise.resolve({ value: queued.shift()!, done: false });
+      if (done) return Promise.resolve({ value: undefined, done: true });
+      return new Promise((resolve) => {
+        waiting.push(resolve);
+      });
+    },
+    return(): Promise<IteratorResult<string>> {
+      self.removeListener("line", onLine);
+      self.removeListener("close", onClose);
+      done = true;
+      queued.length = 0;
+      finish();
+      if (!self.closed) self.close();
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    [Symbol.asyncIterator]() {
+      return iterator;
+    },
+  };
+  return iterator;
 };
 
 

@@ -12,7 +12,6 @@ import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
 import {
   setSqliteHostBridge,
   warmSqliteEngine,
-  warmSqliteWasmBytes,
   WASM_CACHE_PATH,
   WASM_SAB_HEADER_BYTES,
   WASM_SAB_MAX_BYTES,
@@ -370,10 +369,21 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   // if main had SAB off, neither buffer was sent
   _sabEnabled = !!msg.syncBuffer;
 
+  // installs leave their package pack to the main thread, which has the same
+  // files: the install is over as soon as they are in place
+  if (msg.deferPackSave) {
+    (globalThis as { __nodepodDeferPackSave?: (key: string) => boolean }).__nodepodDeferPackSave = (key) => {
+      post({ type: "pack-save", key });
+      return true;
+    };
+  }
+
   const sqliteBridge = installSqliteHostBridge();
 
   if (msg.sqliteStartup === "bytes") {
-    warmSqliteWasmBytes();
+    // have the main thread cache the bytes for the processes an install
+    // runs, without holding this one up while they download
+    if (sqliteBridge) post({ type: "sqlite-preload", sab: null });
   } else if (msg.sqliteStartup === "engine" || !sqliteBridge) {
     // without the host bridge a cold DatabaseSync has no synchronous way to
     // get the wasm, so the engine must be ready before user code runs
@@ -484,6 +494,7 @@ async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
       getCols: () => _cols,
       getRows: () => _rows,
       onRawModeChange: postStdinRawStatus,
+      isTTY: msg.stdoutIsTTY !== false,
     });
 
     // shellExec(), NOT child_process.exec() — the latter spawns a new worker and recurses
@@ -632,6 +643,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
       getCols: () => _cols,
       getRows: () => _rows,
       onRawModeChange: postStdinRawStatus,
+      isTTY: msg.stdoutIsTTY !== false,
     });
 
     const ctx = {

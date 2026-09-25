@@ -5,8 +5,13 @@
 export const sep = '/';
 export const delimiter = ':';
 
+// what normalize() would change: an empty, "." or ".." segment, or a
+// trailing slash. Most paths tools pass have none of them.
+const NEEDS_NORMALIZING = /\/\/|(?:^|\/)\.\.?(?:\/|$)|.\/$/;
+
 export function normalize(inputPath: string): string {
   if (!inputPath) return '.';
+  if (!NEEDS_NORMALIZING.test(inputPath)) return inputPath;
 
   const rooted = inputPath.charAt(0) === '/';
   const tokens = inputPath.split('/').filter(t => t.length > 0);

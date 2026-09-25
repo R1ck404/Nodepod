@@ -98,6 +98,7 @@ createServer((req, res) => {
   console.log(`  Vite HMR test:        http://localhost:${port}/examples/vite-hmr-test/`);
   console.log(`  Expo web smoke:       http://localhost:${port}/examples/expo-web-smoke/`);
   console.log(`  Dev playground:       http://localhost:${port}/examples/dev-playground/`);
+  console.log(`  Every create-vite:    http://localhost:${port}/examples/create-vite-all/`);
   console.log(`  SQLite test:          http://localhost:${port}/examples/sqlite-test/`);
   console.log(`  Vite dev exit 1:      http://localhost:${port}/examples/vite-dev-exit-1/  (auth+sqlite repro)`);
   console.log(`  import.meta.glob:     http://localhost:${port}/examples/import-meta-glob-test/`);

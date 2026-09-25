@@ -108,4 +108,55 @@ describe("AsyncLocalStorage", () => {
     als.disable();
     expect(als.getStore()).toBeUndefined();
   });
+
+  it("a run() scope ends enterWith() done inside it", () => {
+    const a = new AsyncLocalStorage<string>();
+    const b = new AsyncLocalStorage<string>();
+    b.run("b-outer", () => {
+      a.run("a", () => {
+        b.enterWith("b-inner");
+        expect(b.getStore()).toBe("b-inner");
+        expect(a.getStore()).toBe("a");
+      });
+      expect(b.getStore()).toBe("b-outer");
+    });
+  });
+
+  it("continuations keep the context they were registered in", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const seen: string[] = [];
+    await als.run("outer", async () => {
+      const p = Promise.resolve().then(() => {
+        seen.push(als.getStore()!);
+      });
+      const t = new Promise<void>((resolve) =>
+        setTimeout(() => {
+          seen.push(als.getStore()!);
+          resolve();
+        }, 0),
+      );
+      als.enterWith("inner");
+      expect(als.getStore()).toBe("inner");
+      await p;
+      await t;
+    });
+    expect(seen).toEqual(["outer", "outer"]);
+  });
+
+  it("isolates concurrent runs of two storages", async () => {
+    const a = new AsyncLocalStorage<number>();
+    const b = new AsyncLocalStorage<string>();
+    const results = await Promise.all(
+      [1, 2, 3].map((n) =>
+        a.run(n, () =>
+          b.run(`b${n}`, async () => {
+            await new Promise((r) => setTimeout(r, 4 - n));
+            await Promise.resolve();
+            return `${a.getStore()}:${b.getStore()}`;
+          }),
+        ),
+      ),
+    );
+    expect(results).toEqual(["1:b1", "2:b2", "3:b3"]);
+  });
 });

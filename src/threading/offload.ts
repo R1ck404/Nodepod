@@ -157,7 +157,8 @@ async function mainThreadExtract(
 
     files.push({
       path: relative,
-      data: new Uint8Array(entry.payload),
+      // already a copy of its own (parseTarArchive slices every payload)
+      data: entry.payload,
       isBinary: true,
     });
   }

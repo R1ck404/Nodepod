@@ -83,3 +83,27 @@ describe("package pack range reads", () => {
     }
   });
 });
+
+describe("saving a pack from its parts", () => {
+  it("stores the files' bytes as one pack without joining them first", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    const cache = (await openSnapshotCache())!;
+    const { collectBinarySnapshotParts, saveSnapshotParts } = await import("../persistence/binary-snapshot");
+    const { MemoryVolume } = await import("../memory-volume");
+    const vol = new MemoryVolume();
+    vol.writeFileSync("/app/node_modules/a/index.js", "export default 1;");
+    vol.writeFileSync("/app/node_modules/a/package.json", '{"name":"a"}');
+    vol.writeFileSync("/app/src/main.js", "not in the pack");
+    const parts = collectBinarySnapshotParts(vol, (p) => p.includes("/node_modules/"));
+    expect(parts.parts.length).toBe(2);
+    await saveSnapshotParts(cache, "parts", parts);
+    const back = (await cache.get("parts"))!;
+    const target = new MemoryVolume();
+    target.mountBinarySnapshot(back);
+    expect(target.readFileSync("/app/node_modules/a/index.js", "utf8")).toBe("export default 1;");
+    expect(target.readFileSync("/app/node_modules/a/package.json", "utf8")).toBe('{"name":"a"}');
+    expect(target.existsSync("/app/src/main.js")).toBe(false);
+    cache.close();
+  });
+});

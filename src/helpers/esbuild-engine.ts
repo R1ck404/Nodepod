@@ -4,7 +4,7 @@
 // globalThis so duplicate bundle copies of this file still converge.
 
 import {
-  CDN_ESBUILD_ESM,
+  CDN_ESBUILD_BROWSER_SCRIPT,
   CDN_ESBUILD_BINARY,
   CDN_ESBUILD_BUNDLE,
   cdnImport,
@@ -30,6 +30,9 @@ interface Instance {
   worker: Worker | null;
   // calls running on it
   pending: number;
+  // of which build()s: a bundle keeps the instance's one thread busy for
+  // as long as it runs, so transforms go elsewhere (runEsbuildTransform)
+  builds?: number;
   // takes no new calls; terminated once pending reaches 0
   detached: boolean;
 }
@@ -80,6 +83,43 @@ function initializeCapturingWorker(
   return { ready, worker: () => spawned };
 }
 
+// esbuild's JS side keeps each instance's protocol buffers at the size of
+// the largest response it ever read (a dependency pre-bundle: tens of MB).
+// Loaded as an ES module, an instance could never be collected: module
+// records live as long as the realm, so every retired instance kept those
+// buffers. The browser build is evaluated as a plain script instead, one
+// copy per instance, which is garbage once the instance is dropped.
+let _engineSource: Promise<string> | null = null;
+
+// the intrinsic Promise, even where a process realm installed its own:
+// async functions always return intrinsic promises
+function nativePromise(): PromiseConstructor {
+  return (async () => {})().constructor as PromiseConstructor;
+}
+
+async function loadEngineCopy(tag: string): Promise<EsbuildEngine> {
+  try {
+    const source = await (_engineSource ??= fetch(CDN_ESBUILD_BROWSER_SCRIPT).then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.text();
+    }));
+    const module = { exports: {} as EsbuildEngine };
+    // esbuild's own promises needn't carry the async context a process
+    // realm's global Promise tracks (node doesn't pass the caller's context
+    // into esbuild either), and every request and response makes some
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    new Function("module", "Promise", `${source}\n//# sourceURL=esbuild-wasm-${tag}.js`)(module, nativePromise());
+    if (typeof module.exports.initialize === "function") return module.exports;
+    throw new Error("unexpected esbuild-wasm browser build");
+  } catch {
+    _engineSource = null;
+    // module instance per tag (never collected, see above)
+    _moduleCopies++;
+    const loaded = await cdnImport(`${CDN_ESBUILD_BUNDLE}?${tag}`);
+    return (loaded.default || loaded) as EsbuildEngine;
+  }
+}
+
 /**
  * Get (initializing on first call) the realm-wide esbuild-wasm instance.
  * A host page may pre-provide its own instance on `globalThis.__esbuild`.
@@ -103,21 +143,15 @@ export function getEsbuild(opts?: { wasmURL?: string }): Promise<EsbuildEngine> 
   }
 
   const generation = state.generation;
-  _instancesCreated++;
   g.__nodepodEsbuild = (async () => {
     try {
       const customWasmURL = state.customWasmURL;
-      const [loaded, sharedModule] = await Promise.all([
-        // a retired instance's module can't be initialized again: later
-        // generations load their own module instance
-        cdnImport(
-          state.generation === 0
-            ? CDN_ESBUILD_ESM
-            : `${CDN_ESBUILD_BUNDLE}?nodepod-instance=${state.generation}`,
-        ),
+      const [engine, sharedModule] = await Promise.all([
+        // a retired instance's copy can't be initialized again: every
+        // instance evaluates its own
+        loadEngineCopy(`nodepod-instance=${state.generation}`),
         customWasmURL ? null : requestSharedModule(),
       ]);
-      const engine: EsbuildEngine = loaded.default || loaded;
       const instance: Instance = { engine, worker: null, pending: 0, detached: false };
       let init: ReturnType<typeof initializeCapturingWorker> | null = null;
       try {
@@ -161,11 +195,13 @@ export function getEsbuild(opts?: { wasmURL?: string }): Promise<EsbuildEngine> 
   return g.__nodepodEsbuild;
 }
 
-// Every instance loads its own copy of esbuild's JS (an initialized module
-// can't be started again), and module records are never freed: past this
-// many in one realm, instances are no longer replaced or added.
-const MAX_INSTANCES = 24;
-let _instancesCreated = 0;
+// Every instance evaluates its own copy of esbuild's JS (an initialized one
+// can't be started again). Copies loaded through the ES module fallback are
+// never freed (module records live as long as the realm): once this many
+// have been loaded, instances are no longer replaced or added. Script
+// copies are collected with their instance and not counted.
+const MAX_MODULE_COPIES = 24;
+let _moduleCopies = 0;
 
 // Inside a process worker the main thread shares one compiled module per
 // session (see esbuild-wasm-module.ts); on the main thread, use it directly.
@@ -199,8 +235,11 @@ export interface EsbuildLease {
   release(inputBytes?: number): void;
 }
 
-function lease(instance: Instance | null, engine: EsbuildEngine): EsbuildLease {
-  if (instance) instance.pending++;
+function lease(instance: Instance | null, engine: EsbuildEngine, isBuild = false): EsbuildLease {
+  if (instance) {
+    instance.pending++;
+    if (isBuild) instance.builds = (instance.builds ?? 0) + 1;
+  }
   let released = false;
   return {
     engine,
@@ -208,6 +247,7 @@ function lease(instance: Instance | null, engine: EsbuildEngine): EsbuildLease {
       if (released || !instance) return;
       released = true;
       instance.pending--;
+      if (isBuild) instance.builds!--;
       if (inputBytes >= RETIRE_CALL_BYTES) detach(instance);
       if (instance.detached && instance.pending === 0) terminate(instance);
     },
@@ -215,12 +255,12 @@ function lease(instance: Instance | null, engine: EsbuildEngine): EsbuildLease {
 }
 
 /** Lease the primary instance (initializing it if needed) for one call. */
-export async function acquireEsbuild(opts?: { wasmURL?: string }): Promise<EsbuildLease> {
+export async function acquireEsbuild(opts?: { wasmURL?: string; build?: boolean }): Promise<EsbuildLease> {
   const g = globalThis as EsbuildGlobal;
   for (let attempt = 0; attempt < 8; attempt++) {
     const engine = getEsbuildIfReady() ?? (await getEsbuild(opts));
     const primary = engineState().primary;
-    if (primary && primary.engine === engine) return lease(primary, engine);
+    if (primary && primary.engine === engine) return lease(primary, engine, opts?.build);
     // a host-provided instance isn't ours to track or stop
     if (!primary && engine === g.__esbuild) return lease(null, engine);
     // detached while this call waited for it: take its replacement. A ready
@@ -237,7 +277,7 @@ function detach(instance: Instance): void {
   if (instance.detached || !instance.worker) return;
   const state = engineState();
   // the primary is replaced by a new instance: keep it past the limit
-  if (state.primary === instance && _instancesCreated >= MAX_INSTANCES) return;
+  if (state.primary === instance && _moduleCopies >= MAX_MODULE_COPIES) return;
   instance.detached = true;
   if (state.primary === instance) {
     const g = globalThis as EsbuildGlobal;
@@ -292,16 +332,14 @@ let _laneCounter = 0;
 function spawnLane(): void {
   const lane: Lane = { instance: null, idleTimer: null };
   _lanes.push(lane);
-  _instancesCreated++;
   void (async () => {
     let init: ReturnType<typeof initializeCapturingWorker> | null = null;
     try {
-      const [loaded, sharedModule] = await Promise.all([
-        cdnImport(`${CDN_ESBUILD_BUNDLE}?nodepod-lane=${++_laneCounter}`),
+      const [engine, sharedModule] = await Promise.all([
+        loadEngineCopy(`nodepod-lane=${++_laneCounter}`),
         requestSharedModule(),
       ]);
       if (!sharedModule) throw new Error("no shared module");
-      const engine: EsbuildEngine = loaded.default || loaded;
       init = initializeCapturingWorker(engine, { wasmModule: sharedModule });
       await init.ready;
       const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: false };
@@ -325,6 +363,47 @@ function spawnLane(): void {
       if (i >= 0) _lanes.splice(i, 1);
     }
   })();
+}
+
+/**
+ * A fresh instance of its own for one build that runs alongside others
+ * (see the dependency pre-bundle split in polyfills/esbuild.ts). It is
+ * stopped when released. Null when no instance can be added.
+ */
+export async function acquireDedicatedEsbuild(): Promise<EsbuildLease | null> {
+  const state = engineState();
+  if (
+    state.customWasmURL ||
+    typeof Worker !== "function" ||
+    _moduleCopies >= MAX_MODULE_COPIES
+  ) {
+    return null;
+  }
+  let init: ReturnType<typeof initializeCapturingWorker> | null = null;
+  try {
+    const [engine, sharedModule] = await Promise.all([
+      loadEngineCopy(`nodepod-dedicated=${++_laneCounter}`),
+      requestSharedModule(),
+    ]);
+    if (!sharedModule) throw new Error("no shared module");
+    init = initializeCapturingWorker(engine, { wasmModule: sharedModule });
+    await init.ready;
+    const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: true };
+    if (!instance.worker) {
+      terminate(instance);
+      return null;
+    }
+    // detached from the start: nothing else is routed to it, and it is
+    // terminated as soon as its one call is released
+    return lease(instance, engine, true);
+  } catch {
+    try {
+      init?.worker()?.terminate();
+    } catch {
+      /* gone */
+    }
+    return null;
+  }
 }
 
 function scheduleLaneIdle(lane: Lane): void {
@@ -353,8 +432,12 @@ export async function runEsbuildTransform<T>(
 ): Promise<T> {
   const state = engineState();
   const primary = state.primary;
+  // a running build counts as a full backlog: transforms sharing its
+  // thread would slow the build (a dev server's dependency pre-bundle,
+  // which the page is waiting for) as much as the build slows them
+  const primaryLoad = primary ? primary.pending + (primary.builds ? LANE_SPAWN_BACKLOG : 0) : Infinity;
   // no primary (starting, or being replaced): any ready lane beats waiting
-  let bestLoad = primary ? primary.pending : Infinity;
+  let bestLoad = primaryLoad;
   let best: Lane | null = null;
   for (const lane of _lanes) {
     const instance = lane.instance;
@@ -366,9 +449,9 @@ export async function runEsbuildTransform<T>(
   if (
     !best &&
     primary &&
-    primary.pending >= LANE_SPAWN_BACKLOG &&
+    primaryLoad >= LANE_SPAWN_BACKLOG &&
     _lanes.length < MAX_EXTRA_LANES &&
-    _instancesCreated < MAX_INSTANCES &&
+    _moduleCopies < MAX_MODULE_COPIES &&
     _lanes.every((l) => l.instance && l.instance.pending >= LANE_SPAWN_BACKLOG) &&
     !state.customWasmURL &&
     typeof Worker === "function"

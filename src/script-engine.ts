@@ -12,7 +12,8 @@ import type { PackageManifest } from "./types/manifest";
 import { quickDigest, contentDigest } from "./helpers/digest";
 import { createImportMeta } from "./helpers/import-meta";
 import { LRUCache as _LRUCache } from "./memory-handler";
-import { bytesToBase64, bytesToHex } from "./helpers/byte-encoding";
+import { bytesToBase64, bytesToHex, decodeShortAscii } from "./helpers/byte-encoding";
+import { inSyncScope, syncScopeDepth, setSyncPromiseClass } from "./helpers/sync-scope";
 import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
 import * as pathPolyfill from "./polyfills/path";
 import {
@@ -130,6 +131,7 @@ import {
   collectEsmCjsPatches,
   hasTopLevelAwait,
   stripTopLevelAwait,
+  topLevelParser,
 } from "./syntax-transforms";
 import {
   getCachedModule,
@@ -265,16 +267,16 @@ function convertViaAst(
   filePath: string,
   moduleExportName: string,
 ): { code: string; hasTLA: boolean } {
-  const ast = acorn.parse(source, {
+  // collect import.meta and import() patches: the lexer finds them in one
+  // tokenizer pass, where walking every node of the AST cost about as much
+  // again as a large chunk's parse
+  const lexed = source.length <= LEXER_MAX_CHARS ? lexModule(source) : null;
+  const ast = (lexed ? topLevelParser() : acorn.Parser).parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
   }) as any;
   const patches: Array<[number, number, string]> = [];
 
-  // collect import.meta and import() patches: the lexer finds them in one
-  // tokenizer pass, where walking every node of the AST cost about as much
-  // again as a large chunk's parse
-  const lexed = source.length <= LEXER_MAX_CHARS ? lexModule(source) : null;
   if (lexed) {
     for (const imp of lexed[0]) {
       if (imp.d === -2) patches.push([imp.ss, imp.se, "import_meta"]);
@@ -456,6 +458,7 @@ function transformSalt(): string {
       [
         convertModuleSyntaxDetailed,
         convertViaAst,
+        topLevelParser,
         convertViaRegex,
         collectEsmCjsPatches,
         applyPatches,
@@ -551,6 +554,7 @@ var __asyncLoad = $asyncLoad;
 var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
 var __syncAwaitFn = $syncAwaitFn;
+var __asyncBody = $syncAwaitFn && $syncAwaitFn.asyncBody;
 var Promise = ${promiseVar};
 var global = globalThis;
 `;
@@ -969,8 +973,14 @@ class SyncThenable<T> {
     onFulfilled?: ((v: T) => R) | null,
     _onRejected?: ((e: any) => R) | null,
   ): SyncThenable<R> | this {
-    if (onFulfilled) return new SyncThenable(onFulfilled(this._value));
-    return this;
+    if (!onFulfilled) return this;
+    const result = onFulfilled(this._value);
+    // like a promise, adopt a thenable the callback returns (a CJS shim's
+    // `import("./index.js").then((m) => m.fn())` hands back fn's promise)
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      return result as unknown as SyncThenable<R>;
+    }
+    return new SyncThenable(result);
   }
   catch(_onRejected?: ((e: any) => unknown) | null): this {
     return this;
@@ -986,16 +996,19 @@ class SyncThenable<T> {
 // The synchronous fast-path in SyncPromise.then below is gated on this scope:
 // user-code .then calls outside of it keep native microtask timing (Node parity),
 // while require() machinery unwrapping inside it keeps working synchronously.
-let syncScopeDepth = 0;
-function inSyncScope<T>(fn: () => T): T {
-  syncScopeDepth++;
-  try {
-    return fn();
-  } finally {
-    syncScopeDepth--;
-  }
-}
+// (The scope lives in helpers/sync-scope so polyfills can see it too.)
 function syncAwait(val: unknown): unknown {
+  // like `await`, a thenable resolved with another thenable is followed on
+  // (bounded, against thenables that resolve to themselves)
+  for (let hops = 0; hops < 32; hops++) {
+    const next = syncAwaitOnce(val);
+    if (next === val || !next || typeof (next as { then?: unknown }).then !== "function") return next;
+    val = next;
+  }
+  return val;
+}
+
+function syncAwaitOnce(val: unknown): unknown {
   if (val && typeof (val as any).then === "function") {
     let resolved: unknown;
     let gotSync = false;
@@ -1010,12 +1023,17 @@ function syncAwait(val: unknown): unknown {
             rejected = true;
           }
         : undefined;
-    inSyncScope(() =>
+    const derived = inSyncScope(() =>
       (val as any).then((v: unknown) => {
         resolved = v;
         gotSync = true;
       }, onRejected),
     );
+    // val itself goes back to the caller, who handles its rejection; the
+    // promise this .then() made must not report it again as unhandled
+    if (!onRejected && derived && typeof derived.then === "function") {
+      derived.then(undefined, () => {});
+    }
     if (gotSync) return resolved;
     // `await` of a rejected promise throws at the await site
     if (rejected) throw error;
@@ -1033,6 +1051,24 @@ function syncAwait(val: unknown): unknown {
 function syncAwaitFn(thunk: () => unknown): unknown {
   return inSyncScope(() => syncAwait(thunk()));
 }
+
+/**
+ * Body of an async function under the full de-async transform
+ * (`__asyncBody(() => { BODY })`): it runs right away, its awaits unwrapped,
+ * and the function returns a promise already settled with the outcome, so
+ * callers can still .then()/.catch() it and an await of it unwraps at once.
+ */
+function asyncBody(body: () => unknown): Promise<unknown> {
+  let value: unknown;
+  try {
+    value = inSyncScope(body);
+  } catch (error) {
+    return new SyncPromiseClass((_resolve, reject) => reject(error));
+  }
+  return new SyncPromiseClass((resolve) => resolve(value));
+}
+// reaches module wrappers alongside syncAwaitFn (see buildModuleWrapper)
+(syncAwaitFn as typeof syncAwaitFn & { asyncBody?: typeof asyncBody }).asyncBody = asyncBody;
 
 // Promise subclass that resolves .then() synchronously when the executor resolves sync.
 // Needed because async functions always return native Promises, but when their body
@@ -1084,7 +1120,7 @@ function createSyncPromise(): typeof Promise {
           (value) => {
             // Adopting a SyncPromise outside a sync scope: keep native
             // adoption timing, but remember the source so it can be forced.
-            if (syncScopeDepth === 0 && isSyncPromise(value)) {
+            if (syncScopeDepth() === 0 && isSyncPromise(value)) {
               adopted = value;
               resolve(value);
               return;
@@ -1270,8 +1306,8 @@ function createSyncPromise(): typeof Promise {
       // it exists so require() machinery can unwrap synchronously. Everywhere
       // else, fall through to native microtask timing so user-visible .then
       // ordering matches Node (sync statements, then nextTick, then promises).
-      if (syncScopeDepth > 0) this._force();
-      if (syncScopeDepth > 0 && this._syncResolved && onFulfilled) {
+      if (syncScopeDepth() > 0) this._force();
+      if (syncScopeDepth() > 0 && this._syncResolved && onFulfilled) {
         try {
           const result = onFulfilled(this._syncValue as T);
           if (
@@ -1321,7 +1357,7 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && syncScopeDepth > 0) {
+      if (this._syncRejected && syncScopeDepth() > 0) {
         // consumed synchronously: the native promise must not also report
         // an unhandled rejection
         markHandled(this);
@@ -1369,7 +1405,7 @@ function createSyncPromise(): typeof Promise {
   // promises built earlier can still settle synchronously.
   const collect = (iterable: Iterable<any>): any[] => {
     const arr = Array.from(iterable);
-    if (syncScopeDepth > 0) {
+    if (syncScopeDepth() > 0) {
       for (const v of arr) if (isSyncPromise(v)) v._force();
     }
     return arr;
@@ -1515,6 +1551,7 @@ function createSyncPromise(): typeof Promise {
 }
 
 const SyncPromiseClass = createSyncPromise();
+setSyncPromiseClass(SyncPromiseClass);
 
 function toImportNamespace(loaded: unknown): Record<string, unknown> {
   if (loaded == null || (typeof loaded !== "object" && typeof loaded !== "function")) {
@@ -3095,8 +3132,8 @@ export class ScriptEngine {
 
     // Next.js createAsyncLocalStorage() prefers globalThis.AsyncLocalStorage over
     // require('async_hooks'). Install our propagation-aware polyfill so
-    // workUnitAsyncStorage / workAsyncStorage survive await boundaries.
-    asyncCtxPolyfill.installAsyncContext();
+    // workUnitAsyncStorage / workAsyncStorage survive await boundaries (the
+    // first storage constructed installs the context tracking).
     if (!(globalThis as any).AsyncLocalStorage?.__nodepodAsyncCtx) {
       (globalThis as any).AsyncLocalStorage = asyncCtxPolyfill.AsyncLocalStorage;
       ((globalThis as any).AsyncLocalStorage as any).__nodepodAsyncCtx = true;
@@ -3339,6 +3376,9 @@ export class ScriptEngine {
     class ExtendedDecoder {
       private enc: string;
       private inner: TextDecoder | null = null;
+      private utf8 = false;
+      // the inner decoder may hold a partial character from a stream call
+      private streaming = false;
 
       constructor(encoding: string = "utf-8", options?: TextDecoderOptions) {
         this.enc = encoding.toLowerCase();
@@ -3359,6 +3399,7 @@ export class ScriptEngine {
           } catch {
             this.inner = new Original("utf-8", options);
           }
+          this.utf8 = this.inner.encoding === "utf-8";
         }
       }
 
@@ -3383,12 +3424,21 @@ export class ScriptEngine {
       }
 
       decode(input?: BufferSource, options?: TextDecodeOptions): string {
+        const stream = !!options?.stream;
+        if (this.utf8 && !this.streaming && !stream && input instanceof Uint8Array) {
+          const short = decodeShortAscii(input);
+          if (short !== null) return short;
+        }
         if (!input) {
+          this.streaming = false;
           if (this.inner) return this.inner.decode(undefined, options);
           return "";
         }
         const safe = ExtendedDecoder.normalizeInput(input);
-        if (this.inner) return this.inner.decode(safe, options);
+        if (this.inner) {
+          this.streaming = stream;
+          return this.inner.decode(safe, options);
+        }
         const safeView = safe as ArrayBufferView | ArrayBuffer;
         const bytes =
           safeView instanceof ArrayBuffer

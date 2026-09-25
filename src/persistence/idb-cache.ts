@@ -29,6 +29,8 @@ export interface PackHead {
 export interface IDBSnapshotCache {
   get(packageJsonHash: string): Promise<VFSBinarySnapshot | null>;
   set(packageJsonHash: string, snapshot: VFSBinarySnapshot): Promise<void>;
+  /** set() from the files' bytes as they are, without joining them first. */
+  setParts?(packageJsonHash: string, manifest: VFSSnapshotEntry[], parts: Uint8Array[], byteLength: number): Promise<void>;
   /** The pack's manifest and version, without loading its data. */
   getManifest?(packageJsonHash: string): Promise<PackHead | null>;
   /**
@@ -181,6 +183,20 @@ function idbAcceptsBlobs(): Promise<boolean> {
   return blobSupport;
 }
 
+function joinParts(parts: Uint8Array[], byteLength: number): ArrayBuffer {
+  const only = parts.length === 1 ? parts[0] : null;
+  if (only && only.byteOffset === 0 && only.byteLength === only.buffer.byteLength && only.buffer instanceof ArrayBuffer) {
+    return only.buffer;
+  }
+  const data = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const part of parts) {
+    data.set(part, offset);
+    offset += part.byteLength;
+  }
+  return data.buffer;
+}
+
 async function toBytes(data: unknown): Promise<Uint8Array | null> {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (typeof Blob !== 'undefined' && data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
@@ -210,6 +226,35 @@ export async function openSnapshotCache(): Promise<IDBSnapshotCache | null> {
     return record;
   };
 
+  const setParts = async (
+    packageJsonHash: string,
+    manifest: VFSSnapshotEntry[],
+    parts: Uint8Array[],
+    byteLength: number,
+  ): Promise<void> => {
+    try {
+      const previous = await idbGet(db, packageJsonHash) as ManifestRecord | null;
+      const record: ManifestRecord = {
+        schema: SCHEMA,
+        manifest,
+        byteLength,
+        createdAt: Date.now(),
+        version: newVersion(),
+      };
+      // a Blob lets readRange read slices from disk; built from the
+      // parts, the bytes are copied once, not joined into a buffer first
+      const data = (await idbAcceptsBlobs()) ? new Blob(parts as BlobPart[]) : joinParts(parts, byteLength);
+      await idbWrite(
+        db,
+        [
+          [packageJsonHash, record],
+          [packageJsonHash + DATA_SUFFIX + record.version, data],
+        ],
+        previous?.version ? [packageJsonHash + DATA_SUFFIX + previous.version] : [],
+      );
+    } catch { /* silently fail — cache is optional */ }
+  };
+
   return {
     async get(packageJsonHash: string): Promise<VFSBinarySnapshot | null> {
       try {
@@ -226,28 +271,11 @@ export async function openSnapshotCache(): Promise<IDBSnapshotCache | null> {
       }
     },
 
-    async set(packageJsonHash: string, snapshot: VFSBinarySnapshot): Promise<void> {
-      try {
-        const previous = await idbGet(db, packageJsonHash) as ManifestRecord | null;
-        const record: ManifestRecord = {
-          schema: SCHEMA,
-          manifest: snapshot.manifest,
-          byteLength: snapshot.data.byteLength,
-          createdAt: Date.now(),
-          version: newVersion(),
-        };
-        // a Blob lets readRange read slices from disk
-        const data = (await idbAcceptsBlobs()) ? new Blob([snapshot.data]) : snapshot.data;
-        await idbWrite(
-          db,
-          [
-            [packageJsonHash, record],
-            [packageJsonHash + DATA_SUFFIX + record.version, data],
-          ],
-          previous?.version ? [packageJsonHash + DATA_SUFFIX + previous.version] : [],
-        );
-      } catch { /* silently fail — cache is optional */ }
+    set(packageJsonHash: string, snapshot: VFSBinarySnapshot): Promise<void> {
+      return setParts(packageJsonHash, snapshot.manifest, [new Uint8Array(snapshot.data)], snapshot.data.byteLength);
     },
+
+    setParts,
 
     async getManifest(packageJsonHash: string): Promise<PackHead | null> {
       try {

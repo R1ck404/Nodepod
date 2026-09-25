@@ -221,8 +221,9 @@ export class RegistryClient {
     }
 
     let metadata: PackageMetadata;
+    let bytes: ArrayBuffer;
     try {
-      const bytes = await readBodyWithTimeout(
+      bytes = await readBodyWithTimeout(
         resp,
         METADATA_TIMEOUT_MS,
         `registry metadata for "${name}"`,
@@ -242,8 +243,9 @@ export class RegistryClient {
       const headers = new Headers(resp.headers);
       headers.set("content-type", "application/json");
       headers.set("x-nodepod-stored-at", String(Date.now()));
-      const body = JSON.stringify(metadata);
-      void persistentCache.put(requestUrl, new Response(body, {
+      // the document as received: re-serializing the parsed copy cost as
+      // much as parsing it
+      void persistentCache.put(requestUrl, new Response(bytes, {
         status: 200,
         headers,
       })).catch(() => {});

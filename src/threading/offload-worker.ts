@@ -65,27 +65,55 @@ function uint8ToBase64(data: Uint8Array): string {
 
 // tar parser duplicated from packages/archive-extractor.ts
 
+let headerDecoder: TextDecoder | null = null;
+
 function readNullTerminated(
   buf: Uint8Array,
   start: number,
   len: number,
 ): string {
-  // TextDecoder rejects SAB-backed views, copy into a non-shared buffer first
-  const section = buf.subarray(start, start + len);
-  const zeroPos = section.indexOf(0);
-  const effLen = zeroPos >= 0 ? zeroPos : section.byteLength;
-  const copy = new Uint8Array(effLen);
-  copy.set(section.subarray(0, effLen));
-  return new TextDecoder().decode(copy);
+  const limit = Math.min(start + len, buf.length);
+  let end = start;
+  let ascii = true;
+  while (end < limit) {
+    const b = buf[end];
+    if (b === 0) break;
+    if (b >= 0x80) ascii = false;
+    end++;
+  }
+  if (end === start) return "";
+  if (ascii) return String.fromCharCode.apply(null, buf.subarray(start, end) as unknown as number[]);
+  // TextDecoder rejects SAB-backed views: slice() copies into a plain buffer
+  return (headerDecoder ??= new TextDecoder()).decode(buf.slice(start, end));
 }
 
+// parseInt(field.trim(), 8) || 0, without building the string
 function readOctalField(
   buf: Uint8Array,
   start: number,
   len: number,
 ): number {
-  const raw = readNullTerminated(buf, start, len).trim();
-  return parseInt(raw, 8) || 0;
+  const limit = Math.min(start + len, buf.length);
+  let i = start;
+  while (i < limit && (buf[i] === 0x20 || (buf[i] >= 0x09 && buf[i] <= 0x0d))) i++;
+  let sign = 1;
+  if (i < limit && (buf[i] === 0x2b || buf[i] === 0x2d)) {
+    if (buf[i] === 0x2d) sign = -1;
+    i++;
+  }
+  let value = 0;
+  let digits = 0;
+  while (i < limit && buf[i] >= 0x30 && buf[i] <= 0x37) {
+    value = value * 8 + (buf[i] - 0x30);
+    digits++;
+    i++;
+  }
+  return digits > 0 ? sign * value || 0 : 0;
+}
+
+function isZeroBlock(buf: Uint8Array): boolean {
+  for (let i = 0; i < buf.length; i++) if (buf[i] !== 0) return false;
+  return true;
 }
 
 type EntryKind = "file" | "directory" | "link" | "other";
@@ -149,7 +177,7 @@ export class ByteQueue {
 }
 
 function parseTarHeader(header: Uint8Array): Omit<TarEntry, "payload"> | null {
-  if (header.every((b) => b === 0)) return null;
+  if (isZeroBlock(header)) return null;
   const nameField = readNullTerminated(header, 0, 100);
   if (!nameField) return null;
   const byteSize = readOctalField(header, 124, 12);
@@ -218,7 +246,7 @@ function* parseTar(raw: Uint8Array): Generator<TarEntry> {
     const header = raw.slice(cursor, cursor + BLOCK);
     cursor += BLOCK;
 
-    if (header.every((b) => b === 0)) break;
+    if (isZeroBlock(header)) break;
 
     const nameField = readNullTerminated(header, 0, 100);
     if (!nameField) continue;

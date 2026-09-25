@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>nodepod: every npm create vite template, each in its own pod</title>
+  <style>
+    body { font: 13px system-ui, sans-serif; margin: 16px; background: #0f1115; color: #d8dee9; }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    .sub { color: #8a93a6; margin-bottom: 12px; }
+    #summary { margin: 8px 0 14px; font-weight: 600; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 10px; }
+    .card { background: #171a21; border: 1px solid #262b36; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+    .card.pass { border-color: #2f7d4f; } .card.fail { border-color: #a33a3a; }
+    .head { display: flex; justify-content: space-between; gap: 8px; }
+    .name { font-weight: 600; }
+    .state { font-family: ui-monospace, monospace; font-size: 12px; }
+    .pass .state { color: #6fd08c; } .fail .state { color: #f07b7b; } .run .state { color: #e6c07b; }
+    .times { color: #8a93a6; font-family: ui-monospace, monospace; font-size: 11px; }
+    pre { margin: 0; height: 84px; overflow: auto; background: #0b0d11; padding: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
+    iframe { width: 100%; height: 170px; border: 0; background: #fff; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>npm create vite: every template in its own pod</h1>
+  <div class="sub">
+    Each card boots its own Nodepod and runs create, <code>npm install</code>, <code>npm run dev</code>, then
+    fetches the page, its entry modules and their pre-bundled dependencies through the dev server.
+    Query options: <code>?only=react-ts,svelte</code>, <code>?concurrency=4</code>, <code>?manual=1</code>.
+    A browser tab can only hold so many WebAssembly memories (each dev server keeps Rolldown's, Tailwind's...):
+    if a card fails with "Cannot allocate Wasm memory", lower <code>?concurrency=</code>.
+    <code>tests/browser/create-vite-all.spec.ts</code> runs this page headless.
+  </div>
+  <button id="start">run</button>
+  <div id="summary">idle</div>
+  <div class="grid" id="grid"></div>
+
+  <script type="module">
+    import { Nodepod } from "/dist/index.mjs";
+
+    const params = new URLSearchParams(location.search);
+
+    // create-vite's own templates, scaffolded without prompts
+    const TEMPLATES = [
+      "vanilla", "vanilla-ts", "vue", "vue-ts", "react", "react-ts",
+      "react-compiler", "react-compiler-ts", "preact", "preact-ts",
+      "lit", "lit-ts", "svelte", "svelte-ts", "solid", "solid-ts",
+      "qwik", "qwik-ts",
+    ];
+    const CASES = [
+      ...TEMPLATES.map((t) => ({
+        name: t,
+        scaffold: ["npm", ["create", "vite@latest", "app", "--", "--template", t, "--no-interactive", "--no-immediate"]],
+        install: true,
+      })),
+      // create-vite's "Svelte > SvelteKit" hands over to sv; these are the
+      // answers from the prompts, given as flags
+      {
+        name: "sveltekit-demo",
+        scaffold: ["npx", ["sv@latest", "create", "--template", "demo", "--types", "ts",
+          "--add", "tailwindcss=plugins:typography", "--install", "npm", "app"]],
+        install: false,
+      },
+      {
+        name: "sveltekit-minimal",
+        scaffold: ["npx", ["sv@latest", "create", "--template", "minimal", "--types", "ts",
+          "--no-add-ons", "--install", "npm", "app"]],
+        install: false,
+      },
+      // same project, installed by `npm install` here rather than by sv
+      {
+        name: "sveltekit-minimal-direct",
+        scaffold: ["npx", ["sv@latest", "create", "--template", "minimal", "--types", "ts",
+          "--no-add-ons", "--no-install", "app"]],
+        install: true,
+      },
+    ];
+
+    const only = params.get("only")?.split(",").map((s) => s.trim()).filter(Boolean);
+    const cases = only ? CASES.filter((c) => only.includes(c.name)) : CASES;
+    const concurrency = Math.max(1, Number(params.get("concurrency")) || cases.length);
+
+    // how long each step may take before the case is reported as stuck there
+    const LIMITS = { boot: 60_000, scaffold: 240_000, install: 420_000, dev: 180_000, probe: 90_000 };
+
+    const results = {};
+    window.__createVite = { results, done: false };
+
+    const grid = document.getElementById("grid");
+    const summary = document.getElementById("summary");
+
+    function card(name) {
+      const el = document.createElement("div");
+      el.className = "card";
+      el.innerHTML = `<div class="head"><span class="name"></span><span class="state">queued</span></div>
+        <div class="times"></div><pre></pre>`;
+      el.querySelector(".name").textContent = name;
+      grid.appendChild(el);
+      const pre = el.querySelector("pre");
+      let text = "";
+      return {
+        el,
+        state(s, cls) {
+          el.querySelector(".state").textContent = s;
+          el.className = "card " + (cls || "run");
+        },
+        times(t) {
+          el.querySelector(".times").textContent = Object.entries(t).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}s`).join("  ");
+        },
+        log(chunk) {
+          // spinners redraw with \r and ANSI codes: keep what a terminal would show
+          text += chunk.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+          text = text.split("\n").map((l) => l.slice(l.lastIndexOf("\r") + 1)).join("\n");
+          if (text.length > 20000) text = text.slice(-20000);
+          pre.textContent = text;
+          pre.scrollTop = pre.scrollHeight;
+        },
+        tail: () => text.trimEnd().split("\n").slice(-12).join("\n"),
+        preview(url) {
+          const f = document.createElement("iframe");
+          f.src = url;
+          el.appendChild(f);
+        },
+      };
+    }
+
+    function withTimeout(promise, ms, what) {
+      let timer;
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(`${what} did not finish within ${ms / 1000}s`), { stuck: what })), ms); }),
+      ]).finally(() => clearTimeout(timer));
+    }
+
+    async function run(pod, ui, cmd, args, cwd, step) {
+      ui.log(`\n$ ${cmd} ${args.join(" ")}\n`);
+      const proc = await pod.spawn(cmd, args, { cwd });
+      proc.on("output", (t) => ui.log(t));
+      proc.on("error", (t) => ui.log(t));
+      try {
+        const res = await withTimeout(proc.completion, LIMITS[step], step);
+        if (res.exitCode !== 0) throw Object.assign(new Error(`${step} exited with ${res.exitCode}`), { step });
+      } catch (e) {
+        try { proc.kill(); } catch {}
+        throw e;
+      }
+    }
+
+    // the dev server works for the browser: the page, its entry modules (so
+    // plugins transform them) and the pre-bundled dependencies they import
+    async function probe(base) {
+      const get = async (path, accept) => {
+        const r = await fetch(base + path, { cache: "no-store", headers: accept ? { accept } : {} });
+        return { status: r.status, body: await r.text() };
+      };
+      const page = await get("/", "text/html,application/xhtml+xml,*/*;q=0.8");
+      if (page.status !== 200) throw new Error(`/ answered ${page.status}: ${page.body.slice(0, 200)}`);
+      const entries = new Set();
+      for (const m of page.body.matchAll(/<script[^>]*\bsrc="([^"]+)"/g)) entries.add(m[1]);
+      for (const m of page.body.matchAll(/import\(\s*["']([^"']+)["']\s*\)/g)) entries.add(m[1]);
+      for (const m of page.body.matchAll(/^\s*import\s+(?:[^'"]*from\s+)?["'](\/[^"']+)["']/gm)) entries.add(m[1]);
+      const checked = ["/ 200"];
+      const deps = new Set();
+      for (const entry of [...entries].filter((e) => e.startsWith("/") && !e.startsWith("/@vite/client"))) {
+        const mod = await get(entry);
+        if (mod.status !== 200) throw new Error(`${entry} answered ${mod.status}: ${mod.body.slice(0, 300)}`);
+        checked.push(`${entry} 200`);
+        for (const m of mod.body.matchAll(/["'](\/node_modules\/\.vite\/deps\/[^"'?]+(?:\?[^"']*)?)["']/g)) deps.add(m[1]);
+      }
+      for (const dep of [...deps].slice(0, 6)) {
+        const d = await get(dep);
+        if (d.status !== 200) throw new Error(`${dep} answered ${d.status}: ${d.body.slice(0, 300)}`);
+        checked.push(`${dep.replace(/\?.*/, "")} 200`);
+      }
+      return checked.join(", ");
+    }
+
+    function virtualBase(url) {
+      const u = new URL(url, location.href);
+      const m = u.hostname.match(/^(.+)-(\d+)\.localhost$/i);
+      return m ? `/__virtual__/${m[1]}/${m[2]}` : u.pathname.replace(/\/+$/, "");
+    }
+
+    async function runCase(c) {
+      const ui = card(c.name);
+      const t = {};
+      const started = performance.now();
+      let mark = started;
+      const lap = (k) => { const now = performance.now(); t[k] = now - mark; mark = now; ui.times(t); };
+      let step = "boot";
+      let pod = null;
+      try {
+        ui.state("booting");
+        let resolveReady;
+        const ready = new Promise((r) => { resolveReady = r; });
+        pod = await withTimeout(Nodepod.boot({
+          watermark: false,
+          workdir: "/home",
+          allowedFetchDomains: null,
+          onServerReady: (port, url) => { ui.log(`\n[server ready] port ${port}\n`); resolveReady(url); },
+        }), LIMITS.boot, "boot");
+        lap("boot");
+
+        step = "scaffold";
+        ui.state("scaffolding");
+        await run(pod, ui, c.scaffold[0], c.scaffold[1], "/home", "scaffold");
+        lap("scaffold");
+
+        if (c.install) {
+          step = "install";
+          ui.state("npm install");
+          await run(pod, ui, "npm", ["install"], "/home/app", "install");
+          lap("install");
+        }
+
+        step = "dev";
+        ui.state("npm run dev");
+        ui.log("\n$ npm run dev\n");
+        const dev = await pod.spawn("npm", ["run", "dev"], { cwd: "/home/app" });
+        dev.on("output", (s) => ui.log(s));
+        dev.on("error", (s) => ui.log(s));
+        const url = await withTimeout(Promise.race([
+          ready,
+          dev.completion.then((r) => { throw new Error(`dev server exited with ${r.exitCode} before listening`); }),
+        ]), LIMITS.dev, "dev");
+        lap("dev");
+
+        step = "probe";
+        ui.state("checking");
+        const base = virtualBase(url);
+        let detail = "";
+        let lastError = null;
+        const probeStart = performance.now();
+        // the first requests can race the dependency optimizer (504 outdated deps)
+        while (performance.now() - probeStart < LIMITS.probe) {
+          try {
+            detail = await probe(base);
+            lastError = null;
+            break;
+          } catch (e) {
+            lastError = e;
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
+        if (lastError) throw lastError;
+        lap("probe");
+        ui.preview(url);
+        ui.state(`PASS ${((performance.now() - started) / 1000).toFixed(1)}s`, "pass");
+        results[c.name] = { status: "PASS", ms: { ...t, total: performance.now() - started }, detail };
+      } catch (e) {
+        const stuck = e && e.stuck;
+        ui.state(`${stuck ? "STUCK" : "FAIL"} at ${step}`, "fail");
+        ui.log(`\n!! ${e && e.message}\n`);
+        results[c.name] = {
+          status: stuck ? "STUCK" : "FAIL",
+          step,
+          error: String(e && e.message || e),
+          ms: { ...t, total: performance.now() - started },
+          tail: ui.tail(),
+        };
+      }
+    }
+
+    async function start() {
+      document.getElementById("start").disabled = true;
+      const queue = [...cases];
+      const t0 = performance.now();
+      const tick = setInterval(() => {
+        const done = Object.values(results);
+        const pass = done.filter((r) => r.status === "PASS").length;
+        summary.textContent = `${done.length}/${cases.length} done, ${pass} passed, ${done.length - pass} failed  (${((performance.now() - t0) / 1000).toFixed(0)}s)`;
+      }, 500);
+      await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+        while (queue.length) await runCase(queue.shift());
+      }));
+      clearInterval(tick);
+      const done = Object.values(results);
+      const pass = done.filter((r) => r.status === "PASS").length;
+      summary.textContent = `finished: ${pass}/${cases.length} passed in ${((performance.now() - t0) / 1000).toFixed(0)}s`;
+      window.__createVite.done = true;
+    }
+
+    document.getElementById("start").addEventListener("click", start);
+    if (params.get("manual") !== "1") start();
+  </script>
+</body>
+</html>
