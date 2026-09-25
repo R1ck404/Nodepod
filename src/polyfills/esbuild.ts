@@ -6,6 +6,8 @@ import {
   getEsbuild,
   getEsbuildIfReady,
   acquireEsbuild,
+  acquireDedicatedEsbuild,
+  type EsbuildLease,
   runEsbuildTransform,
 } from "../helpers/esbuild-engine";
 import { stripTopLevelAwait } from "../syntax-transforms";
@@ -74,6 +76,7 @@ export interface TransformConfig {
   loader?: "js" | "jsx" | "ts" | "tsx" | "json" | "css";
   format?: "iife" | "cjs" | "esm";
   target?: string | string[];
+  supported?: Record<string, boolean>;
   minify?: boolean;
   sourcemap?: boolean | "inline" | "external";
   jsx?: "transform" | "preserve";
@@ -100,6 +103,7 @@ export interface BundleConfig {
   format?: "iife" | "cjs" | "esm";
   platform?: "browser" | "node" | "neutral";
   target?: string | string[];
+  supported?: Record<string, boolean>;
   minify?: boolean;
   sourcemap?: boolean | "inline" | "external";
   external?: string[];
@@ -144,11 +148,39 @@ async function currentEngine(): Promise<typeof import("esbuild-wasm")> {
   return getEsbuild({ wasmURL: wasmBinaryUrl });
 }
 
+// esbuild 0.27 moved Safari and iOS destructuring support from 10 to
+// 14.1 / 14.5, and destructuring can't be lowered: every destructuring
+// pattern became an error for targets in that gap. Vite 5-7 were built on
+// earlier releases and target safari14 by default (dep optimizer and build),
+// so for such targets destructuring counts as supported, as it did in the
+// esbuild those tools depend on. An explicit `supported.destructuring` wins.
+const DESTRUCTURING_GAP = /^(safari|ios)(\d+)(?:\.(\d+))?/i;
+export function withEsbuildCompat<T extends { target?: string | string[]; supported?: Record<string, boolean> }>(
+  cfg: T,
+): T;
+export function withEsbuildCompat<T extends { target?: string | string[]; supported?: Record<string, boolean> }>(
+  cfg: T | undefined,
+): T | undefined;
+export function withEsbuildCompat<T extends { target?: string | string[]; supported?: Record<string, boolean> }>(
+  cfg: T | undefined,
+): T | undefined {
+  if (!cfg?.target || (cfg.supported && "destructuring" in cfg.supported)) return cfg;
+  const targets = Array.isArray(cfg.target) ? cfg.target : String(cfg.target).split(",");
+  const inGap = targets.some((t) => {
+    const m = DESTRUCTURING_GAP.exec(String(t).trim());
+    if (!m) return false;
+    const version = Number(m[2]) + Number(m[3] ?? 0) / 100;
+    return version >= 10 && version < (m[1].toLowerCase() === "ios" ? 14.05 : 14.01);
+  });
+  return inGap ? { ...cfg, supported: { ...cfg.supported, destructuring: true } } : cfg;
+}
+
 export async function transform(
   source: string,
   cfg?: TransformConfig,
 ): Promise<TransformOutput> {
   const h = getRegistry().register("EsbuildOp");
+  cfg = withEsbuildCompat(cfg);
   try {
     await currentEngine();
     return await runEsbuildTransform(
@@ -202,11 +234,22 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
   // register before initialize() - the cdn import inside isn't tracked
   // so the loop can drain mid-await if we do it the other way round
   const h = getRegistry().register("EsbuildOp");
-  let inputBytes = cfg.stdin?.contents?.length ?? 0;
-  let leased: Awaited<ReturnType<typeof acquireEsbuild>> | null = null;
+  cfg = withEsbuildCompat(cfg);
   try {
     await currentEngine();
-    leased = await acquireEsbuild();
+    const split = await buildDependencyGroups(cfg);
+    if (split) return split;
+    return await buildOn(await acquireEsbuild({ build: true }), cfg, true);
+  } finally {
+    h.close();
+  }
+}
+
+// One build on a leased instance (released when it ends). Outputs are
+// written to the volume when `write` and the config asks for it.
+async function buildOn(leased: EsbuildLease, cfg: BundleConfig, write: boolean): Promise<BundleOutput> {
+  let inputBytes = cfg.stdin?.contents?.length ?? 0;
+  try {
     const engine = leased.engine;
 
     const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions);
@@ -238,22 +281,250 @@ export async function build(cfg: BundleConfig): Promise<BundleOutput> {
 
     stripNamespacePrefixes(raw);
 
-    if (shouldWrite && raw.outputFiles && volumeRef) {
-      for (const f of raw.outputFiles) {
-        const outPath = f.path.startsWith("/") ? f.path : workDir + "/" + f.path;
-        const dir = outPath.substring(0, outPath.lastIndexOf("/"));
-        if (dir && !volumeRef.existsSync(dir)) {
-          volumeRef.mkdirSync(dir, { recursive: true });
-        }
-        volumeRef.writeFileSync(outPath, f.text);
-      }
-    }
+    if (write && shouldWrite) writeOutputs(raw, workDir);
 
     return raw;
   } finally {
-    leased?.release(inputBytes);
-    h.close();
+    leased.release(inputBytes);
   }
+}
+
+function writeOutputs(raw: BundleOutput, workDir: string): void {
+  if (!raw.outputFiles || !volumeRef) return;
+  for (const f of raw.outputFiles) {
+    const outPath = f.path.startsWith("/") ? f.path : workDir + "/" + f.path;
+    const dir = outPath.substring(0, outPath.lastIndexOf("/"));
+    if (dir && !volumeRef.existsSync(dir)) {
+      volumeRef.mkdirSync(dir, { recursive: true });
+    }
+    // the bytes as esbuild made them: `text` decodes them only for the
+    // volume to encode them again (megabytes, for a dependency pre-bundle)
+    volumeRef.writeFileSync(outPath, f.contents ?? f.text);
+  }
+}
+
+// ── Parallel dependency pre-bundle ──
+// Vite pre-bundles all of an app's dependencies in one build, and a build
+// runs on one esbuild-wasm instance: Go compiled to wasm, one thread. Entries
+// whose dependency closures share no package (a UI kit and the React it
+// uses, next to three.js, date-fns, rxjs...) are bundled as separate builds
+// on instances of their own, at the same time. The split result is only
+// used if the builds' module sets turn out disjoint: then it is the output
+// the single build gives, with chunks and helpers per group. Anything else
+// (an overlap the package manifests didn't show, an error) runs the single
+// build as before.
+const SPLIT_MAX_BUILDS = 4;
+
+function isDependencyPrebundle(cfg: BundleConfig): boolean {
+  const c = cfg as BundleConfig & { splitting?: boolean; metafile?: boolean };
+  return (
+    Array.isArray(cfg.entryPoints) &&
+    cfg.entryPoints.length >= 2 &&
+    cfg.bundle === true &&
+    c.splitting === true &&
+    c.metafile === true &&
+    cfg.format === "esm" &&
+    !!cfg.outdir &&
+    !cfg.stdin &&
+    (cfg.plugins ?? []).some((p) => (p as { name?: string } | null)?.name === "vite:dep-pre-bundle")
+  );
+}
+
+// Vite's flattenId (optimizer entry names)
+function flattenId(id: string): string {
+  return id.replace(/[/:]/g, "_").replace(/\./g, "__").replace(/(\s*>\s*)/g, "___");
+}
+
+function packageNamesIn(vol: MemoryVolume, nodeModules: string): string[] {
+  const names: string[] = [];
+  let entries: string[];
+  try {
+    entries = vol.readdirSync(nodeModules) as string[];
+  } catch {
+    return names;
+  }
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    if (name.startsWith("@")) {
+      try {
+        for (const sub of vol.readdirSync(`${nodeModules}/${name}`) as string[]) names.push(`${name}/${sub}`);
+      } catch {
+        /* unreadable scope */
+      }
+    } else {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+// node's lookup of a package from inside `fromDir`
+function packageDirFrom(vol: MemoryVolume, name: string, fromDir: string, root: string): string | null {
+  for (let dir = fromDir; ; ) {
+    const candidate = `${dir === "/" ? "" : dir}/node_modules/${name}`;
+    if (vol.existsSync(`${candidate}/package.json`)) return candidate;
+    if (dir === "/" || dir.length <= root.length) break;
+    const up = dir.substring(0, dir.lastIndexOf("/")) || "/";
+    // a package's own node_modules dir holds its children, not itself
+    dir = up.endsWith("/node_modules") ? up.substring(0, up.lastIndexOf("/")) || "/" : up;
+  }
+  return null;
+}
+
+// Groups of entries whose package closures don't overlap, largest first;
+// null when the entries can't be mapped to installed packages
+export function planDependencyGroups(vol: MemoryVolume, cfg: BundleConfig): Array<{ entries: string[]; packages: number }> | null {
+  const root = (cfg.absWorkingDir || resolveWorkingDir()).replace(/\/+$/, "") || "/";
+  const entries = cfg.entryPoints as string[];
+  const byFlat = new Map<string, string>();
+  for (const name of packageNamesIn(vol, `${root === "/" ? "" : root}/node_modules`)) byFlat.set(flattenId(name), name);
+
+  const closures: Array<Set<string>> = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string" || entry.includes("___")) return null;
+    // the longest installed package whose flattened name starts the entry
+    let pkg: string | null = null;
+    for (let end = entry.length; end > 0; end = entry.lastIndexOf("_", end - 1)) {
+      const hit = byFlat.get(entry.slice(0, end));
+      if (hit) {
+        pkg = hit;
+        break;
+      }
+      if (end <= 0) break;
+    }
+    if (!pkg) return null;
+    const start = packageDirFrom(vol, pkg, root, root);
+    if (!start) return null;
+    const closure = new Set<string>([start]);
+    const queue = [start];
+    while (queue.length > 0) {
+      const dir = queue.pop()!;
+      let manifest: Record<string, Record<string, string> | undefined>;
+      try {
+        manifest = JSON.parse(vol.readFileSync(`${dir}/package.json`, "utf8") as string);
+      } catch {
+        continue;
+      }
+      for (const field of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+        for (const dep of Object.keys(manifest[field] ?? {})) {
+          const depDir = packageDirFrom(vol, dep, dir, root);
+          if (depDir && !closure.has(depDir)) {
+            closure.add(depDir);
+            queue.push(depDir);
+          }
+        }
+      }
+    }
+    closures.push(closure);
+  }
+
+  // union entries that share any package
+  const parent = entries.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const owner = new Map<string, number>();
+  closures.forEach((closure, i) => {
+    for (const dir of closure) {
+      const j = owner.get(dir);
+      if (j === undefined) owner.set(dir, i);
+      else parent[find(i)] = find(j);
+    }
+  });
+  const groups = new Map<number, { entries: string[]; packages: Set<string> }>();
+  entries.forEach((entry, i) => {
+    const r = find(i);
+    let g = groups.get(r);
+    if (!g) groups.set(r, (g = { entries: [], packages: new Set() }));
+    g.entries.push(entry);
+    for (const dir of closures[i]) g.packages.add(dir);
+  });
+  return [...groups.values()]
+    .map((g) => ({ entries: g.entries, packages: g.packages.size }))
+    .sort((a, b) => b.packages - a.packages);
+}
+
+async function buildDependencyGroups(cfg: BundleConfig): Promise<BundleOutput | null> {
+  if (!volumeRef || !isDependencyPrebundle(cfg)) return null;
+  const cores = (globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 2;
+  const maxBuilds = Math.min(SPLIT_MAX_BUILDS, Math.max(1, cores - 2));
+  if (maxBuilds < 2) return null;
+  let groups: Array<{ entries: string[]; packages: number }> | null;
+  try {
+    groups = planDependencyGroups(volumeRef, cfg);
+  } catch {
+    return null;
+  }
+  if (!groups || groups.length < 2) return null;
+
+  // the biggest group on its own; the rest spread over the other builds,
+  // each onto the least loaded (by package count)
+  const slots: string[][] = [groups[0].entries.slice()];
+  const rest = groups.slice(1);
+  const others = Math.min(maxBuilds - 1, rest.length);
+  const load: number[] = [];
+  for (let i = 0; i < others; i++) {
+    slots.push([]);
+    load.push(0);
+  }
+  for (const g of rest) {
+    const i = load.indexOf(Math.min(...load));
+    slots[1 + i].push(...g.entries);
+    load[i] += g.packages;
+  }
+
+  const acquired = await Promise.allSettled(
+    slots.map((_, i) => (i === 0 ? acquireEsbuild({ build: true }) : acquireDedicatedEsbuild())),
+  );
+  const leases = acquired.map((a) => (a.status === "fulfilled" ? a.value : null));
+  if (leases.some((l) => !l)) {
+    for (const l of leases) l?.release();
+    return null;
+  }
+  // every group finishes before a failure falls back, so the single build
+  // doesn't run alongside the rest of them
+  const built = await Promise.allSettled(
+    slots.map((entryPoints, i) => buildOn(leases[i]!, { ...cfg, entryPoints }, false)),
+  );
+  // the single build reports the error as it always has
+  if (built.some((b) => b.status === "rejected")) return null;
+  const results = built.map((b) => (b as PromiseFulfilledResult<BundleOutput>).value);
+
+  const merged = mergeGroupResults(results);
+  if (!merged) return null;
+  if (cfg.write !== false) writeOutputs(merged, cfg.absWorkingDir || resolveWorkingDir());
+  return merged;
+}
+
+// one result from disjoint group builds, or null if they weren't disjoint
+export function mergeGroupResults(results: BundleOutput[]): BundleOutput | null {
+  const inputs: Record<string, unknown> = {};
+  const outputs: Record<string, unknown> = {};
+  const files = new Map<string, { path: string; contents: Uint8Array; text: string }>();
+  const warnings: unknown[] = [];
+  for (const r of results) {
+    if (!r.metafile?.inputs || !r.metafile.outputs || !r.outputFiles) return null;
+    for (const [path, info] of Object.entries(r.metafile.inputs)) {
+      if (path in inputs) return null;
+      inputs[path] = info;
+    }
+    for (const [path, info] of Object.entries(r.metafile.outputs)) {
+      // shared runtime-helper chunks come out byte-identical, same name
+      if (path in outputs && JSON.stringify(outputs[path]) !== JSON.stringify(info)) return null;
+      outputs[path] = info;
+    }
+    for (const f of r.outputFiles) {
+      const known = files.get(f.path);
+      if (known && known.text !== f.text) return null;
+      files.set(f.path, f);
+    }
+    warnings.push(...(r.warnings ?? []));
+  }
+  return {
+    ...results[0],
+    errors: [],
+    warnings,
+    outputFiles: [...files.values()],
+    metafile: { ...results[0].metafile, inputs, outputs },
+  };
 }
 
 export async function formatMessages(

@@ -23,6 +23,8 @@ export interface ResolutionConfig {
   devDependencies?: boolean;
   optionalDependencies?: boolean;
   onProgress?: (msg: string) => void;
+  /** A package version was chosen for a place in the tree (it may be placed again elsewhere). */
+  onResolved?: (dep: ResolvedDependency) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,16 +44,28 @@ export interface SemverComponents {
 
 const SEMVER_PATTERN = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/;
 
+// A resolution compares the same version strings over and over (every sort
+// of a package's thousands of versions, every range check): parse each once.
+// The results are shared, callers only read them.
+const parsedVersions = new Map<string, SemverComponents | null>();
+const PARSED_VERSIONS_MAX = 200_000;
+
 // Returns null for unparseable strings
 export function parseSemver(raw: string): SemverComponents | null {
+  const known = parsedVersions.get(raw);
+  if (known !== undefined) return known;
   const m = raw.match(SEMVER_PATTERN);
-  if (!m) return null;
-  return {
-    major: Number(m[1]),
-    minor: Number(m[2]),
-    patch: Number(m[3]),
-    prerelease: m[4],
-  };
+  const parsed = m
+    ? {
+        major: Number(m[1]),
+        minor: Number(m[2]),
+        patch: Number(m[3]),
+        prerelease: m[4],
+      }
+    : null;
+  if (parsedVersions.size >= PARSED_VERSIONS_MAX) parsedVersions.clear();
+  parsedVersions.set(raw, parsed);
+  return parsed;
 }
 
 // Standard three-way comparison: negative if left < right, 0 if equal, positive if left > right
@@ -271,11 +285,26 @@ export function pickBestMatch(
   available: string[],
   range: string,
 ): string | null {
-  const descending = [...available].sort((a, b) => compareSemver(b, a));
+  return pickFromDescending([...available].sort((a, b) => compareSemver(b, a)), range);
+}
+
+function pickFromDescending(descending: readonly string[], range: string): string | null {
   for (const candidate of descending) {
     if (satisfiesRange(candidate, range)) return candidate;
   }
   return null;
+}
+
+// a package's versions, highest first, sorted once per metadata document
+const descendingVersions = new WeakMap<object, readonly string[]>();
+
+function pickFromMetadata(metadata: PackageMetadata, range: string): string | null {
+  let descending = descendingVersions.get(metadata.versions);
+  if (!descending) {
+    descending = Object.keys(metadata.versions).sort((a, b) => compareSemver(b, a));
+    descendingVersions.set(metadata.versions, descending);
+  }
+  return pickFromDescending(descending, range);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +392,7 @@ const PREFETCH_CONCURRENCY = 24;
 function pickVersion(metadata: PackageMetadata, range: string): string | null {
   if (range === "latest" || range === "*") return metadata["dist-tags"].latest ?? null;
   if (metadata["dist-tags"][range]) return metadata["dist-tags"][range];
-  return pickBestMatch(Object.keys(metadata.versions), range);
+  return pickFromMetadata(metadata, range);
 }
 
 function prefetchMetadata(
@@ -644,7 +673,6 @@ async function installPackageAt(
   config.onProgress?.(`Resolving ${fetchName}@${versionConstraint}`);
 
   const metadata = await registry.fetchManifest(fetchName);
-  const allVersions = Object.keys(metadata.versions);
 
   let chosenVersion: string;
   if (versionConstraint === "latest" || versionConstraint === "*") {
@@ -652,7 +680,7 @@ async function installPackageAt(
   } else if (metadata["dist-tags"][versionConstraint]) {
     chosenVersion = metadata["dist-tags"][versionConstraint];
   } else {
-    const best = pickBestMatch(allVersions, versionConstraint);
+    const best = pickFromMetadata(metadata, versionConstraint);
     if (!best) {
       throw new Error(
         `Could not find a version of "${fetchName}" matching "${versionConstraint}"`,
@@ -672,6 +700,7 @@ async function installPackageAt(
     shasum: versionInfo.dist.shasum,
   };
   completed.set(placementKey, resolved);
+  config.onResolved?.(resolved);
 
   if (walkEdges) {
     await walkEdgesForPackage(placementKey, installName, versionInfo, state);

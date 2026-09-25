@@ -86,8 +86,19 @@ function call(
     && target.includes("/node_modules/")
     ? WASM_RECOVERY_TIMEOUT_MS
     : CALL_TIMEOUT_MS;
-  const waited = Atomics.wait(ctrl, 0, -1, timeout);
-  if (waited === "timed-out") {
+  // wait until this call is answered, not just until woken: the answer to
+  // the call before can have been read before its notify came (the host
+  // notifies after storing it), and that notify then wakes this wait
+  const deadline = Date.now() + timeout;
+  let timedOut = false;
+  while (Atomics.load(ctrl, 0) === -1) {
+    const left = deadline - Date.now();
+    if (left <= 0 || Atomics.wait(ctrl, 0, -1, left) === "timed-out") {
+      timedOut = true;
+      break;
+    }
+  }
+  if (timedOut) {
     if (retained && state.sab === sab) {
       state.sab = null;
       state.capacity = 0;
@@ -223,7 +234,7 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
 
     statMany(paths: string[]) {
       let res = call(state, port, "statMany", [paths], DEFAULT_PAYLOAD);
-      if (res && res.ok && res.truncated) {
+      if (res && res.truncated) {
         res = call(state, port, "statMany", [paths], res.fullLength + 1024);
       }
       if (!res || !res.ok) return null;
@@ -254,7 +265,7 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
         [path],
         knownSize > DEFAULT_PAYLOAD ? knownSize + 1024 : DEFAULT_PAYLOAD,
       );
-      if (res && res.ok && res.truncated) {
+      if (res && res.truncated) {
         // retry with a buffer sized to the reported full length
         res = call(state, port, "readFileSync", [path], res.fullLength + 1024);
       }
@@ -267,7 +278,7 @@ export function createLazyFsClient(port: MessagePort): VolumeMissHandler {
 
     readdir(path: string) {
       let res = call(state, port, "readdirWithTypes", [path], DEFAULT_PAYLOAD);
-      if (res && res.ok && res.truncated) {
+      if (res && res.truncated) {
         res = call(state, port, "readdirWithTypes", [path], res.fullLength + 1024);
       }
       if (!res || !res.ok) return null;

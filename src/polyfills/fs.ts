@@ -19,6 +19,7 @@ import { Buffer } from "./buffer";
 import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
 import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop";
 import { setImmediate as scheduleImmediate } from "./timers";
+import { settledPromise, settledResolve, settledReject } from "../helpers/sync-scope";
 
 export type { FileStat, FileWatchHandle, WatchCallback, WatchEventKind };
 
@@ -1349,7 +1350,7 @@ export function buildFileSystemBridge(
       target: unknown,
       encOrOpts?: string | { encoding?: string | null },
     ): Promise<Buffer | string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           const p = abs(target);
           let enc: string | undefined;
@@ -1368,7 +1369,7 @@ export function buildFileSystemBridge(
       data: string | Uint8Array,
       opts?: WriteFileOptions,
     ): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           bridge.writeFileSync(target as PathArg, data, opts);
           ok();
@@ -1378,7 +1379,7 @@ export function buildFileSystemBridge(
       });
     },
     stat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(runStat(() => volume.statSync(abs(target)), opts));
         } catch (e) {
@@ -1390,7 +1391,7 @@ export function buildFileSystemBridge(
       target: unknown,
       opts?: { recursive?: boolean; mode?: number },
     ): Promise<string | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.mkdirSync(abs(target), opts));
         } catch (e) {
@@ -1399,7 +1400,7 @@ export function buildFileSystemBridge(
       });
     },
     unlink(target: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.unlinkSync(abs(target));
           ok();
@@ -1409,7 +1410,7 @@ export function buildFileSystemBridge(
       });
     },
     rmdir(target: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.rmdirSync(abs(target) as string);
           ok();
@@ -1419,7 +1420,7 @@ export function buildFileSystemBridge(
       });
     },
     rename(src: unknown, dest: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.renameSync(abs(src), abs(dest));
           ok();
@@ -1429,7 +1430,7 @@ export function buildFileSystemBridge(
       });
     },
     access(target: unknown, mode?: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.accessSync(abs(target), mode);
           ok();
@@ -1439,7 +1440,7 @@ export function buildFileSystemBridge(
       });
     },
     realpath(target: unknown): Promise<string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.realpathSync(abs(target)));
         } catch (e) {
@@ -1448,7 +1449,7 @@ export function buildFileSystemBridge(
       });
     },
     copyFile(src: unknown, dest: unknown, mode: number = 0): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.copyFileSync(abs(src), abs(dest), mode);
           ok();
@@ -1458,7 +1459,7 @@ export function buildFileSystemBridge(
       });
     },
     appendFile(target: unknown, data: string | Uint8Array): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.appendFileSync(abs(target), data);
           ok();
@@ -1468,7 +1469,7 @@ export function buildFileSystemBridge(
       });
     },
     symlink(target: unknown, path: unknown, type?: string): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
           ok();
@@ -1478,7 +1479,7 @@ export function buildFileSystemBridge(
       });
     },
     readlink(target: unknown): Promise<string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.readlinkSync(abs(target)));
         } catch (e) {
@@ -1487,7 +1488,7 @@ export function buildFileSystemBridge(
       });
     },
     link(existingPath: unknown, newPath: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.linkSync(abs(existingPath), abs(newPath));
           ok();
@@ -1497,7 +1498,7 @@ export function buildFileSystemBridge(
       });
     },
     chmod(target: unknown, mode: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.chmodSync(abs(target), mode);
           ok();
@@ -1507,7 +1508,7 @@ export function buildFileSystemBridge(
       });
     },
     chown(target: unknown, uid: number, gid: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.chownSync(abs(target), uid, gid);
           ok();
@@ -1517,7 +1518,7 @@ export function buildFileSystemBridge(
       });
     },
     truncate(target: unknown, len?: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.truncateSync(abs(target), len);
           ok();
@@ -1557,7 +1558,7 @@ export function buildFileSystemBridge(
       });
     },
     lstat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(runStat(() => volume.lstatSync(abs(target)), opts));
         } catch (e) {
@@ -1568,25 +1569,25 @@ export function buildFileSystemBridge(
     utimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
       try {
         volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     lchown(target: unknown, uid: number, gid: number): Promise<void> {
       try {
         volume.lchownSync(abs(target), uid, gid);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     lutimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
       try {
         volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     opendir(target: unknown, _opts?: unknown): Promise<Dir> {
@@ -1594,9 +1595,9 @@ export function buildFileSystemBridge(
         const p = abs(target);
         const names = volume.readdirSync(p);
         const entries = toDirents(p, names);
-        return Promise.resolve(new Dir(p, entries));
+        return settledResolve(new Dir(p, entries));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     readdir(
@@ -1608,11 +1609,11 @@ export function buildFileSystemBridge(
         const names = volume.readdirSync(p);
         const o = typeof opts === "string" ? { encoding: opts } : opts;
         if (o?.withFileTypes) {
-          return Promise.resolve(toDirents(p, names));
+          return settledResolve(toDirents(p, names));
         }
-        return Promise.resolve(encodeReaddirNames(names, o?.encoding));
+        return settledResolve(encodeReaddirNames(names, o?.encoding));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     glob(
@@ -1626,9 +1627,9 @@ export function buildFileSystemBridge(
           return {
             next() {
               if (i < matched.length) {
-                return Promise.resolve({ value: matched[i++], done: false as const });
+                return settledResolve({ value: matched[i++], done: false as const });
               }
-              return Promise.resolve({ value: undefined as never, done: true as const });
+              return settledResolve({ value: undefined as never, done: true as const });
             },
           };
         },
@@ -1638,16 +1639,16 @@ export function buildFileSystemBridge(
       try {
         const f = flags ?? "r";
         const fd = bridge.openSync(abs(target), f, _mode);
-        return Promise.resolve(new FileHandle(fd));
+        return settledResolve(new FileHandle(fd));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     mkdtemp(prefix: string): Promise<string> {
       try {
-        return Promise.resolve(bridge.mkdtempSync(prefix));
+        return settledResolve(bridge.mkdtempSync(prefix));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     watch(
@@ -1682,9 +1683,9 @@ export function buildFileSystemBridge(
           return {
             next(): Promise<IteratorResult<{ eventType: string; filename: string | null }>> {
               if (events.length > 0) {
-                return Promise.resolve({ value: events.shift()!, done: false });
+                return settledResolve({ value: events.shift()!, done: false });
               }
-              if (closed) return Promise.resolve({ value: undefined as any, done: true });
+              if (closed) return settledResolve({ value: undefined as any, done: true });
               return new Promise<IteratorResult<{ eventType: string; filename: string | null }>>((res) => {
                 resolve = () => {
                   if (events.length > 0) res({ value: events.shift()!, done: false });
@@ -1694,14 +1695,14 @@ export function buildFileSystemBridge(
             },
             return(): Promise<IteratorResult<{ eventType: string; filename: string | null }>> {
               releaseAll();
-              return Promise.resolve({ value: undefined as any, done: true });
+              return settledResolve({ value: undefined as any, done: true });
             },
           };
         },
       };
     },
     statfs(_target: unknown): Promise<StatFs> {
-      return Promise.resolve(new StatFs());
+      return settledResolve(new StatFs());
     },
     cp(
       src: unknown,
@@ -1710,9 +1711,9 @@ export function buildFileSystemBridge(
     ): Promise<void> {
       try {
         bridge.cpSync(src, dest, opts);
-        return Promise.resolve();
+        return settledResolve();
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     FileHandle: FileHandle as any,

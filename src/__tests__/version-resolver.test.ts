@@ -532,3 +532,22 @@ describe("resolveDependencyTree — nested placement", () => {
     expect(tree.size).toBe(2);
   });
 });
+
+describe("resolveDependencyTree — onResolved", () => {
+  it("reports every chosen package version as the tree resolves", async () => {
+    const registry = makeMockRegistry({
+      parent: [{ version: "1.0.0", dependencies: { child: "^2.0.0" } }],
+      child: [{ version: "2.1.0" }, { version: "3.0.0" }],
+    });
+    const seen: string[] = [];
+    const tree = await resolveDependencyTree("parent", "^1.0.0", {
+      registry,
+      onResolved: (dep) => seen.push(`${dep.name}@${dep.version} ${dep.tarballUrl}`),
+    });
+    expect(tree.size).toBe(2);
+    expect(seen.sort()).toEqual([
+      "child@2.1.0 https://registry.example/child/-/child-2.1.0.tgz",
+      "parent@1.0.0 https://registry.example/parent/-/parent-1.0.0.tgz",
+    ]);
+  });
+});

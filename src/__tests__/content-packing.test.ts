@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import pako from "pako";
 import { MemoryVolume } from "../memory-volume";
+import { beginForegroundActivity, noteForegroundActivity } from "../helpers/foreground-activity";
 
 // deterministic text that compresses like source code
 function source(seed: number, bytes: number): string {
@@ -176,6 +178,224 @@ describe("content packing of mounted packs", () => {
       const read = vol.peekFileSync(path);
       expect(read).toEqual(bytes);
       if (!path.endsWith("index.js")) expect(read.buffer.byteLength).toBe(read.byteLength);
+    }
+  });
+});
+
+describe("content packing with an off-thread deflater", () => {
+  // deflate-raw like the worker's CompressionStream; each call can be held
+  function deflater() {
+    const held: Array<() => void> = [];
+    let hold = false;
+    return {
+      calls: 0,
+      hold(on: boolean) {
+        hold = on;
+        if (!on) for (const release of held.splice(0)) release();
+      },
+      deflate(bytes: Uint8Array): Promise<Uint8Array> {
+        this.calls++;
+        const out = pako.deflateRaw(bytes);
+        return new Promise((resolve) => {
+          if (hold) held.push(() => resolve(out));
+          else resolve(out);
+        });
+      },
+    };
+  }
+
+  function packages(vol: MemoryVolume) {
+    vol.writeFileSync("/app/node_modules/lib/index.js", source(1, 40_000));
+    vol.writeFileSync("/app/node_modules/lib/util.js", source(2, 40_000));
+    vol.writeFileSync("/app/node_modules/lib/more.js", source(5, 40_000));
+    vol.writeFileSync("/app/node_modules/lib/index.d.ts", source(3, 40_000));
+    vol.writeFileSync("/app/node_modules/lib/index.js.map", source(4, 40_000));
+    vol.writeFileSync("/app/node_modules/big/bundle.js", source(6, 600_000));
+  }
+
+  it("packs through the deflater and reads back byte for byte", async () => {
+    const d = deflater();
+    const vol = new MemoryVolume();
+    vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+    packages(vol);
+    await vol.packContentNow();
+    expect(d.calls).toBeGreaterThan(0);
+    expect(vol.getStats().packedFiles).toBe(6);
+    expect(vol.readFileSync("/app/node_modules/big/bundle.js", "utf8")).toBe(source(6, 600_000));
+    expect(vol.readFileSync("/app/node_modules/lib/util.js", "utf8")).toBe(source(2, 40_000));
+  });
+
+  it("unpacks a read file's chunk neighbours, not rarely read files", async () => {
+    const vol = new MemoryVolume();
+    const d = deflater();
+    vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+    packages(vol);
+    await vol.packContentNow();
+    vol.readFileSync("/app/node_modules/lib/index.js");
+    const stats = vol.getStats();
+    // index.js, util.js and more.js share a chunk; the map and the
+    // declarations sit in one of their own, the big file alone
+    expect(stats.packedFiles).toBe(3);
+    expect(vol.peekFileSync("/app/node_modules/lib/more.js")).toEqual(new TextEncoder().encode(source(5, 40_000)));
+    expect(vol.readFileSync("/app/node_modules/lib/index.js.map", "utf8")).toBe(source(4, 40_000));
+  });
+
+  it("leaves files read or written while their chunk was away", async () => {
+    const vol = new MemoryVolume();
+    const d = deflater();
+    vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+    packages(vol);
+    d.hold(true);
+    const round = vol.packContentNow();
+    // let the round hand its groups over
+    for (let i = 0; i < 20 && d.calls < 3; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(d.calls).toBeGreaterThanOrEqual(3);
+    vol.readFileSync("/app/node_modules/lib/util.js");
+    vol.writeFileSync("/app/node_modules/lib/more.js", "rewritten");
+    d.hold(false);
+    await round;
+    expect(vol.readFileSync("/app/node_modules/lib/more.js", "utf8")).toBe("rewritten");
+    expect(vol.readFileSync("/app/node_modules/lib/util.js", "utf8")).toBe(source(2, 40_000));
+    expect(vol.readFileSync("/app/node_modules/lib/index.js", "utf8")).toBe(source(1, 40_000));
+    // util.js was read: not packed; the others that weren't touched were
+    expect(vol.getStats().packedFiles).toBe(3);
+  });
+
+  it("keeps a file read during a round out of the next round too", async () => {
+    const vol = new MemoryVolume();
+    const d = deflater();
+    vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+    packages(vol);
+    d.hold(true);
+    const round = vol.packContentNow();
+    for (let i = 0; i < 20 && d.calls < 3; i++) await new Promise((r) => setTimeout(r, 0));
+    vol.readFileSync("/app/node_modules/lib/util.js");
+    d.hold(false);
+    await round;
+    expect(vol.getStats().packedFiles).toBe(5);
+    // the round didn't stop for the read, but the file is still in use
+    await vol.packContentNow();
+    expect(vol.getStats().packedFiles).toBe(5);
+    // not read since: packed
+    await vol.packContentNow();
+    expect(vol.getStats().packedFiles).toBe(6);
+    expect(vol.readFileSync("/app/node_modules/lib/util.js", "utf8")).toBe(source(2, 40_000));
+  });
+
+  it("starts a round for packages an install moved into node_modules", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      // extracted where the installer stages it, then moved into place
+      vol.writeFileSync("/.nodepod/install/x/index.js", source(7, 1_200_000));
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(d.calls).toBe(0);
+      vol.renameSync("/.nodepod/install/x", "/app/node_modules/huge");
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(d.calls).toBeGreaterThan(0);
+      expect(vol.readFileSync("/app/node_modules/huge/index.js", "utf8")).toBe(source(7, 1_200_000));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("packs nothing while held", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      packages(vol);
+      vol.writeFileSync("/app/node_modules/huge/index.js", source(7, 1_200_000));
+      // a copy of the packages is about to be saved
+      const release = vol.holdContentPacking();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(d.calls).toBe(0);
+      release();
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(d.calls).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts a round once an install's writes and the reads after it stop", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      packages(vol);
+      // enough to count as an install
+      vol.writeFileSync("/app/node_modules/huge/index.js", source(7, 1_200_000));
+      // a dev server reading right after the install holds the round off
+      for (let i = 0; i < 5; i++) {
+        await vi.advanceTimersByTimeAsync(600);
+        vol.readFileSync("/app/node_modules/lib/index.js");
+      }
+      expect(d.calls).toBe(0);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(d.calls).toBeGreaterThan(0);
+      expect(vol.getStats().packedFiles).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a round off while the preview is loading a page", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      packages(vol);
+      vol.writeFileSync("/app/node_modules/huge/index.js", source(7, 1_200_000));
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(600);
+        noteForegroundActivity();
+      }
+      expect(d.calls).toBe(0);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(d.calls).toBeGreaterThan(0);
+      expect(vol.getStats().packedFiles).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a round off while a page request is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      packages(vol);
+      vol.writeFileSync("/app/node_modules/huge/index.js", source(7, 1_200_000));
+      // a dev server holding a module request while it pre-bundles
+      const answered = beginForegroundActivity();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(d.calls).toBe(0);
+      answered();
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(d.calls).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("doesn't start a round for a tool's cache in node_modules", async () => {
+    vi.useFakeTimers();
+    try {
+      const vol = new MemoryVolume();
+      const d = deflater();
+      vol.enableContentPacking({ deflate: (b) => d.deflate(b) });
+      vol.writeFileSync("/app/node_modules/.vite/deps/react.js", source(1, 3_000_000));
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(d.calls).toBe(0);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

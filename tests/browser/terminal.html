@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>terminal scenarios</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>body{margin:0;background:#0d1117} #box{width:960px;height:560px}</style>
+<div id="box"></div>
+<script type="module">
+// The terminal example's setup, with the xterm instance exposed so the spec
+// can read everything written to it (terminal.spec.ts).
+import { Nodepod } from "/dist/index.mjs";
+import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm";
+import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm";
+
+class ExposedTerminal extends Terminal {
+  constructor(...args) {
+    super(...args);
+    window.__xterm = this;
+  }
+}
+
+const pod = await Nodepod.boot({
+  swUrl: "/__sw__.js",
+  workdir: "/home",
+  files: {
+    "/home/index.js": [
+      'const http = require("http");',
+      'http.createServer((q, r) => r.end("ok")).listen(3000, () => console.log("server listening on port 3000"));',
+    ].join("\n"),
+  },
+});
+window.__pod = pod;
+const terminal = pod.createTerminal({ Terminal: ExposedTerminal, FitAddon, fontSize: 13, scrollback: 5000 });
+terminal.attach(document.getElementById("box"));
+window.__text = () => {
+  const b = window.__xterm.buffer.active;
+  const out = [];
+  for (let i = 0; i < b.length; i++) out.push(b.getLine(i).translateToString(true));
+  return out.join("\n").replace(/\n+$/, "");
+};
+window.__ready = true;
+</script>

@@ -56,6 +56,8 @@ export interface MainToWorker_Init {
   // shared transform store packs that exist (see transform-store.ts)
   /** persisted transform packs; null when unknown (ask for every package) */
   transformScopes?: string[] | null;
+  /** the main thread saves this process's installs' package packs (pack-save) */
+  deferPackSave?: boolean;
 }
 
 export interface MainToWorker_Probe {
@@ -76,6 +78,8 @@ export interface MainToWorker_Exec {
   isWorkerThread?: boolean;
   workerData?: unknown;
   threadId?: number;
+  // false when the parent process reads this one's stdout through a pipe
+  stdoutIsTTY?: boolean;
 }
 
 export interface MainToWorker_Stdin {
@@ -450,8 +454,9 @@ export interface WorkerToMain_SqlitePreload {
    *   [0] status (0 pending, 1 ok, 2 fail)
    *   [1] wasm byte length (set by main on success)
    *   bytes [16..] wasm payload (main writes, worker reads after notify)
+   * null: only cache the bytes on the main thread; no answer is sent
    */
-  sab: Int32Array;
+  sab: Int32Array | null;
 }
 
 export interface WorkerToMain_WsFrame {
@@ -500,7 +505,14 @@ export type WorkerToMainMessage =
   | WorkerToMain_ShellDone
   | WorkerToMain_Error
   | WorkerToMain_SqlitePreload
+  | WorkerToMain_PackSave
   | WorkerToMain_WsFrame;
+
+/** An install finished: save its node_modules as the package pack `key`. */
+export interface WorkerToMain_PackSave {
+  type: "pack-save";
+  key: string;
+}
 
 // --- Spawn config ---
 

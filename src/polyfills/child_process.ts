@@ -28,7 +28,7 @@ import { createYarnCommand } from "../shell/commands/yarn";
 import { createBunCommand, createBunxCommand } from "../shell/commands/bun";
 import { createNodeCommand, createNpxCommand } from "../shell/commands/node";
 import { createGitCommand } from "../shell/commands/git";
-import { format as utilFormat } from "./util";
+import { format as utilFormat, stripVTControlCharacters } from "./util";
 import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config";
 import { closeAllServers, getAllServers } from "./http";
 import { disposeAllTimers } from "./timers";
@@ -68,6 +68,9 @@ let _sabEnabled = true;
 let _stdoutSink: ((text: string) => void) | null = null;
 let _stderrSink: ((text: string) => void) | null = null;
 let _haltSignal: AbortSignal | null = null;
+// a process whose parent pipes its output has no terminal: no spinners,
+// and process.stdout.isTTY stays false, as in node
+let _stdoutIsTTY = true;
 
 let _termCols: (() => number) | null = null;
 let _termRows: (() => number) | null = null;
@@ -144,7 +147,10 @@ export function setStreamingCallbacks(cfg: {
   getCols?: () => number;
   getRows?: () => number;
   onRawModeChange?: (isRaw: boolean) => void;
+  // false when the parent reads stdout through a pipe (not a terminal)
+  isTTY?: boolean;
 }): void {
+  _stdoutIsTTY = cfg.isTTY ?? true;
   _stdoutSink = cfg.onStdout ?? null;
   _stderrSink = cfg.onStderr ?? null;
   _haltSignal = cfg.signal ?? null;
@@ -168,6 +174,7 @@ export function setStreamingCallbacks(cfg: {
 }
 
 export function clearStreamingCallbacks(): void {
+  _stdoutIsTTY = true;
   _stdoutSink = null;
   _stderrSink = null;
   _haltSignal = null;
@@ -207,7 +214,7 @@ export type SpawnChildCallback = (
   opts?: {
     cwd?: string;
     env?: Record<string, string>;
-    stdio?: "pipe" | "inherit";
+    stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
@@ -640,6 +647,19 @@ const ERASE_LINE = "\x1b[2K";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function createSpinner(text: string, writeFn: (s: string) => void) {
+  // output read through a pipe: like npm there, just the outcome as plain text
+  if (!_stdoutIsTTY) {
+    return {
+      update(_t: string) {},
+      succeed(t: string) {
+        writeFn(stripVTControlCharacters(t) + "\n");
+      },
+      fail(t: string) {
+        writeFn(stripVTControlCharacters(t) + "\n");
+      },
+      stop() {},
+    };
+  }
   let frame = 0;
   let current = text;
   const id = setInterval(() => {
@@ -754,6 +774,11 @@ let _shellSnapshotCache:
   | null
   | undefined;
 
+// set in process workers whose main thread saves install packs itself
+function packSaveHandoff(): ((key: string) => boolean) | null {
+  return (globalThis as { __nodepodDeferPackSave?: (key: string) => boolean }).__nodepodDeferPackSave ?? null;
+}
+
 async function getShellSnapshotCache() {
   if (_shellSnapshotCache === undefined) {
     try {
@@ -840,7 +865,7 @@ async function installPackages(
 
   const { DependencyInstaller } = await import("../packages/installer");
   const snapshotCache = await getShellSnapshotCache();
-  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache });
+  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache, deferPackSave: packSaveHandoff() });
   let out = "";
   const write = _stdoutSink ?? ((_s: string) => {});
   const startTime = Date.now();
@@ -1073,7 +1098,13 @@ async function npmInitOrCreate(
 
   // npm create <pkg> / npm init <pkg> → npx create-<pkg>
   if (sub === "create" || (sub === "init" && positional.length > 0)) {
-    const initializer = positional[0];
+    const at = args.findIndex((a) => !a.startsWith("-"));
+    const initializer = args[at]!;
+    // what follows the initializer is its own, in the order given (npm
+    // create vite app -- --template react): only npm's `--` is dropped
+    const rest = args.slice(at + 1);
+    const separator = rest.indexOf("--");
+    const initializerArgs = separator >= 0 ? [...rest.slice(0, separator), ...rest.slice(separator + 1)] : rest;
     let pkgSpec: string;
     if (initializer.startsWith("@")) {
       // scoped: npm create @scope/pkg → npx @scope/create-pkg
@@ -1089,7 +1120,7 @@ async function npmInitOrCreate(
         pkgSpec = `create-${initializer}`;
       }
     }
-    return npxExecute(["-y", pkgSpec, ...positional.slice(1), ...flags], ctx);
+    return npxExecute(["-y", pkgSpec, "--", ...initializerArgs], ctx);
   }
 
   // plain npm init [-y] → create package.json
@@ -1218,6 +1249,7 @@ async function npmCi(
   const installer = new DependencyInstaller(_vol!, {
     cwd: ctx.cwd,
     snapshotCache,
+    deferPackSave: packSaveHandoff(),
   });
   const registryUrl = resolveRegistry(_vol!, ctx.cwd, ctx.env);
   let out = "";
@@ -1272,13 +1304,15 @@ function prewarmEsbuildFor(entry: string): void {
         const mf = JSON.parse(_vol.readFileSync(manifestPath, "utf8")) as PackageManifest & {
           optionalDependencies?: Record<string, string>;
           peerDependencies?: Record<string, string>;
+          peerDependenciesMeta?: Record<string, { optional?: boolean }>;
         };
-        const deps = {
-          ...mf.dependencies,
-          ...mf.optionalDependencies,
-          ...mf.peerDependencies,
-        };
-        if ("esbuild" in deps || "esbuild-wasm" in deps) prewarmEsbuild();
+        // an optional peer is only used if the project brings it (vite 8
+        // lists esbuild so, and transforms with oxc): no instance for that
+        const required = (name: string): boolean =>
+          name in (mf.dependencies ?? {}) ||
+          name in (mf.optionalDependencies ?? {}) ||
+          (name in (mf.peerDependencies ?? {}) && !mf.peerDependenciesMeta?.[name]?.optional);
+        if (required("esbuild") || required("esbuild-wasm")) prewarmEsbuild();
       } catch {
         /* unreadable manifest: nothing to prewarm */
       }
@@ -1429,7 +1463,7 @@ export async function executeNodeBinary(
         if (typeof a === "string" && a.startsWith("Error: Process exited with code")) return;
       }
       // error/warn → stderr, everything else → stdout
-      const line = utilFormat(cArgs[0], ...cArgs.slice(1)) + "\n";
+      const line = utilFormat(...cArgs) + "\n";
       m === "error" ? pushErr(line) : pushOut(line);
     },
     onStdout: pushOut,
@@ -1497,16 +1531,19 @@ export async function executeNodeBinary(
   // while this ENB's wait loop may still be running
   const myHaltSignal = getHaltSignal();
   if (myHaltSignal) {
-    proc.stdout.isTTY = true;
-    proc.stderr.isTTY = true;
-    proc.stdin.isTTY = true;
-    // sync terminal dimensions for TUI libraries
-    const cols = getTermCols();
-    const rows = getTermRows();
-    proc.stdout.columns = cols;
-    proc.stdout.rows = rows;
-    proc.stderr.columns = cols;
-    proc.stderr.rows = rows;
+    // a parent reading this process's output through a pipe: no terminal
+    if (_stdoutIsTTY) {
+      proc.stdout.isTTY = true;
+      proc.stderr.isTTY = true;
+      proc.stdin.isTTY = true;
+      // sync terminal dimensions for TUI libraries
+      const cols = getTermCols();
+      const rows = getTermRows();
+      proc.stdout.columns = cols;
+      proc.stdout.rows = rows;
+      proc.stderr.columns = cols;
+      proc.stderr.rows = rows;
+    }
     // stdin intentionally skipped -- real Node's tty.ReadStream has no
     // columns/rows/resize, TUIs watch process.stdout for dimensions
     proc.stdin.setRawMode = (flag: boolean) => {
@@ -1890,12 +1927,14 @@ async function npxExecute(
   let separatorSeen = false;
 
   for (let i = 0; i < params.length; i++) {
-    if (separatorSeen) {
-      filteredParams.push(params[i]);
+    // npm's option parser takes the first `--` for itself
+    if (params[i] === "--" && !separatorSeen) {
+      separatorSeen = true;
       continue;
     }
-    if (params[i] === "--") {
-      separatorSeen = true;
+    // from the command on, every argument is the command's own
+    if (separatorSeen || filteredParams.length > 0) {
+      filteredParams.push(params[i]);
       continue;
     }
     if (params[i] === "-y" || params[i] === "--yes") {
@@ -2520,12 +2559,11 @@ export function spawn(
   }
 
   // normalize stdio, node parity: 'pipe' default, 'inherit' to share parent
-  // streams, 'ignore' to drop. current spawn protocol only carries one
-  // top-level "pipe"|"inherit" so we pass "inherit" when stdin is inherit,
-  // else "pipe". stdout/stderr inherit works anyway because the streaming
-  // onStdout/onStderr callbacks route through getStdoutSink/getStderrSink.
+  // streams, 'ignore' to drop. The spawn request carries all three: the main
+  // thread forwards stdin and gives stdout a terminal only where inherited.
+  // stdout/stderr inherit also works through the streaming
+  // onStdout/onStderr callbacks, which route to getStdoutSink/getStderrSink.
   const stdioArr = normalizeStdio(cfg.stdio);
-  const stdinInherit = stdioArr[0] === "inherit";
   const stdoutInherit = stdioArr[1] === "inherit";
   const stderrInherit = stdioArr[2] === "inherit";
 
@@ -2551,7 +2589,8 @@ export function spawn(
     const operation = _spawnChildFn(command, spawnArgs, {
       cwd,
       env,
-      stdio: stdinInherit ? "inherit" : "pipe",
+      // per stream: the child gets a terminal only where it inherits one
+      stdio: stdioArr,
       onStdout: (data: string) => {
         stdoutStreamed = true;
         // pipe: buffer for parent to read via child.stdout.on('data')

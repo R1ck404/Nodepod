@@ -5,6 +5,7 @@ import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding';
 import { MOCK_IDS, MOCK_FS } from './constants/config';
 import type { MemoryHandler } from './memory-handler';
 import pako from 'pako';
+import { lastForegroundActivity } from './helpers/foreground-activity';
 
 export interface VolumeNode {
   kind: 'file' | 'directory' | 'symlink';
@@ -64,7 +65,14 @@ export interface ContentRef {
 // listings and sizes never inflate.
 interface PackedChunk {
   bytes: Uint8Array; // deflate-raw
+  // the files packed into a shared chunk (see _unpackForRead)
+  members?: VolumeFileInode[];
 }
+
+// files that are rarely read once installed (maps, type declarations,
+// docs) are packed in chunks of their own, so reading code doesn't
+// inflate them along with it
+const COLD_PACKAGE_FILE = /\.map$|\.d\.[cm]?ts$|\.(md|markdown|txt)$|^(license|licence|changelog|readme|authors|notice|history)/i;
 
 interface PackedRef {
   chunk: PackedChunk;
@@ -78,10 +86,73 @@ interface PackState {
   lastActivity: number;
   lastRoundStart: number;
   // completed rounds; a file read during generation G is hot until round G
-  // completes, so an aborted round doesn't forget what was in use
+  // completes, so an aborted round doesn't forget what was in use (one read
+  // while round G runs, until round G+1 completes)
   generation: number;
   lastRead: WeakMap<VolumeFileInode, number>;
+  // deflate-raw off the main thread (enableContentPacking({ deflate })):
+  // a round then costs the main thread only the copies it hands over, so
+  // rounds also run right after an install instead of waiting for quiet
+  deflate: ((bytes: Uint8Array) => Promise<Uint8Array>) | null;
+  // package bytes written since the last round started
+  packageBytes: number;
+  afterWritesTimer: ReturnType<typeof setTimeout> | null;
+  // last read of any file (lastActivity also counts writes)
+  lastReadAt: number;
+  // package writes landed while a round ran: go again after it
+  rerun: boolean;
+  // holdContentPacking() calls not released yet
+  holds: number;
 }
+
+// Between slices of background work (packing): on a page, wait until the
+// thread is idle so the work never delays rendering or input; elsewhere
+// just yield to other tasks.
+function yieldForBackgroundWork(): Promise<void> {
+  const ric = (globalThis as {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+  }).requestIdleCallback;
+  return new Promise((resolve) => {
+    if (typeof ric === "function") ric(() => resolve(), { timeout: 1000 });
+    else setTimeout(resolve, 0);
+  });
+}
+
+// an absolute path needs normalizing if it has an empty, "." or ".."
+// segment, or a trailing slash
+const NEEDS_NORMALIZING = /\/\/|\/\.\.?(?:\/|$)|.\/$/;
+
+// a file an install put in node_modules; not a tool's cache there
+// (node_modules/.vite, .cache), which the tool is still busy reading
+function isInstalledPackagePath(path: string): boolean {
+  const at = path.indexOf('/node_modules/');
+  return at >= 0 && path.charCodeAt(at + 14) !== 46; // '.'
+}
+
+// bytes of the files in memory under a node
+function residentBytes(node: VolumeNode): number {
+  if (node.kind === 'file') {
+    const bytes = node.inode ? node.inode.content : node.content;
+    return bytes ? bytes.byteLength : 0;
+  }
+  let total = 0;
+  if (node.kind === 'directory' && node.children) {
+    for (const child of node.children.values()) total += residentBytes(child);
+  }
+  return total;
+}
+
+// with an off-thread deflater, a round starts this long after package
+// writes (an install, a restored pack) stop, once there are enough of them
+const PACK_AFTER_WRITES_MS = 2000;
+// ...and once nothing has been read for this long (or this long has passed)
+const PACK_AFTER_READS_MS = 1000;
+const PACK_AFTER_WRITES_MAX_WAIT_MS = 20_000;
+const PACK_AFTER_WRITES_MIN_BYTES = 1024 * 1024;
+// uncompressed bytes handed to the deflater and not back yet
+const PACK_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
+// how often a round held off by a page load checks again
+const PACK_FOREGROUND_POLL_MS = 250;
 
 // uncompressed bytes per shared chunk
 const PACK_CHUNK_BYTES = 128 * 1024;
@@ -1100,6 +1171,13 @@ export class MemoryVolume {
   mountEntries(entries: ReadonlyArray<MountEntry>, opts: { notify?: boolean } = {}): number {
     const notify = opts.notify === true;
     this._notePackActivity();
+    if (this._packState?.deflate) {
+      let packageBytes = 0;
+      for (const entry of entries) {
+        if (entry.content && isInstalledPackagePath(entry.path)) packageBytes += entry.content.byteLength;
+      }
+      if (packageBytes > 0) this._notePackageWrite(packageBytes);
+    }
     const groups = new Map<string | number, VolumeFileInode>();
     const sorted = entries
       .map((entry, index) => ({ entry, index, depth: countPathSegments(entry.path) }))
@@ -1284,6 +1362,8 @@ export class MemoryVolume {
 
   private normalize(p: string): string {
     if (this._disposed) throw new Error('[Nodepod] Filesystem has been disposed');
+    // nearly every path arrives normalized already
+    if (p.charCodeAt(0) === 47 && !NEEDS_NORMALIZING.test(p)) return p;
     if (this._handler) {
       const cached = this._handler.pathNormCache.get(p);
       if (cached !== undefined) return cached;
@@ -1317,35 +1397,39 @@ export class MemoryVolume {
     return p.slice(idx + 1);
   }
 
-  private resolveNode(p: string, followFinal: boolean, seen = new Set<string>()): VolumeNode | undefined {
+  // walks the pre-normalized path segment by segment without splitting it;
+  // the bookkeeping for symlinks is only done when one is met
+  private resolveNode(p: string, followFinal: boolean, seen?: Set<string>): VolumeNode | undefined {
     if (p === '/') return this.tree;
-    const segments = this.segments(p);
     let current = this.tree;
-    let currentPath = '';
-    for (let index = 0; index < segments.length; index++) {
+    const len = p.length;
+    let start = 1;
+    for (;;) {
       if (current.kind !== 'directory' || !current.children) return undefined;
-      const segment = segments[index];
-      const child = current.children.get(segment);
+      let end = p.indexOf('/', start);
+      if (end === -1) end = len;
+      const child = current.children.get(p.substring(start, end));
       if (!child) return undefined;
-      currentPath += '/' + segment;
-      const shouldFollow = child.kind === 'symlink' && (followFinal || index < segments.length - 1);
-      if (!shouldFollow) {
-        current = child;
-        continue;
+      const last = end === len;
+      if (child.kind === 'symlink' && (followFinal || !last)) {
+        const currentPath = p.substring(0, end);
+        seen ??= new Set<string>();
+        if (seen.has(currentPath) || seen.size >= 40) {
+          throw makeSystemError('ELOOP', 'stat', p);
+        }
+        seen.add(currentPath);
+        const target = child.target!;
+        const targetPath = target.startsWith('/')
+          ? this.normalize(target)
+          : this.normalize(this.parentOf(currentPath) + '/' + target);
+        const remainder = last ? '' : p.substring(end + 1);
+        const resolvedPath = remainder ? this.normalize(targetPath + '/' + remainder) : targetPath;
+        return this.resolveNode(resolvedPath, followFinal, seen);
       }
-      if (seen.has(currentPath) || seen.size >= 40) {
-        throw makeSystemError('ELOOP', 'stat', p);
-      }
-      seen.add(currentPath);
-      const target = child.target!;
-      const targetPath = target.startsWith('/')
-        ? this.normalize(target)
-        : this.normalize(this.parentOf(currentPath) + '/' + target);
-      const remainder = segments.slice(index + 1).join('/');
-      const resolvedPath = remainder ? this.normalize(targetPath + '/' + remainder) : targetPath;
-      return this.resolveNode(resolvedPath, followFinal, seen);
+      current = child;
+      if (last) return current;
+      start = end + 1;
     }
-    return current;
   }
 
   // the node at exactly this path: no symlink is followed, final or not.
@@ -1452,6 +1536,7 @@ export class MemoryVolume {
 
     const now = Date.now();
     this._notePackActivity();
+    if (this._packState?.deflate && isInstalledPackagePath(norm)) this._notePackageWrite(bytes.byteLength);
     if (existing?.kind === 'file') {
       const inode = this._fileInodeAt(norm, existing);
       if (inode.src) this._forgetSource(inode);
@@ -1510,7 +1595,7 @@ export class MemoryVolume {
    * PackedChunk). Main thread only: rounds run after the volume has been
    * quiet for a while and yield between slices; reads stay synchronous.
    */
-  enableContentPacking(): void {
+  enableContentPacking(opts: { deflate?: (bytes: Uint8Array) => Promise<Uint8Array> } = {}): void {
     if (this._packState || this._missHandler || this._disposed) return;
     this._packState = {
       timer: null,
@@ -1519,8 +1604,49 @@ export class MemoryVolume {
       lastRoundStart: -Infinity,
       generation: 0,
       lastRead: new WeakMap(),
+      deflate: opts.deflate ?? null,
+      packageBytes: 0,
+      afterWritesTimer: null,
+      lastReadAt: 0,
+      rerun: false,
+      holds: 0,
     };
     this._schedulePackCheck(PACK_QUIET_MS);
+  }
+
+  // package content written: with an off-thread deflater, pack it once the
+  // writes stop (an install has just finished) rather than after quiet
+  private _notePackageWrite(bytes: number): void {
+    const state = this._packState;
+    if (!state?.deflate) return;
+    state.packageBytes += bytes;
+    if (state.packageBytes < PACK_AFTER_WRITES_MIN_BYTES) return;
+    if (state.afterWritesTimer) clearTimeout(state.afterWritesTimer);
+    const writesEnded = Date.now();
+    const check = (): void => {
+      state.afterWritesTimer = null;
+      if (this._packState !== state) return;
+      // whatever runs right after an install (a dev server starting, its
+      // dependency pre-bundle) reads packages: wait for a pause in reads,
+      // or the round inflates what it just packed and competes with them.
+      // Same for a page the preview is loading
+      const now = Date.now();
+      const busyAt = Math.max(state.lastReadAt, lastForegroundActivity());
+      if (
+        state.holds > 0 ||
+        (now - busyAt < PACK_AFTER_READS_MS && now - writesEnded < PACK_AFTER_WRITES_MAX_WAIT_MS)
+      ) {
+        const timer = setTimeout(check, PACK_AFTER_READS_MS);
+        (timer as unknown as { unref?: () => void }).unref?.();
+        state.afterWritesTimer = timer;
+        return;
+      }
+      if (state.running) state.rerun = true;
+      else void this._packRound();
+    };
+    const timer = setTimeout(check, PACK_AFTER_WRITES_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    state.afterWritesTimer = timer;
   }
 
   get contentPackingEnabled(): boolean {
@@ -1549,6 +1675,23 @@ export class MemoryVolume {
     }
   }
 
+  /**
+   * Keep packing rounds from packing anything until the returned release is
+   * called (a bulk copy of the packages is about to be taken: packing them
+   * first would only have it inflate them again).
+   */
+  holdContentPacking(): () => void {
+    const state = this._packState;
+    if (!state) return () => {};
+    state.holds++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      state.holds--;
+    };
+  }
+
   /** Run a packing round now (tests; normally rounds start on their own). */
   packContentNow(): Promise<void> {
     if (!this._packState || this._packState.running) return Promise.resolve();
@@ -1557,9 +1700,35 @@ export class MemoryVolume {
 
   private _noteRead(inode: VolumeFileInode): void {
     const state = this._packState!;
-    state.lastRead.set(inode, state.generation);
+    // read while a round runs (an off-thread one isn't stopped by it): in
+    // use for the round after it too
+    state.lastRead.set(inode, state.running ? state.generation + 1 : state.generation);
     this._notePackActivity();
-    if (inode.packed) this._unpack(inode);
+    state.lastReadAt = state.lastActivity;
+    if (inode.packed) this._unpackForRead(inode);
+  }
+
+  // A read unpacks every file of the chunk: its files come from one
+  // directory and are mostly read together, in whatever order the reader
+  // (a bundler resolving in parallel) happens to go, so inflating the chunk
+  // again for each of them cost far more than keeping the neighbours. The
+  // ones nobody reads are packed again by the next round.
+  private _unpackForRead(inode: VolumeFileInode): void {
+    const chunk = inode.packed!.chunk;
+    const members = chunk.members;
+    if (!members) {
+      this._unpack(inode);
+      return;
+    }
+    chunk.members = undefined;
+    const bytes = this._inflateChunk(chunk);
+    for (const member of members) {
+      const ref = member.packed;
+      if (!ref || ref.chunk !== chunk) continue;
+      member.content = bytes.slice(ref.offset, ref.offset + ref.length);
+      member.packed = undefined;
+    }
+    this._inflatedChunks = this._inflatedChunks.filter((c) => c.chunk !== chunk);
   }
 
   private _notePackActivity(): void {
@@ -1575,6 +1744,10 @@ export class MemoryVolume {
     const timer = setTimeout(() => {
       state.timer = null;
       if (this._packState !== state || state.running) return;
+      if (state.holds > 0) {
+        this._schedulePackCheck(PACK_FOREGROUND_POLL_MS);
+        return;
+      }
       const wait =
         Math.max(state.lastActivity + PACK_QUIET_MS, state.lastRoundStart + PACK_MIN_INTERVAL_MS) - Date.now();
       if (wait > 0) {
@@ -1596,7 +1769,7 @@ export class MemoryVolume {
       !inode.packed &&
       !inode.src &&
       // not read since the last completed round
-      state.lastRead.get(inode) !== state.generation
+      (state.lastRead.get(inode) ?? -1) < state.generation
     );
   }
 
@@ -1606,21 +1779,55 @@ export class MemoryVolume {
     state.running = true;
     const started = Date.now();
     state.lastRoundStart = started;
+    state.packageBytes = 0;
+    state.rerun = false;
     this._inflatedChunks = [];
     let completed = false;
+    // groups handed to the off-thread deflater and not back yet
+    const offThread = new Set<Promise<void>>();
+    let inFlight = 0;
     try {
       let sliceStart = Date.now();
-      // yield between slices; stop the round when the volume is in use again
+      // yield between slices. Deflating on this thread, stop the round when
+      // the volume is in use again; off-thread, a file used meanwhile is
+      // just left unpacked
       const proceed = async (): Promise<boolean> => {
-        if (Date.now() - sliceStart >= PACK_SLICE_MS) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
+        if (Date.now() - sliceStart >= PACK_SLICE_MS || state.holds > 0) {
+          await yieldForBackgroundWork();
+          // held (holdContentPacking), or off-thread and the preview is
+          // loading a page (for so long at most): wait
+          while (
+            this._packState === state &&
+            (state.holds > 0 ||
+              (state.deflate &&
+                Date.now() - lastForegroundActivity() < PACK_AFTER_READS_MS &&
+                Date.now() - started < PACK_AFTER_WRITES_MAX_WAIT_MS))
+          ) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, PACK_FOREGROUND_POLL_MS);
+              (timer as unknown as { unref?: () => void }).unref?.();
+            });
+          }
           sliceStart = Date.now();
         }
-        return this._packState === state && state.lastActivity <= started;
+        return this._packState === state && (state.deflate !== null || state.lastActivity <= started);
+      };
+      const pack = async (group: VolumeFileInode[], size: number): Promise<void> => {
+        if (!state.deflate) {
+          this._packGroup(group, size);
+          return;
+        }
+        const done: Promise<void> = this._packGroupOffThread(group, size, state).finally(() => {
+          inFlight -= size;
+          offThread.delete(done);
+        });
+        inFlight += size;
+        offThread.add(done);
+        while (inFlight > PACK_IN_FLIGHT_BYTES && offThread.size > 0) await Promise.race(offThread);
       };
 
       // walk for candidates (no content is touched), yielding like the rest
-      const candidates: VolumeNode[] = [];
+      const candidates: Array<[VolumeNode, number]> = [];
       // files mounted from a pack are views into its one big buffer: any of
       // them left unpacked would keep all of it alive next to the chunks
       const views: VolumeNode[] = [];
@@ -1643,43 +1850,47 @@ export class MemoryVolume {
         // loaded whole at its startup, and it only halves
         if (name === 'package.json' || name.endsWith('.wasm') || bytes.byteLength < PACK_MIN_FILE_BYTES) continue;
         if (node.inode && !this._packable(node.inode, state)) continue;
-        candidates.push(node);
+        candidates.push([node, COLD_PACKAGE_FILE.test(name) ? 1 : 0]);
       }
 
-      let group: VolumeFileInode[] = [];
-      let groupBytes = 0;
+      // one open group per kind (code, rarely read files)
+      const groups: Array<{ inodes: VolumeFileInode[]; bytes: number }> = [
+        { inodes: [], bytes: 0 },
+        { inodes: [], bytes: 0 },
+      ];
       // hard links: one inode, several candidate nodes
       const grouped = new Set<VolumeFileInode>();
-      for (const node of candidates) {
-        // groups are built and packed without yielding: their bytes can't
-        // change underneath
-        if (group.length === 0 && !(await proceed())) return;
+      const flush = async (g: { inodes: VolumeFileInode[]; bytes: number }): Promise<void> => {
+        const inodes = g.inodes;
+        g.inodes = [];
+        g.bytes = 0;
+        for (const inode of inodes) grouped.delete(inode);
+        // a group can span yields: keep what is still packable as it was
+        const still = inodes.filter((inode) => this._packable(inode, state));
+        if (still.length === 0) return;
+        let size = 0;
+        for (const inode of still) size += inode.content!.byteLength;
+        await pack(still, size);
+      };
+      for (const [node, kind] of candidates) {
+        if (!(await proceed())) return;
         if (node.kind !== 'file' || node.lazy) continue;
         const inode = this._fileInode(node);
         if (grouped.has(inode) || !this._packable(inode, state)) continue;
         const size = inode.content!.byteLength;
         if (size >= PACK_SOLO_BYTES) {
-          // it yields: pack what's pending first
-          if (group.length > 0) {
-            this._packGroup(group, groupBytes);
-            group = [];
-            groupBytes = 0;
-            grouped.clear();
-          }
-          if (!(await this._packSolo(inode, state, proceed))) return;
+          if (state.deflate) await pack([inode], size);
+          else if (!(await this._packSolo(inode, state, proceed))) return;
           continue;
         }
-        group.push(inode);
+        const g = groups[kind];
+        g.inodes.push(inode);
         grouped.add(inode);
-        groupBytes += size;
-        if (groupBytes >= PACK_CHUNK_BYTES) {
-          this._packGroup(group, groupBytes);
-          group = [];
-          groupBytes = 0;
-          grouped.clear();
-        }
+        g.bytes += size;
+        if (g.bytes >= PACK_CHUNK_BYTES) await flush(g);
       }
-      if (group.length > 0) this._packGroup(group, groupBytes);
+      for (const g of groups) if (g.inodes.length > 0) await flush(g);
+      await Promise.all(offThread);
       // what stays unpacked gets buffers of its own
       for (const node of views) {
         if (node.kind !== 'file') continue;
@@ -1689,14 +1900,54 @@ export class MemoryVolume {
       }
       completed = true;
     } finally {
+      // an aborted round still lets its handed-over groups land (or bail)
+      if (offThread.size > 0) await Promise.allSettled(offThread);
       if (completed) state.generation++;
       state.running = false;
       this._inflatedChunks = [];
+      if (this._packState === state && state.rerun) {
+        state.rerun = false;
+        state.packageBytes = PACK_AFTER_WRITES_MIN_BYTES;
+        this._notePackageWrite(0);
+      }
       // in use again since the round started: go again after the next quiet period
       if (this._packState === state && state.lastActivity > started && !state.timer) {
         this._schedulePackCheck(PACK_QUIET_MS);
       }
     }
+  }
+
+  // deflate a group on the deflater's thread; files written or read while
+  // it was away stay as they are
+  private async _packGroupOffThread(group: VolumeFileInode[], size: number, state: PackState): Promise<void> {
+    const joined = new Uint8Array(size);
+    const contents: Uint8Array[] = [];
+    const offsets: number[] = [];
+    let offset = 0;
+    for (const inode of group) {
+      const bytes = inode.content!;
+      contents.push(bytes);
+      offsets.push(offset);
+      joined.set(bytes, offset);
+      offset += bytes.byteLength;
+    }
+    let deflated: Uint8Array;
+    try {
+      deflated = await state.deflate!(joined);
+    } catch {
+      return;
+    }
+    if (this._packState !== state) return;
+    const chunk: PackedChunk = { bytes: deflated };
+    const members: VolumeFileInode[] = [];
+    for (let i = 0; i < group.length; i++) {
+      const inode = group[i];
+      if (inode.content !== contents[i] || !this._packable(inode, state)) continue;
+      inode.packed = { chunk, offset: offsets[i], length: contents[i].byteLength };
+      inode.content = undefined;
+      members.push(inode);
+    }
+    if (members.length > 1) chunk.members = members;
   }
 
   private _packGroup(group: VolumeFileInode[], size: number): void {
@@ -1714,6 +1965,7 @@ export class MemoryVolume {
       inode.packed = { chunk, offset: offsets[i], length: inode.content!.byteLength };
       inode.content = undefined;
     }
+    if (group.length > 1) chunk.members = group;
   }
 
   // a big file deflates in pieces across slices, then replaces the content
@@ -2944,6 +3196,10 @@ export class MemoryVolume {
     this._invalidateLazyListedFor(normTo);
     // a complete local copy: lookups under the new location needn't list
     if (this._missHandler && hydrated) this._markLazyTreeListed(normTo, node);
+    // an install extracts a package elsewhere and moves it into node_modules
+    if (this._packState?.deflate && isInstalledPackagePath(normTo) && !isInstalledPackagePath(normFrom)) {
+      this._notePackageWrite(residentBytes(node));
+    }
 
     if (this._handler) {
       this._handler.invalidateStat(normFrom);

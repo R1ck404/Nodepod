@@ -127,8 +127,10 @@ export interface MemoryHandlerOptions {
   /**
    * Keep node_modules files that no process has read lately deflated in
    * main-thread memory (about 4x smaller), inflating each on its next read.
-   * Rounds run in the background once the pod has been quiet for a while.
-   * Needs lean spawn snapshots (SharedArrayBuffer). Default: true.
+   * Rounds run in the background: shortly after an install (compressed off
+   * the main thread, holding off while processes read packages or the
+   * preview loads a page), and otherwise once the pod has been quiet for a
+   * while. Needs lean spawn snapshots (SharedArrayBuffer). Default: true.
    */
   packPackageContent?: boolean;
 }

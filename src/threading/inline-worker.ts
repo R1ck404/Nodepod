@@ -498,5 +498,11 @@ export function createInlineWorker(): HostWorker | null {
 
 // call when the pool is permanently disposed
 export function revokeInlineWorkerUrl(): void {
-  getRuntimeHost().disposeGlobalResources?.();
+  // a process worker registers no host: no worker was created, and a pool
+  // giving up on workers there must not fail the task it falls back for
+  try {
+    getRuntimeHost().disposeGlobalResources?.();
+  } catch {
+    /* no host */
+  }
 }

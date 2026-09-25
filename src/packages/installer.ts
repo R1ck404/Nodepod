@@ -17,10 +17,13 @@ import type { IDBSnapshotCache } from "../persistence/idb-cache";
 import { canPageFrom, type PackContentSource } from "../persistence/pack-content-source";
 import type { VFSSnapshotEntry } from "../threading/worker-protocol";
 import { quickDigest } from "../helpers/digest";
+import { restoreToolCache } from "../persistence/tool-cache";
+import { prefetchTarball, releasePrefetchedTarballs } from "./tarball-prefetch";
 import { requestEsbuildPrefetch } from "../helpers/esbuild-wasm-module";
 import {
-  createFilteredBinarySnapshot,
+  collectBinarySnapshotParts,
   restoreBinarySnapshot,
+  saveSnapshotParts,
 } from "../persistence/binary-snapshot";
 import { getTarballCache } from "../persistence/tarball-cache";
 import { PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
@@ -74,6 +77,59 @@ export function findWasiPackageReferences(source: string): string[] {
     references.add(match[1]);
   }
   return [...references];
+}
+
+// "-wasm32-wasi" in raw bytes, ASCII case-insensitive like
+// WASI_CONVENTION_RE: finds the few files worth decoding without decoding
+// the rest. Anchored on "32-", the case-invariant middle.
+export function bytesMentionWasiConvention(bytes: Uint8Array): boolean {
+  const lower = (b: number): number => (b >= 0x41 && b <= 0x5a ? b + 32 : b);
+  for (let i = bytes.indexOf(0x33, 5); i !== -1 && i + 6 < bytes.length; i = bytes.indexOf(0x33, i + 1)) {
+    if (bytes[i + 1] !== 0x32 || bytes[i + 2] !== 0x2d) continue;
+    if (
+      bytes[i - 5] === 0x2d &&
+      lower(bytes[i - 4]) === 0x77 && // w
+      lower(bytes[i - 3]) === 0x61 && // a
+      lower(bytes[i - 2]) === 0x73 && // s
+      lower(bytes[i - 1]) === 0x6d && // m
+      lower(bytes[i + 3]) === 0x77 && // w
+      lower(bytes[i + 4]) === 0x61 && // a
+      lower(bytes[i + 5]) === 0x73 && // s
+      lower(bytes[i + 6]) === 0x69 // i
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The companion scan's view of one extracted file (see
+// findWasiCompanionCandidates): same files, same matching.
+export function scanExtractedFile(relativePath: string, data: Uint8Array | string, into: Set<string>): void {
+  const segments = relativePath.split("/");
+  if (segments.some((s) => s === "node_modules" || s === ".git")) return;
+  const name = segments[segments.length - 1];
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || !WASI_SOURCE_EXTENSIONS.has(name.slice(dot).toLowerCase()) || TYPE_DECLARATION_RE.test(name)) return;
+  let source: string;
+  if (typeof data === "string") {
+    if (data.length > 16 * 1024 * 1024) return;
+    source = data;
+  } else {
+    if (data.byteLength > 16 * 1024 * 1024 || !bytesMentionWasiConvention(data)) return;
+    source = new TextDecoder().decode(data);
+  }
+  for (const reference of findWasiPackageReferences(source)) into.add(reference);
+}
+
+// What a full install's pack holds: everything installed under node_modules,
+// not the caches tools keep there (node_modules/.vite, .cache)
+export function isPackFile(path: string): boolean {
+  return path.includes("/node_modules/") && !/\/node_modules\/\.(?:vite|cache)(?:\/|$)/.test(path);
+}
+
+function wasiReferenceKey(dependency: ResolvedDependency): string {
+  return `${dependency.fetchName}@${dependency.version}|${dependency.tarballUrl ?? ""}`;
 }
 
 function stableRecord(record: Record<string, string> | undefined): string {
@@ -229,6 +285,7 @@ export class DependencyInstaller {
   private _packSource: PackContentSource | null;
   private _performance: PerformanceTracker | null;
   private _profiler: NodepodProfilerImpl | null;
+  private _deferPackSave: ((cacheKey: string) => boolean) | null;
 
   constructor(
     vol: MemoryVolume,
@@ -239,6 +296,11 @@ export class DependencyInstaller {
       packSource?: PackContentSource | null;
       performanceTracker?: PerformanceTracker | null;
       profiler?: NodepodProfilerImpl | null;
+      /**
+       * Hand a full install's pack save to whoever keeps the same files
+       * (a process's install: the main thread). True if it took it.
+       */
+      deferPackSave?: ((cacheKey: string) => boolean) | null;
     } & RegistryConfig = {},
   ) {
     this.vol = vol;
@@ -248,6 +310,7 @@ export class DependencyInstaller {
     this._packSource = opts.packSource ?? null;
     this._performance = opts.performanceTracker ?? null;
     this._profiler = opts.profiler ?? null;
+    this._deferPackSave = opts.deferPackSave ?? null;
   }
 
   private profileSpan(
@@ -428,10 +491,10 @@ export class DependencyInstaller {
         const nmRoot = path.join(this.workingDir, "node_modules");
         const prefixes = [...tree.keys()].map((n) => path.join(nmRoot, n));
         const snapshot = await this.withPackagesResident(prefixes, () =>
-          createFilteredBinarySnapshot(this.vol, (p) =>
+          collectBinarySnapshotParts(this.vol, (p) =>
             prefixes.some((prefix) => p === prefix || p.startsWith(prefix + "/")),
           ));
-        await this._snapshotCache.set(treeKey, snapshot);
+        await saveSnapshotParts(this._snapshotCache, treeKey, snapshot);
       } catch { /* cache write failure is non-fatal */ }
     }
 
@@ -481,6 +544,9 @@ export class DependencyInstaller {
           onProgress,
         );
         if (restored !== null) {
+          try {
+            await restoreToolCache(this.vol, this._snapshotCache, path.join(this.workingDir, "node_modules"));
+          } catch { /* the tool rebuilds its cache */ }
           onProgress?.(`Restored ${restored} cached entries`);
           this._performance?.increment("install.cacheHits");
           this._profiler?.count("packages.snapshotCacheHits");
@@ -495,6 +561,7 @@ export class DependencyInstaller {
 
     onProgress?.("Resolving dependency tree...");
 
+    const prefetched: string[] = [];
     const resolutionOpts: ResolutionConfig = {
       registry: flags.registry
         ? new RegistryClient({ endpoint: flags.registry })
@@ -502,6 +569,13 @@ export class DependencyInstaller {
       devDependencies: flags.withDevDeps,
       optionalDependencies: flags.withOptionalDeps,
       onProgress,
+      // no cached pack (checked above): every archive of the tree is needed,
+      // so each downloads while the rest of the tree resolves
+      onResolved: (dep) => {
+        if (!dep.tarballUrl) return;
+        prefetched.push(dep.tarballUrl);
+        prefetchTarball(dep.tarballUrl);
+      },
     };
 
     const stopResolution = this._performance?.start("install.resolve");
@@ -513,38 +587,47 @@ export class DependencyInstaller {
       devDependencies: flags.withDevDeps ? stableRecord(manifest.devDependencies) : "",
       optionalDependencies: flags.withOptionalDeps ? stableRecord(manifest.optionalDependencies) : "",
     }));
-    const resolved = await resolveWithCache(resolutionKey, () =>
-      resolveFromManifest(manifest, resolutionOpts));
-    const tree = resolved.tree;
-    if (resolved.hit) {
-      this._performance?.increment("install.resolutionCacheHits");
-      this._profiler?.count("packages.resolutionCacheHits");
-    }
-    stopResolution?.();
-    this.endProfileSpan(resolutionSpan);
-    // esbuild ships as ~10MB of wasm fetched on first use: when it is part of
-    // this install, download and compile it while the packages extract
-    if ([...tree.values()].some((d) => d.name === "esbuild" || d.name === "esbuild-wasm")) requestEsbuildPrefetch();
+    let tree: Map<string, ResolvedDependency>;
+    let newPkgs: string[];
+    try {
+      const resolved = await resolveWithCache(resolutionKey, () =>
+        resolveFromManifest(manifest, resolutionOpts));
+      tree = resolved.tree;
+      if (resolved.hit) {
+        this._performance?.increment("install.resolutionCacheHits");
+        this._profiler?.count("packages.resolutionCacheHits");
+      }
+      stopResolution?.();
+      this.endProfileSpan(resolutionSpan);
+      // esbuild ships as ~10MB of wasm fetched on first use: when it is part of
+      // this install, download and compile it while the packages extract
+      if ([...tree.values()].some((d) => d.name === "esbuild" || d.name === "esbuild-wasm")) requestEsbuildPrefetch();
 
-    const stopMaterialize = this._performance?.start("install.materialize");
-    const materializeSpan = this.profileSpan("packages.materialize");
-    const newPkgs = await this.materializeWithWasiCompanions(
-      tree,
-      flags,
-      resolutionOpts,
-    );
-    stopMaterialize?.();
-    this.endProfileSpan(materializeSpan);
+      const stopMaterialize = this._performance?.start("install.materialize");
+      const materializeSpan = this.profileSpan("packages.materialize");
+      newPkgs = await this.materializeWithWasiCompanions(
+        tree,
+        flags,
+        resolutionOpts,
+      );
+      stopMaterialize?.();
+      this.endProfileSpan(materializeSpan);
+    } finally {
+      // archives of packages that were already installed are never taken
+      releasePrefetchedTarballs(prefetched);
+    }
 
     // Cache the installed node_modules snapshot for future reuse (raw bytes,
     // no base64 — restores go through the bulk binary path)
-    if (this._snapshotCache && cacheKey && newPkgs.length > 0) {
+    // (or have the thread that keeps the files save it after this returns:
+    // the install is done once its files are in place)
+    if (this._snapshotCache && cacheKey && newPkgs.length > 0 && !this._deferPackSave?.(cacheKey)) {
       try {
         const snapshot = await this.withPackagesResident(
           [path.join(this.workingDir, "node_modules")],
-          () => createFilteredBinarySnapshot(this.vol, (p) => p.includes("/node_modules/")),
+          () => collectBinarySnapshotParts(this.vol, isPackFile),
         );
-        await this._snapshotCache.set(cacheKey, snapshot);
+        await saveSnapshotParts(this._snapshotCache, cacheKey, snapshot);
       } catch { /* cache write failure is non-fatal */ }
     }
 
@@ -767,7 +850,7 @@ export class DependencyInstaller {
       const packageDir = path.join(nmRoot, parentPlacement);
       // one published version's files never change; the tarball URL tells
       // apart same-named builds from elsewhere (git, pkg.pr.new)
-      const cacheKey = `${dependency.fetchName}@${dependency.version}|${dependency.tarballUrl ?? ""}`;
+      const cacheKey = wasiReferenceKey(dependency);
       const cachedReferences = wasiReferenceCache.get(cacheKey);
       const references = new Set<string>(cachedReferences ?? []);
       const files = cachedReferences ? [] : [packageDir];
@@ -1000,18 +1083,27 @@ export class DependencyInstaller {
     try {
       for (let attempt = 0; attempt < MATERIALIZE_ATTEMPTS && !extracted; attempt++) {
         if (attempt > 0) {
+          const reason = String((lastError as Error | null)?.message ?? lastError ?? "").slice(0, 160);
           onProgress?.(
-            `  Retrying ${depName}@${dep.version} (attempt ${attempt + 1}/${MATERIALIZE_ATTEMPTS})...`,
+            `  Retrying ${depName}@${dep.version} (attempt ${attempt + 1}/${MATERIALIZE_ATTEMPTS})${reason ? `: ${reason}` : "..."}`,
           );
           await new Promise<void>((r) => setTimeout(r, MATERIALIZE_RETRY_DELAY_MS * attempt));
         }
         try {
+          // the WASI companion scan, done while the files stream in
+          const wasiReferences = new Set<string>();
+          let extractedFiles = 0;
           await downloadAndExtract(dep.tarballUrl, this.vol, targetDir, {
             stripComponents: 1,
             expectedShasum: dep.shasum,
             expectedIntegrity: dep.integrity,
             profiler: this._profiler,
+            onFile: (relativePath, data) => {
+              extractedFiles++;
+              scanExtractedFile(relativePath, data, wasiReferences);
+            },
           });
+          if (extractedFiles > 0) wasiReferenceCache.set(wasiReferenceKey(dep), [...wasiReferences]);
           const manifestPath = path.join(targetDir, "package.json");
           if (!this.vol.existsSync(manifestPath)) {
             throw new Error(`Package archive did not contain ${manifestPath}`);

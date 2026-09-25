@@ -1,10 +1,24 @@
 // Buffer polyfill extending Uint8Array with Node.js Buffer API
 
 
-import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1 } from '../helpers/byte-encoding';
+import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1, decodeShortAscii } from '../helpers/byte-encoding';
 
 const textEnc = new TextEncoder();
 const textDec = new TextDecoder('utf-8');
+
+// Counting a string's UTF-8 bytes needn't allocate them: encodeInto() a
+// reused buffer (servers take the byteLength of every response body)
+const LENGTH_SCRATCH_MAX = 1024 * 1024;
+let lengthScratch: Uint8Array | null = null;
+
+function utf8ByteLength(text: string): number {
+  const worst = text.length * 3;
+  if (worst > LENGTH_SCRATCH_MAX) return textEnc.encode(text).length;
+  if (!lengthScratch || lengthScratch.length < worst) {
+    lengthScratch = new Uint8Array(Math.max(worst, 16 * 1024));
+  }
+  return textEnc.encodeInto(text, lengthScratch).written;
+}
 
 function encodeUtf16Le(value: string): Uint8Array {
   const bytes = new Uint8Array(value.length * 2);
@@ -221,7 +235,18 @@ class BufferPolyfill extends Uint8Array {
     ].includes(lower);
   }
 
-  static byteLength(text: string, enc?: string): number {
+  static byteLength(text: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer, enc?: string): number {
+    // like node: a buffer's length is its size, whatever the encoding
+    if (typeof text !== 'string') {
+      if (
+        ArrayBuffer.isView(text) ||
+        text instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && text instanceof SharedArrayBuffer)
+      ) {
+        return text.byteLength;
+      }
+      text = String(text);
+    }
     const lower = (enc || 'utf8').toLowerCase();
     if (lower === 'base64' || lower === 'base64url') {
       const stripped = text.replace(/[=]/g, '');
@@ -236,7 +261,7 @@ class BufferPolyfill extends Uint8Array {
     if (lower === 'latin1' || lower === 'binary' || lower === 'ascii') {
       return text.length;
     }
-    return textEnc.encode(text).length;
+    return utf8ByteLength(text);
   }
 
   // ---- Instance methods ----
@@ -268,6 +293,9 @@ class BufferPolyfill extends Uint8Array {
     if (lower === 'utf16le' || lower === 'utf-16le' || lower === 'ucs2' || lower === 'ucs-2') {
       return decodeUtf16Le(view);
     }
+
+    const short = decodeShortAscii(view);
+    if (short !== null) return short;
 
     // copy into fresh buffer, TextDecoder.decode() rejects SharedArrayBuffer views (napi-rs/WASI over shared memory)
     if (typeof SharedArrayBuffer !== "undefined" && view.buffer instanceof SharedArrayBuffer) {

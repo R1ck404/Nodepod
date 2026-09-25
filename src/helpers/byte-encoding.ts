@@ -64,3 +64,21 @@ export function bytesToHex(data: Uint8Array): string {
 export function bytesToLatin1(data: Uint8Array): string {
   return bytesToBinaryString(data);
 }
+
+// A native TextDecoder call costs more than decoding an identifier-sized
+// string in JS, and parsers decode one per name (Rollup: every string in
+// its AST). Short all-ASCII input is the same in UTF-8 as in ASCII.
+const SHORT_ASCII_MAX = 64;
+
+/** The string for short all-ASCII bytes, or null (use a TextDecoder). */
+export function decodeShortAscii(data: Uint8Array): string | null {
+  const n = data.length;
+  if (n > SHORT_ASCII_MAX) return null;
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    const c = data[i]!;
+    if (c > 0x7f) return null;
+    out += String.fromCharCode(c);
+  }
+  return out;
+}

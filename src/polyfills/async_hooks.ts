@@ -11,11 +11,25 @@
 
 type StoreFrame = Map<object, unknown>;
 
+// Frames are never modified once they can be captured, so capturing one is a
+// reference, not a copy: every then(), timer and microtask captures the
+// current frame, most of them in programs that never use a store.
 let currentFrame: StoreFrame = new Map();
 let asyncContextInstalled = false;
 
 function captureFrame(): StoreFrame {
-  return new Map(currentFrame);
+  return currentFrame;
+}
+
+// enterWith() replaces the current frame with a copy carrying the store. A
+// run() scope that ends while that copy is current still restores what it
+// replaced, as if enterWith() had changed the scope's frame in place.
+const enteredFrom = new WeakMap<StoreFrame, StoreFrame>();
+
+function frameWith(frame: StoreFrame, key: object, value: unknown): StoreFrame {
+  const next = new Map(frame);
+  next.set(key, value);
+  return next;
 }
 
 const NativePromise = Promise;
@@ -51,7 +65,7 @@ function runScoped<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
   currentFrame = frame;
   const finish = () => {
-    if (currentFrame === frame) {
+    if (currentFrame === frame || enteredFrom.get(currentFrame) === frame) {
       currentFrame = prev;
     }
   };
@@ -74,13 +88,20 @@ function wrapCallback<T extends (...args: any[]) => any>(
   frame: StoreFrame,
 ): T | undefined | null {
   if (typeof cb !== "function") return cb;
-  const wrapped = function (this: unknown, ...args: unknown[]) {
-    // Sync restore (runWithFrame, NOT runScoped): if this callback captured
-    // an empty/stale frame and held it across its own awaits, it would be
-    // current when an active run()'s native-await resumptions fire and would
-    // clobber the run's store. The run's frame is held by runScoped instead,
-    // so restoring here hands control straight back to it.
-    return runWithFrame(frame, () => cb.apply(this, args));
+  // promise reactions get exactly one argument and no receiver
+  const wrapped = function (value: unknown) {
+    // Sync restore (runWithFrame semantics, NOT runScoped): if this callback
+    // captured an empty/stale frame and held it across its own awaits, it
+    // would be current when an active run()'s native-await resumptions fire
+    // and would clobber the run's store. The run's frame is held by
+    // runScoped instead, so restoring here hands control straight back to it.
+    const prev = currentFrame;
+    currentFrame = frame;
+    try {
+      return cb(value);
+    } finally {
+      currentFrame = prev;
+    }
   } as T;
   return wrapped;
 }
@@ -88,6 +109,14 @@ function wrapCallback<T extends (...args: any[]) => any>(
 class ContextPromise<T = unknown> extends NativePromise<T> {
   static get [Symbol.species]() {
     return ContextPromise;
+  }
+
+  // installed as the global Promise: promises from async functions, and
+  // ones made before it was installed, are still promises. Classes that
+  // extend the global Promise inherit this, and keep the usual check
+  static [Symbol.hasInstance](this: unknown, value: unknown): boolean {
+    if (this !== ContextPromise) return Function.prototype[Symbol.hasInstance].call(this, value);
+    return value instanceof NativePromise;
   }
 
   then<TResult1 = T, TResult2 = never>(
@@ -114,8 +143,8 @@ class ContextPromise<T = unknown> extends NativePromise<T> {
   }
 
   static resolve<T>(value?: T | PromiseLike<T>): ContextPromise<T> {
-    if (value instanceof ContextPromise) {
-      return value;
+    if (value != null && (value as { constructor?: unknown }).constructor === ContextPromise) {
+      return value as ContextPromise<T>;
     }
     if (value != null && typeof (value as PromiseLike<T>).then === "function") {
       return new ContextPromise((resolve, reject) => {
@@ -171,7 +200,13 @@ function patchTimerContext(): void {
     const frame = captureFrame();
     return ((...args: unknown[]) => {
       // Sync restore for the same reason as wrapCallback.
-      runWithFrame(frame, () => fn(...args));
+      const prev = currentFrame;
+      currentFrame = frame;
+      try {
+        fn(...args);
+      } finally {
+        currentFrame = prev;
+      }
     }) as F;
   };
 
@@ -183,7 +218,14 @@ function patchTimerContext(): void {
     (globalThis.queueMicrotask as any).__nodepodAsyncCtx = true;
   }
 
-  if (!(globalThis.setTimeout as any)?.__nodepodAsyncCtx) {
+  // a process's own timers (node:timers, which also keep its event loop
+  // count) stay as they are, as they were when this ran before them
+  const ownTimer = (fn: unknown): boolean => {
+    const flags = fn as { __nodepodAsyncCtx?: boolean; __nodepodPatched?: boolean } | undefined;
+    return !!(flags?.__nodepodAsyncCtx || flags?.__nodepodPatched);
+  };
+
+  if (!ownTimer(globalThis.setTimeout)) {
     const origSetTimeout = globalThis.setTimeout.bind(globalThis);
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
       const wrapped =
@@ -193,7 +235,7 @@ function patchTimerContext(): void {
     (globalThis.setTimeout as any).__nodepodAsyncCtx = true;
   }
 
-  if (typeof globalThis.setImmediate === "function" && !(globalThis.setImmediate as any).__nodepodAsyncCtx) {
+  if (typeof globalThis.setImmediate === "function" && !ownTimer(globalThis.setImmediate)) {
     const origSetImmediate = globalThis.setImmediate.bind(globalThis);
     globalThis.setImmediate = ((handler: (...args: unknown[]) => void, ...args: unknown[]) => {
       return origSetImmediate(wrapTimer(handler), ...args);
@@ -202,6 +244,12 @@ function patchTimerContext(): void {
   }
 }
 
+// Installed by the first AsyncLocalStorage, not up front: until a store
+// exists every frame is empty and tracking them is pure overhead, and a
+// subclassed global Promise costs every promise chain (a bundler's plugin
+// hooks: about three times the native time). Promises made before that are
+// native and run their callbacks in whatever frame is current, like the
+// ones async functions return.
 export function installAsyncContext(): void {
   if (asyncContextInstalled) return;
   asyncContextInstalled = true;
@@ -213,8 +261,6 @@ export function installAsyncContext(): void {
 
   patchTimerContext();
 }
-
-installAsyncContext();
 
 /* ------------------------------------------------------------------ */
 /*  AsyncResource                                                      */
@@ -263,6 +309,7 @@ export interface AsyncLocalStorage<T> {
 
 export const AsyncLocalStorage = function AsyncLocalStorage(this: any) {
   if (!this) return;
+  installAsyncContext();
   this._enabled = true;
 } as unknown as {
   new<T>(): AsyncLocalStorage<T>;
@@ -317,20 +364,20 @@ AsyncLocalStorage.prototype.getStore = function getStore() {
 
 AsyncLocalStorage.prototype.run = function run(store: any, fn: (...args: any[]) => any, ...args: any[]) {
   this._stickyStore = store;
-  const frame = captureFrame();
-  frame.set(this, store);
+  const frame = frameWith(currentFrame, this, store);
   return runScoped(frame, () => fn(...args));
 };
 
 AsyncLocalStorage.prototype.exit = function exit(fn: (...args: any[]) => any, ...args: any[]) {
-  const frame = captureFrame();
-  frame.set(this, EXCLUDED);
+  const frame = frameWith(currentFrame, this, EXCLUDED);
   return runScoped(frame, () => fn(...args));
 };
 
 AsyncLocalStorage.prototype.enterWith = function enterWith(store: any): void {
   this._stickyStore = store;
-  currentFrame.set(this, store);
+  const from = currentFrame;
+  currentFrame = frameWith(from, this, store);
+  enteredFrom.set(currentFrame, enteredFrom.get(from) ?? from);
 };
 
 /* ------------------------------------------------------------------ */

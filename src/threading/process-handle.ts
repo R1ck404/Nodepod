@@ -104,7 +104,12 @@ export class ProcessHandle extends EventEmitter {
     this.postMessage(initMsg, transfer);
   }
 
+  // whether this process's stdout is a terminal (a child spawned with
+  // stdio "inherit" gets the same)
+  stdoutIsTTY = true;
+
   exec(execMsg: MainToWorker_Exec): void {
+    if (execMsg.stdoutIsTTY !== undefined) this.stdoutIsTTY = execMsg.stdoutIsTTY;
     this.postMessage(execMsg);
   }
 
@@ -310,6 +315,10 @@ export class ProcessHandle extends EventEmitter {
 
         case "sqlite-preload":
           this.emit("sqlite-preload", msg);
+          break;
+
+        case "pack-save":
+          this.emit("pack-save", msg);
           break;
 
         case "esbuild-module-request":

@@ -18,6 +18,7 @@ import {
 import { EventEmitter } from "./polyfills/events";
 import { Buffer } from "./polyfills/buffer";
 import { bytesToBase64 } from "./helpers/byte-encoding";
+import { beginForegroundActivity, noteForegroundActivity } from "./helpers/foreground-activity";
 
 // Response buffers nothing else references (just received from a process
 // worker): the preview relay may transfer them to the service worker as-is.
@@ -1195,6 +1196,7 @@ export class RequestProxy extends EventEmitter {
     if (!skipCookieInject) {
       this._injectVirtualCookies(instanceId, port, url, headers);
     }
+    const answered = beginForegroundActivity();
     try {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;
       return await entry.server.dispatchRequest(method, url, headers, buf);
@@ -1206,6 +1208,8 @@ export class RequestProxy extends EventEmitter {
         headers: { "Content-Type": "text/plain" },
         body: Buffer.from(msg),
       };
+    } finally {
+      answered();
     }
   }
 
@@ -1639,6 +1643,8 @@ export class RequestProxy extends EventEmitter {
       return;
     }
 
+    // start only: a stream can stay open for as long as the page does
+    noteForegroundActivity();
     const srv = entry.server as any;
     if (typeof srv.handleStreamingRequest === "function") {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;

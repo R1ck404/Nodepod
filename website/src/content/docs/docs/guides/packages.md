@@ -26,7 +26,13 @@ Use `allowedFetchDomains` to extend the built-in package fetch allowlist, or `nu
 ## Keeping package content out of memory
 
 Installed packages are cached in the browser (IndexedDB or OPFS), and repeat
-installs are restored from that cache. By default the restored files are also
+installs are restored from that cache. A tool cache kept inside `node_modules`
+(Vite's pre-bundled dependencies in `node_modules/.vite`) is saved with it and
+comes back only on top of the exact same installed tree, so a restored
+project's dev server can skip its dependency optimization. Vite still checks
+its own lockfile and config hashes and re-optimizes if they differ.
+
+By default the restored files are also
 held in memory on the main thread. For large dependency trees you can page
 them out instead:
 

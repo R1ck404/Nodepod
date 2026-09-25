@@ -2,7 +2,9 @@
 
 import { Buffer } from "./buffer";
 
-export function format(template: unknown, ...values: unknown[]): string {
+export function format(template?: unknown, ...values: unknown[]): string {
+  // console.log() prints an empty line; format(undefined) is "undefined"
+  if (arguments.length === 0) return "";
   if (typeof template !== "string") {
     // non-string first arg: inspect all args
     return [template, ...values].map((v) => typeof v === "string" ? v : inspect(v)).join(" ");

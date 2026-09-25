@@ -31,6 +31,7 @@ import type {
   WorkerToMain_HttpResponse,
   WorkerToMain_HttpClientRequest,
   WorkerToMain_SqlitePreload,
+  WorkerToMain_PackSave,
 } from "./worker-protocol";
 import type { ShellOptions } from "../shell/shell-options";
 import type { VFSBridge } from "./vfs-bridge";
@@ -147,6 +148,14 @@ export class ProcessManager extends EventEmitter {
 
   setSyncBuffer(buf: SharedArrayBuffer): void {
     this._syncBuffer = buf;
+  }
+
+  // saves an install's package pack from this thread's volume (the owner
+  // of the snapshot cache sets it); processes then leave that to it
+  private _packSaver: ((key: string) => void) | null = null;
+
+  setPackSaver(saver: ((key: string) => void) | null): void {
+    this._packSaver = saver;
   }
 
   // "lean" spawns exclude node_modules etc. from snapshots; workers hydrate
@@ -317,6 +326,9 @@ export class ProcessManager extends EventEmitter {
           ? getSharedTransformStore().knownScopes()
           : null
         : undefined,
+      // paged-out package content would have to be read back first: the
+      // process saves its packs itself then
+      deferPackSave: !!this._packSaver && !this._volume.evictionEnabled,
     };
     this._processPorts.set(pid, ownedPorts);
     try {
@@ -1050,6 +1062,10 @@ export class ProcessManager extends EventEmitter {
         const isDirectNodeFile = isNodeBin
           && msg.args.length > 0
           && !msg.args[0].startsWith("-");
+        // stdout read by the parent (the default) is a pipe; an inherited one
+        // is whatever the parent's is
+        const stdoutMode = Array.isArray(msg.stdio) ? msg.stdio[1] : msg.stdio;
+        const stdoutIsTTY = stdoutMode === "inherit" && handle.stdoutIsTTY;
         const sendExec = () => {
           if (isDirectNodeFile) {
             childHandle.exec({
@@ -1059,6 +1075,7 @@ export class ProcessManager extends EventEmitter {
               cwd: msg.cwd,
               env: childEnv(msg.env),
               isShell: false,
+              stdoutIsTTY,
             });
           } else {
             childHandle.exec({
@@ -1069,6 +1086,7 @@ export class ProcessManager extends EventEmitter {
               env: childEnv(msg.env),
               isShell: true,
               shellCommand: fullCmd,
+              stdoutIsTTY,
             });
           }
         };
@@ -1533,7 +1551,16 @@ export class ProcessManager extends EventEmitter {
       });
     });
 
+    handle.on("pack-save", (msg: WorkerToMain_PackSave) => {
+      this._packSaver?.(msg.key);
+    });
+
     handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {
+      // no buffer: cache the bytes for later processes, nobody is waiting
+      if (!msg.sab) {
+        if (!this._volume.existsSync(WASM_CACHE_PATH)) void this._cacheSqliteWasm().catch(() => {});
+        return;
+      }
       handle.holdSync();
       void this._handleSqlitePreload(handle, msg.sab).finally(() => {
         handle.releaseSync();
@@ -1608,6 +1635,8 @@ export class ProcessManager extends EventEmitter {
             env: childEnv(msg.env),
             isShell: true,
             shellCommand: fullCmd,
+            // captured output (execSync's default) is a pipe, not a terminal
+            stdoutIsTTY: (!msg.stdio || msg.stdio[1] === "inherit") && handle.stdoutIsTTY,
           });
         };
 
@@ -1723,6 +1752,38 @@ export class ProcessManager extends EventEmitter {
   private static readonly SAB_STATUS_OK = 1;
   private static readonly SAB_STATUS_FAIL = 2;
 
+  // wa-sqlite's wasm in the volume's cache path (fetched on first use)
+  private _sqliteWasmFetch: Promise<Uint8Array> | null = null;
+  private async _cacheSqliteWasm(): Promise<Uint8Array> {
+    if (this._volume.existsSync(WASM_CACHE_PATH)) {
+      return new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
+    }
+    this._sqliteWasmFetch ??= (async () => {
+      const resp = await fetch(CDN_WA_SQLITE_WASM);
+      if (!resp.ok) {
+        throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
+      }
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      if (this._vfsBridge) {
+        this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
+      } else {
+        const parent = WASM_CACHE_PATH.substring(
+          0,
+          WASM_CACHE_PATH.lastIndexOf("/"),
+        );
+        if (parent && !this._volume.existsSync(parent)) {
+          this._volume.mkdirSync(parent, { recursive: true });
+        }
+        this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
+      }
+      precompileWasm(bytes);
+      return bytes;
+    })().finally(() => {
+      this._sqliteWasmFetch = null;
+    });
+    return this._sqliteWasmFetch;
+  }
+
   private async _handleSqlitePreload(
     handle: ProcessHandle,
     sab: Int32Array,
@@ -1740,29 +1801,7 @@ export class ProcessManager extends EventEmitter {
         WASM_SAB_MAX_BYTES,
       );
 
-      let bytes: Uint8Array;
-      if (this._volume.existsSync(WASM_CACHE_PATH)) {
-        bytes = new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
-      } else {
-        const resp = await fetch(CDN_WA_SQLITE_WASM);
-        if (!resp.ok) {
-          throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
-        }
-        bytes = new Uint8Array(await resp.arrayBuffer());
-        if (this._vfsBridge) {
-          this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
-        } else {
-          const parent = WASM_CACHE_PATH.substring(
-            0,
-            WASM_CACHE_PATH.lastIndexOf("/"),
-          );
-          if (parent && !this._volume.existsSync(parent)) {
-            this._volume.mkdirSync(parent, { recursive: true });
-          }
-          this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
-        }
-        precompileWasm(bytes);
-      }
+      const bytes = await this._cacheSqliteWasm();
 
       if (bytes.byteLength > payloadView.byteLength) {
         throw new Error(
