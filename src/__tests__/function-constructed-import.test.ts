@@ -58,6 +58,24 @@ describe("Function-constructed dynamic import", () => {
     expect((await load("./local.mjs")).where).toBe("lib");
   });
 
+  // prettier's bin/prettier.cjs is the entry script (`npx prettier`), so it
+  // goes through runFileTLA. Its .cjs rewrite used a regex that also hit the
+  // import( inside the string literal, leaving a body that called an unbound
+  // __asyncLoad: "ReferenceError: __asyncLoad is not defined".
+  it("keeps a .cjs entry script's Function body strings intact", async () => {
+    const engine = createEngine({
+      ...DEP,
+      "/project/bin.cjs": [
+        "#!/usr/bin/env node",
+        'var dynamicImport = new Function("module", "return import(module)");',
+        'module.exports.__promise = dynamicImport("zimmerframe");',
+      ].join("\n"),
+    });
+    const { exports } = await engine.runFileTLA("/project/bin.cjs");
+    const r = exports as { __promise: Promise<{ walk: (n: string) => string }> };
+    expect((await r.__promise).walk("y")).toBe("walked:y");
+  });
+
   it("leaves ordinary Function bodies on the native constructor", () => {
     const engine = createEngine({
       "/project/plain.cjs": [

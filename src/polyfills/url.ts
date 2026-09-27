@@ -157,8 +157,21 @@ export function resolve(base: string, target: string): string {
   }
 }
 
-// Re-export the native browser URL and URLSearchParams
-export const URL = globalThis.URL;
+// Chromium reads a file: URL without `//` (`"file:" + __filename`, as zx's
+// cli builds its own URL) as naming a host: file:/home/a -> file://home/a.
+// node, per WHATWG, keeps it all path: file:///home/a.
+export function toNodeFileUrl<T>(input: T): T | string {
+  if (typeof input !== "string") return input;
+  const m = /^file:(?!\/\/)\/?/i.exec(input);
+  return m ? "file:///" + input.slice(m[0].length) : input;
+}
+
+// The native browser URL, parsing file: URLs like node, and URLSearchParams
+export class URL extends globalThis.URL {
+  constructor(url: string | globalThis.URL, base?: string | globalThis.URL) {
+    super(toNodeFileUrl(url), toNodeFileUrl(base));
+  }
+}
 export const URLSearchParams = globalThis.URLSearchParams;
 
 function throwInvalidUrlScheme(protocol: string): never {
@@ -174,7 +187,7 @@ export function fileURLToPath(input: string | URL): string {
     // Bare filesystem path — return as-is
     if (input.startsWith("/") && !hasScheme(input)) return input;
     try {
-      const urlObj = new globalThis.URL(input);
+      const urlObj = new URL(input);
       if (urlObj.protocol !== "file:") {
         throwInvalidUrlScheme(urlObj.protocol);
       }

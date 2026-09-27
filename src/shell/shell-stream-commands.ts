@@ -475,8 +475,10 @@ async function runSed(args: string[], ctx: StreamCommandContext): Promise<Stream
 
 const STREAMABLE = new Set(["echo", "printf", "yes", "cat", "head", "tail", "wc", "grep", "sort", "uniq", "cut", "tr", "sed"]);
 
+// /usr/local/bin is where `which` and process.execPath place node and the
+// package managers (tsx spawns process.execPath)
 export function canonicalVirtualCommandName(name: string): string {
-  const match = name.match(/^\/(?:usr\/)?bin\/([^/]+)$/);
+  const match = name.match(/^\/(?:usr\/(?:local\/)?)?bin\/([^/]+)$/);
   return match ? match[1] : name;
 }
 

@@ -1376,6 +1376,12 @@ PassThrough.prototype.write = function write(
   encOrCb?: string | ((err?: Error | null) => void),
   cb?: (err?: Error | null) => void,
 ): boolean {
+  // a _write of its own replaces the pass-through, as it replaces
+  // Transform's in node: fast-glob's static reader assigns one to a
+  // PassThrough and pushes (then ends) from it; skipping it hung the glob
+  if (this._write !== Duplex.prototype._write) {
+    return Duplex.prototype.write.call(this, chunk, encOrCb, cb);
+  }
   const stored =
     !this._writeObjectMode && !this._objectMode && typeof chunk === "string"
       ? Buffer.from(chunk)

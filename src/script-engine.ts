@@ -47,6 +47,21 @@ import * as hashingPolyfill from "./polyfills/crypto";
 import * as compressionPolyfill from "./polyfills/zlib";
 import * as dnsPolyfill from "./polyfills/dns";
 import bufferPolyfill, { Buffer as NodeBuffer } from "./polyfills/buffer";
+// Descriptor for a Proxy that forwards to `source` over an empty target. The
+// target never has the property, so reporting it non-configurable breaks the
+// Proxy invariant and throws. ES module namespaces (the lazily imported
+// child_process polyfill) and esbuild's __export getters are non-configurable,
+// and esbuild's __toESM reads every descriptor (zx: `'getOwnPropertyDescriptor'
+// on proxy: trap reported non-configurability for property 'ShellProcess'`).
+function forwardedDescriptor(
+  source: object,
+  prop: string | symbol,
+): PropertyDescriptor | undefined {
+  const desc = Object.getOwnPropertyDescriptor(source, prop);
+  if (desc) desc.configurable = true;
+  return desc;
+}
+
 // child_process is lazy-loaded to avoid pulling in the shell at import time
 let _shellExecPolyfill: any = null;
 let _initShellExec: ((vol: any) => void) | null = null;
@@ -61,7 +76,7 @@ const shellExecProxy = new Proxy({} as any, {
   },
   getOwnPropertyDescriptor(_target, prop) {
     if (!_shellExecPolyfill) return undefined;
-    return Object.getOwnPropertyDescriptor(_shellExecPolyfill, prop);
+    return forwardedDescriptor(_shellExecPolyfill, prop);
   },
   has(_target, prop) {
     if (!_shellExecPolyfill) return false;
@@ -1743,7 +1758,7 @@ const CORE_MODULES: Record<string, unknown> = {
     },
     getOwnPropertyDescriptor(_t, prop) {
       if (!_shellExecPolyfill?.promises) return undefined;
-      return Object.getOwnPropertyDescriptor(_shellExecPolyfill.promises, prop);
+      return forwardedDescriptor(_shellExecPolyfill.promises, prop);
     },
     has(_t, prop) {
       if (!_shellExecPolyfill?.promises) return false;
@@ -1973,6 +1988,9 @@ function wrapConsole(
 }
 
 // ── Module resolver & loader ──
+// each engine's own fs.readFileSync, to tell when user code has replaced it
+const ownReadFileSync = new WeakMap<FsBridge, FsBridge["readFileSync"]>();
+
 function buildResolver(
   vol: MemoryVolume,
   fsBridge: FsBridge,
@@ -2030,6 +2048,16 @@ function buildResolver(
       missingManifests.set(manifestPath, null);
       return null;
     }
+  };
+
+  // Node reads module source through fs.readFileSync, and tools patch it to
+  // rewrite what require() evaluates (vue-tsc's runTsc adds .vue support to
+  // typescript/lib/tsc.js that way): use a replaced one, else the volume
+  const readModuleSource = (p: string): string => {
+    if (fsBridge.readFileSync === ownReadFileSync.get(fsBridge)) {
+      return vol.readFileSync(p, "utf8");
+    }
+    return String(fsBridge.readFileSync(p, "utf8"));
   };
 
   // statSync(p).isFile() / isDirectory() without building a stat object
@@ -2446,7 +2474,7 @@ function buildResolver(
     cache[resolved] = record;
 
     if (resolved.endsWith(".json")) {
-      const raw = vol.readFileSync(resolved, "utf8");
+      const raw = readModuleSource(resolved);
       record.exports = JSON.parse(raw);
       record.loaded = true;
       return record;
@@ -2470,7 +2498,7 @@ function buildResolver(
       return record;
     }
 
-    const rawSource = vol.readFileSync(resolved, "utf8");
+    const rawSource = readModuleSource(resolved);
     const dir = pathPolyfill.dirname(resolved);
     const moduleExportName = pickModuleExportName(rawSource);
 
@@ -3054,7 +3082,7 @@ function buildResolver(
         },
         getOwnPropertyDescriptor(_t, prop) {
           if (!rec.exports) return undefined;
-          return Object.getOwnPropertyDescriptor(rec.exports as any, prop);
+          return forwardedDescriptor(rec.exports as any, prop);
         },
       });
     }
@@ -3138,6 +3166,7 @@ export class ScriptEngine {
       onStderr: opts.onStderr,
     });
     this.fsBridge = buildFileSystemBridge(vol, () => this.proc.cwd());
+    ownReadFileSync.set(this.fsBridge, this.fsBridge.readFileSync);
     this.opts = opts;
 
     // Don't call initShellExec here — Nodepod.boot() sets up the shell with correct cwd
@@ -3324,9 +3353,12 @@ export class ScriptEngine {
     }
 
     // bundlers (rolldown, rollup, Vite) prefix virtual module paths with null bytes (\0module, %00module), but Chrome's URL constructor rejects those — sanitize while keeping the virtual semantics
+    // Chrome also reads `file:/abs` as host "abs": parse file: URLs like node
     if (!(globalThis.URL as any).__nodepodPatched) {
       const OrigURL = globalThis.URL;
       const PatchedURL = function URL(this: any, url: string, base?: string) {
+        url = urlPolyfill.toNodeFileUrl(url);
+        base = urlPolyfill.toNodeFileUrl(base);
         try {
           if (base !== undefined) return new OrigURL(url, base);
           return new OrigURL(url);
@@ -3892,8 +3924,17 @@ export class ScriptEngine {
     const moduleExportName = pickModuleExportName(processed);
     let tla = false;
     if (filename.endsWith(".cjs")) {
-      processed = rewriteDynamicImportsRegex(processed);
-      processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
+      // Lexer positions skip string literals: the regex would also rewrite
+      // `new Function("m", "return import(m)")` (prettier's bin), leaving a
+      // body that calls an __asyncLoad the scoped Function never binds.
+      const lexed =
+        processed.length <= LEXER_MAX_CHARS ? lexModule(processed) : null;
+      if (lexed) {
+        processed = patchDynamicImports(processed, lexed);
+      } else {
+        processed = rewriteDynamicImportsRegex(processed);
+        processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
+      }
     } else {
       const converted = convertModuleSyntaxDetailed(
         processed,

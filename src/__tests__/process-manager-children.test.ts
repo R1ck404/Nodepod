@@ -9,6 +9,7 @@ class FakeWorker {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: ((event: ErrorEvent) => void) | null = null;
   messages: any[] = [];
+  listeners: Array<(event: MessageEvent) => void> = [];
 
   constructor() {
     FakeWorker.instances.push(this);
@@ -19,8 +20,15 @@ class FakeWorker {
   }
 
   terminate(): void {}
-  addEventListener(): void {}
+  addEventListener(type: string, fn: (event: MessageEvent) => void): void {
+    if (type === "message") this.listeners.push(fn);
+  }
   removeEventListener(): void {}
+
+  // a message from the worker to the main thread
+  send(data: unknown): void {
+    for (const fn of this.listeners) fn({ data } as MessageEvent);
+  }
 }
 
 const resizes = (worker: FakeWorker) =>
@@ -80,5 +88,36 @@ describe("child process environment", () => {
     const init = FakeWorker.instances.at(-1)!.messages.find((m) => m?.type === "init");
     expect(init.env).toEqual({ KEPT: "yes", COUNT: "3" });
     expect("GONE" in init.env).toBe(false);
+  });
+});
+
+describe("worker_threads children", () => {
+  it("ends a thread's workers when the thread exits, so its exit is not held forever", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const owner = manager.spawn({ command: "node", args: ["build.js"], cwd: "/", env: {} });
+    const ownerWorker = FakeWorker.instances.at(-1)!;
+    const exits: number[] = [];
+    owner.on("exit", (code: number) => exits.push(code));
+
+    // new Worker(...) that the owner unref()s while it still listens on parentPort
+    owner.emit("workerthread-request", {
+      type: "workerthread-request",
+      requestId: 1,
+      modulePath: "/analyse.js",
+      args: [],
+      cwd: "/",
+      env: {},
+      workerData: null,
+      threadId: 1,
+    });
+    const threadWorker = FakeWorker.instances.at(-1)!;
+    expect(threadWorker).not.toBe(ownerWorker);
+
+    ownerWorker.send({ type: "exit", exitCode: 0 });
+    expect(exits).toEqual([]);
+    expect(threadWorker.messages).toContainEqual({ type: "signal", signal: "SIGTERM" });
+
+    threadWorker.send({ type: "exit", exitCode: 130 });
+    expect(exits).toEqual([0]);
   });
 });

@@ -5,6 +5,7 @@ import {
   shellQuote,
   shellCommandFromArgv,
   spawn,
+  spawnSync,
   setSpawnChildCallback,
   setStreamingCallbacks,
   clearStreamingCallbacks,
@@ -118,6 +119,22 @@ describe("spawn env inheritance", () => {
     await new Promise<void>((resolve) => child.once("exit", () => resolve()));
   });
 
+  it("shows a non-streaming child's output where it is inherited", async () => {
+    // `node --version` returns its output at exit instead of streaming it
+    setSpawnChildCallback(async () => ({ pid: 2, exitCode: 0, stdout: "v22.0.0\n", stderr: "warn\n" }));
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    setStreamingCallbacks({
+      onStdout: (text) => stdout.push(text),
+      onStderr: (text) => stderr.push(text),
+    });
+
+    const child = spawn("node", ["--version"], { stdio: "inherit" });
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    expect(stdout).toEqual(["v22.0.0\n"]);
+    expect(stderr).toEqual(["warn\n"]);
+  });
+
   it("streams shell node binary output and inherits stdin before the child exits", async () => {
     const volume = new MemoryVolume();
     volume.writeFileSync("/dev-server.js", "");
@@ -183,6 +200,47 @@ describe("browser-incompatible native binaries", () => {
     await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     expect(child.exitCode).toBe(127);
     expect(stderr).toMatch(/Pin `typescript` to 5\.9\.x/);
+  });
+
+  // TypeScript 7's tsc.js runs it with execFileSync(exe, args, { stdio: "inherit" })
+  it("writes the notice to an inherited stderr from spawnSync", () => {
+    const stderr: string[] = [];
+    setStreamingCallbacks({ onStderr: (text) => stderr.push(text) });
+    try {
+      const result = spawnSync("/project/node_modules/typescript/lib/tsc", ["--version"], {
+        stdio: "inherit",
+      });
+      expect(result.status).toBe(127);
+      expect(stderr.join("")).toMatch(/Pin `typescript` to 5\.9\.x/);
+    } finally {
+      clearStreamingCallbacks();
+    }
+  });
+});
+
+// process.execPath and `which node` are /usr/local/bin/node; tsx re-runs
+// its entry through process.execPath with preload flags
+describe("node by its absolute path", () => {
+  it("runs /usr/local/bin/node like node", async () => {
+    const volume = new MemoryVolume();
+    volume.mkdirSync("/app", { recursive: true });
+    volume.writeFileSync("/app/preflight.cjs", "");
+    volume.writeFileSync("/app/loader.mjs", "");
+    volume.writeFileSync(
+      "/app/hello.ts",
+      "await new Promise<void>((r) => setTimeout(r, 5));\nconst msg: string = 'tsx works';\nconsole.log(msg);\n",
+    );
+    initShellExec(volume, { cwd: "/app" });
+
+    const result = await new Promise<{ error: Error | null; stdout: string }>((resolve) => {
+      shellExec(
+        "/usr/local/bin/node --require /app/preflight.cjs --import file:///app/loader.mjs hello.ts",
+        {},
+        (error, stdout) => resolve({ error, stdout: String(stdout) }),
+      );
+    });
+    expect(result.error).toBeNull();
+    expect(result.stdout).toBe("tsx works\n");
   });
 });
 
