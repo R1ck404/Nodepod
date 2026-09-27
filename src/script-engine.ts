@@ -258,6 +258,71 @@ function pickModuleExportName(source: string): string {
   return candidate;
 }
 
+// Static imports and re-exports of a module the engine converts load through
+// this binding (declared by buildModuleWrapper): a name the source can't
+// hold, like the module binding it derives from.
+function importCallName(moduleExportName: string): string {
+  return `${moduleExportName}_import`;
+}
+
+/** Specifiers of a converted module's static imports and re-exports, in order. */
+function staticImportsOf(code: string, moduleExportName: string): string[] {
+  const call = importCallName(moduleExportName) + "(";
+  if (!code.includes(call)) return [];
+  const specs: string[] = [];
+  // the conversion writes each specifier with JSON.stringify
+  const re = new RegExp(`\\b${importCallName(moduleExportName)}\\(("(?:[^"\\\\\\n]|\\\\.)*")\\)`, "g");
+  for (const m of code.matchAll(re)) specs.push(JSON.parse(m[1]));
+  return specs;
+}
+
+// Modules evaluating asynchronously: ones with top-level await loaded by an
+// import that can wait for them, and the modules importing those. Whoever
+// imports one waits for this before running its own body.
+const pendingEvaluations = new WeakMap<ModuleRecord, Promise<void>>();
+
+/** Thrown by a static import of a module still evaluating (see runModuleBody). */
+class ImportPending {
+  constructor(readonly ready: Promise<void>) {}
+}
+
+/**
+ * Runs a module body whose static imports may evaluate asynchronously. An
+ * import of a module still evaluating stops the body (ImportPending; imports
+ * are its first statements, after only the hoisted function exports cyclic
+ * importers rely on), the rest of its imports load, and once they are done
+ * the body runs again, finding them all evaluated. Null when the body
+ * finished synchronously.
+ */
+function runModuleBody(
+  evaluate: () => unknown,
+  isAsync: boolean,
+  loadImports: () => Promise<void> | null,
+): Promise<void> | null {
+  let wait: Promise<void> | null = null;
+  if (!isAsync) {
+    try {
+      evaluate();
+      return null;
+    } catch (err) {
+      if (!(err instanceof ImportPending)) throw err;
+      wait = loadImports() ?? err.ready;
+    }
+  }
+  return (async () => {
+    for (;;) {
+      if (wait) await wait;
+      try {
+        await evaluate();
+        return;
+      } catch (err) {
+        if (!(err instanceof ImportPending)) throw err;
+        wait = loadImports() ?? err.ready;
+      }
+    }
+  })();
+}
+
 function convertModuleSyntaxDetailed(
   source: string,
   filePath: string,
@@ -324,6 +389,7 @@ function convertViaAst(
   if (hasImportDecl || hasExportDecl) {
     collectEsmCjsPatches(ast, source, patches, {
       exportTarget: `${moduleExportName}.exports`,
+      importCall: moduleExportName === "module" ? undefined : importCallName(moduleExportName),
       liveImports: true,
     });
   }
@@ -563,7 +629,7 @@ function buildModuleWrapper(
   let vars = `var exports = $exports;
 var require = $require;
 var module = $module;
-${moduleExportName ? `var ${moduleExportName} = $module;\n` : ""}var __filename = $filename;
+${moduleExportName ? `var ${moduleExportName} = $module;\nvar ${importCallName(moduleExportName)} = $require.esm || $require;\n` : ""}var __filename = $filename;
 var __dirname = $dirname;
 `;
   if (includeViteVars) {
@@ -1094,6 +1160,13 @@ function asyncBody(body: () => unknown): Promise<unknown> {
   }
   return new SyncPromiseClass((resolve) => resolve(value));
 }
+/**
+ * Async function in a module with top-level await (the "scoped" transform):
+ * called while a top-level await is being unwrapped it runs de-asynced, so
+ * `await f()` settles on the spot; any other call stays natively async.
+ */
+asyncBody.pick = (deAsynced: () => unknown, native: () => Promise<unknown>): Promise<unknown> =>
+  syncScopeDepth() > 0 ? asyncBody(deAsynced) : native();
 // reaches module wrappers alongside syncAwaitFn (see buildModuleWrapper)
 (syncAwaitFn as typeof syncAwaitFn & { asyncBody?: typeof asyncBody }).asyncBody = asyncBody;
 
@@ -1622,19 +1695,25 @@ type DynamicLoader = ((specifier: string) => SyncThenable<unknown> | Promise<unk
 function makeDynamicLoader(resolver: ResolverFn): DynamicLoader {
   const load = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
     try {
-      const loaded = resolver(specifier);
-      return new SyncThenable(toImportNamespace(loaded));
+      return loadNow(specifier);
     } catch (err) {
       if (!(err instanceof AsyncModuleInitializationRequired)) throw err;
 
       // Dynamic imports can happen from async callbacks after the entry module
       // has already returned. Await and retry at this boundary so those late
       // imports cannot receive an uninitialized synchronous polyfill.
-      return err.ready.then(() => {
-        const loaded = resolver(specifier);
-        return toImportNamespace(loaded);
-      });
+      return err.ready.then(() => loadNow(specifier));
     }
+  };
+  const loadNow = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+    // inside a synchronous unwrap (a module de-asynced for top-level await)
+    // the import has to settle on the spot, so it loads the synchronous way
+    if (resolver.importDynamic && syncScopeDepth() === 0) {
+      const { record, exports, pending } = resolver.importDynamic(specifier);
+      if (pending) return pending.then(() => toImportNamespace(record!.exports));
+      return new SyncThenable(toImportNamespace(exports));
+    }
+    return new SyncThenable(toImportNamespace(resolver(specifier)));
   };
   return Object.assign(load, { Function: makeScopedFunction(load) });
 }
@@ -1708,6 +1787,23 @@ export interface ResolverFn {
   extensions: Record<string, unknown>;
   main: ModuleRecord | null;
   _ownerRecord?: ModuleRecord;
+  /**
+   * Loads a module's static imports. Returns a promise when one of them
+   * evaluates asynchronously (top-level await), which the module's body must
+   * wait for; null otherwise.
+   */
+  preloadImports: (specifiers: string[]) => Promise<void> | null;
+  /**
+   * A static import from a module whose body can wait: throws ImportPending
+   * for a module still evaluating. Absent where imports load like require().
+   */
+  esm?: (id: string) => unknown;
+  /**
+   * import(): loads `id` like a static import, so top-level await in its
+   * graph runs natively. `pending` is set while it is still evaluating.
+   * Absent where imports can't wait (modules de-asynced for top-level await).
+   */
+  importDynamic?: (id: string) => { record: ModuleRecord | null; exports: unknown; pending: Promise<void> | null };
 }
 
 /** Build the Node-compatible import.meta object for a module under `resolver`. */
@@ -2004,6 +2100,8 @@ function buildResolver(
   opts: EngineOptions,
   codeCache?: Map<string, string>,
   deAsyncImports = false,
+  // static imports can wait for a module evaluating asynchronously (see esm)
+  asyncImports = false,
 ): ResolverFn {
   // Shared across all resolvers — avoids re-resolving the same paths/manifests per module
   // Use bounded LRU when a memory handler is available, else plain Map
@@ -2460,9 +2558,12 @@ function buildResolver(
     throw e;
   };
 
+  // `viaImport`: loaded for a static import or import() whose importer can
+  // wait, so top-level await in it runs natively (see preloadImports)
   const loadModule = (
     resolved: string,
     parentRecord?: ModuleRecord,
+    viaImport = false,
   ): ModuleRecord => {
     if (cache[resolved]) return cache[resolved];
 
@@ -2692,18 +2793,24 @@ function buildResolver(
 
     const isCjs = resolved.endsWith(".cjs");
     let useFullDeAsync = false;
+    // top-level await that runs natively, the module evaluating asynchronously
+    let asyncEval = false;
     let childResolver!: ResolverFn;
     const finishTransform = (): void => {
       if (!isCjs && !tlaKnown) {
         moduleHasTLA = hasTopLevelAwait(processedCode!);
       }
-      useFullDeAsync = deAsyncImports || moduleHasTLA;
-      // Without top-level await (and outside de-async mode) the top-level-only
-      // strip is a no-op, so skip its full re-parse.
+      asyncEval = viaImport && moduleHasTLA && !isCjs;
+      // required instead (require() can't wait), top-level await is unwrapped
+      // synchronously and so is everything this module imports
+      useFullDeAsync = deAsyncImports || (moduleHasTLA && !asyncEval);
+      // Without top-level await (and outside de-async mode) the strip is a
+      // no-op, so skip its full re-parse. A module with top-level await gets
+      // its own async functions de-asynced only for calls its awaits unwrap.
       if (!isCjs && useFullDeAsync)
         processedCode = stripTopLevelAwait(
           processedCode!,
-          deAsyncImports ? "full" : "topLevelOnly",
+          deAsyncImports ? "full" : "scoped",
         );
 
       childResolver = buildResolver(
@@ -2715,6 +2822,7 @@ function buildResolver(
         opts,
         codeCache,
         useFullDeAsync,
+        viaImport && !useFullDeAsync,
       );
       childResolver.cache = cache;
       childResolver._ownerRecord = record;
@@ -2724,7 +2832,7 @@ function buildResolver(
     const wrappedConsole = wrapConsole(opts.onConsole);
 
     try {
-      let wrapper = buildModuleWrapper(processedCode!, { moduleExportName });
+      let wrapper = buildModuleWrapper(processedCode!, { moduleExportName, async: asyncEval });
 
       let fn;
       try {
@@ -2737,7 +2845,7 @@ function buildResolver(
           transformSource(false);
           publishTransform();
           finishTransform();
-          wrapper = buildModuleWrapper(processedCode!, { moduleExportName });
+          wrapper = buildModuleWrapper(processedCode!, { moduleExportName, async: asyncEval });
           try {
             fn = (0, eval)(wrapper);
           } catch (retryErr) {
@@ -2753,20 +2861,46 @@ function buildResolver(
       }
 
       const asyncLoader = makeDynamicLoader(childResolver);
-      fn(
-        record.exports,
-        childResolver,
-        record,
-        resolved,
-        dir,
-        proc,
-        wrappedConsole,
-        importMetaForModule(childResolver, resolved, dir),
-        asyncLoader,
-        syncAwait,
-        syncAwaitFn,
-        SyncPromiseClass,
+      const evaluate = (): unknown =>
+        fn(
+          record.exports,
+          childResolver,
+          record,
+          resolved,
+          dir,
+          proc,
+          wrappedConsole,
+          importMetaForModule(childResolver, resolved, dir),
+          asyncLoader,
+          syncAwait,
+          syncAwaitFn,
+          SyncPromiseClass,
+        );
+
+      // Imported where the importer can wait: an import of a module still
+      // evaluating asynchronously makes this one wait for it too (and so its
+      // importers, up to the entry or the import() that can wait)
+      const evaluating = runModuleBody(evaluate, asyncEval, () =>
+        childResolver.preloadImports(staticImportsOf(processedCode!, moduleExportName)),
       );
+      if (evaluating) {
+        const evaluation = evaluating.then(
+          () => {
+            pendingEvaluations.delete(record);
+            record.loaded = true;
+            patchFetchNodeAdapterExports(record.exports as Record<string, unknown>);
+            settleLiveImports(record);
+          },
+          (err) => {
+            pendingEvaluations.delete(record);
+            if (cache[resolved] === record) delete cache[resolved];
+            throw err;
+          },
+        );
+        pendingEvaluations.set(record, evaluation);
+        (globalThis as any).__loadModuleDepth = _loadDepth - 1;
+        return record;
+      }
 
       record.loaded = true;
       patchFetchNodeAdapterExports(
@@ -2843,9 +2977,11 @@ function buildResolver(
     return record;
   };
 
-  // Typed as ResolverFn only after resolve/cache/extensions/main are attached
-  // below — defineProperty(main) is invisible to the checker at declaration.
-  const resolver = ((id: string): unknown => {
+  // require(id); `viaImport` loads it for an import that can wait on it
+  // (see loadModule). `resolver` below is typed as ResolverFn only after
+  // resolve/cache/extensions/main are attached — defineProperty(main) is
+  // invisible to the checker at declaration.
+  const requireFrom = (id: string, viaImport: boolean): unknown => {
     if (typeof id !== "string") {
       // Match real Node.js error: TypeError with ERR_INVALID_ARG_TYPE code
       const err: any = new TypeError(
@@ -3063,7 +3199,8 @@ function buildResolver(
 
     let rec: ModuleRecord;
     try {
-      rec = loadModule(resolved, resolver._ownerRecord);
+      rec = loadModule(resolved, resolver._ownerRecord, viaImport);
+      lastLoaded = rec;
     } catch (loadErr: any) {
       // When a bare module fails to load (e.g. native binding not found inside
       // the module), try a WASM drop-in replacement: {name}-wasm or {name}-wasm32-wasi
@@ -3141,7 +3278,35 @@ function buildResolver(
       });
     }
     return rec.exports;
-  }) as ResolverFn;
+  };
+  // the record requireFrom() last loaded a file module for (null for core
+  // modules and polyfills): how an import finds out it has to wait
+  let lastLoaded: ModuleRecord | null = null;
+  const importRecord = (id: string): { record: ModuleRecord | null; exports: unknown; pending: Promise<void> | null } => {
+    lastLoaded = null;
+    const exports = requireFrom(id, true);
+    const record = lastLoaded as ModuleRecord | null;
+    return { record, exports, pending: record ? pendingEvaluations.get(record) ?? null : null };
+  };
+
+  const resolver = ((id: string): unknown => requireFrom(id, false)) as ResolverFn;
+
+  resolver.preloadImports = (specifiers: string[]): Promise<void> | null => {
+    let waits: Promise<void>[] | null = null;
+    for (const id of specifiers) {
+      const { pending } = importRecord(id);
+      if (pending) (waits ??= []).push(pending);
+    }
+    return waits && Promise.all(waits).then(() => {});
+  };
+  if (!deAsyncImports) resolver.importDynamic = importRecord;
+  if (asyncImports) {
+    resolver.esm = (id: string): unknown => {
+      const { exports, pending } = importRecord(id);
+      if (pending) throw new ImportPending(pending);
+      return exports;
+    };
+  }
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
     // CORE_MODULES also contains non-builtin package shims (for example
@@ -4046,7 +4211,8 @@ export class ScriptEngine {
     const tlaStripped = stripTopLevelAwait(processed);
 
     // Don't propagate deAsyncImports from entry — it uses native await (async IIFE),
-    // so deps don't need de-async. loadModule handles individual TLA modules.
+    // so deps don't need de-async, and its imports wait for modules with
+    // top-level await (asyncImports), which evaluate natively.
     const resolver = buildResolver(
       this.vol,
       this.fsBridge,
@@ -4056,61 +4222,41 @@ export class ScriptEngine {
       this.opts,
       this.transformCache,
       false,
+      true,
     );
     resolver._ownerRecord = mod;
     markResolverMain(resolver, mod);
 
-    if (!tla) {
-      try {
-        processed = tlaStripped;
-        const wrapper = buildModuleWrapper(processed, { moduleExportName });
-        const asyncLoader = makeDynamicLoader(resolver);
-        const fn = (0, eval)(wrapper);
-
-        fn(
-          mod.exports,
-          resolver,
-          mod,
-          filename,
-          dir,
-          this.proc,
-          consoleProxy,
-          importMetaForModule(resolver, filename, dir),
-          asyncLoader,
-          syncAwait,
-          syncAwaitFn,
-          SyncPromiseClass,
-        );
-        mod.loaded = true;
-        settleLiveImports(mod);
-      } catch (err) {
-        delete this.moduleRegistry[filename];
-        throw err;
-      }
-      return { exports: mod.exports, module: mod };
-    }
-
+    // an import of a module evaluating asynchronously (top-level await in
+    // its graph) is waited for, see runModuleBody
     try {
+      if (!tla) processed = tlaStripped;
       const wrapper = buildModuleWrapper(processed, {
-        async: true,
+        async: tla,
         moduleExportName,
       });
       const asyncLoader = makeDynamicLoader(resolver);
       const fn = (0, eval)(wrapper);
-      await fn(
-        mod.exports,
-        resolver,
-        mod,
-        filename,
-        dir,
-        this.proc,
-        consoleProxy,
-        importMetaForModule(resolver, filename, dir),
-        asyncLoader,
-        syncAwait,
-        syncAwaitFn,
-        SyncPromiseClass,
+      const evaluating = runModuleBody(
+        () =>
+          fn(
+            mod.exports,
+            resolver,
+            mod,
+            filename,
+            dir,
+            this.proc,
+            consoleProxy,
+            importMetaForModule(resolver, filename, dir),
+            asyncLoader,
+            syncAwait,
+            syncAwaitFn,
+            SyncPromiseClass,
+          ),
+        tla,
+        () => resolver.preloadImports(staticImportsOf(processed, moduleExportName)),
       );
+      if (evaluating) await evaluating;
       mod.loaded = true;
       settleLiveImports(mod);
     } catch (err) {

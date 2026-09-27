@@ -69,7 +69,7 @@ describe("issue 85: named exports survive a module-level `var exports`", () => {
       "__m.exports.K = K",
       "__m.exports.renamed = a",
       "__m.exports.y = ",
-      "Object.assign(__m.exports, require(\"./star.js\"))",
+      "})(__m.exports, require(\"./star.js\"))",
       "__m.exports[\"ns\"] = require(\"./ns.js\")",
       "__m.exports.default = 42",
     ]) {
