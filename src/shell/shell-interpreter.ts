@@ -417,6 +417,7 @@ export class NodepodShell {
 
     // dispatch: builtin > registered command > PATH lookup > error
     const builtin = builtins.get(name) ?? builtins.get(canonicalVirtualCommandName(name));
+    const command = this.commands.get(name) ?? this.commands.get(canonicalVirtualCommandName(name));
     if (builtin) {
       const r = builtin(args, ctx, stdin);
       result = await r;
@@ -428,9 +429,9 @@ export class NodepodShell {
       result = await this.handleSource(args);
     } else if (name === "history") {
       result = this.handleHistory(args);
-    } else if (this.commands.has(name)) {
+    } else if (command) {
       try {
-        result = await this.commands.get(name)!.execute(args, ctx);
+        result = await command.execute(args, ctx);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         result = {
@@ -1158,6 +1159,9 @@ export class NodepodShell {
       return { stdout: "", stderr: "", exitCode: this.lastCommandSubstitutionExit };
     }
 
+    // the installed paths name the same shells: spawn's `shell` option and
+    // `which bash` (zx) hand out /bin/sh and /bin/bash
+    if (/^(?:\/usr)?\/bin\/(?:ba)?sh$/.test(args[0])) args[0] = args[0].slice(args[0].lastIndexOf("/") + 1);
     if ((args[0] === "bash" || args[0] === "sh") && args[1] === "-c") {
       const previous = this.positional;
       const previousName = this.shellName;
@@ -1689,6 +1693,15 @@ export class NodepodShell {
       for (const device of ["null", "stdin", "stdout", "stderr", "zero"]) {
         const path = `/dev/${device}`;
         if (!this.volume.existsSync(path)) this.volume.writeFileSync(path, "");
+      }
+      // sh and bash are built in; executable entries let PATH lookups
+      // (`which bash`, zx picking its shell) find them where node would
+      this.volume.mkdirSync("/bin", { recursive: true, mode: 0o755 });
+      for (const shell of ["sh", "bash"]) {
+        const path = `/bin/${shell}`;
+        if (this.volume.existsSync(path)) continue;
+        this.volume.writeFileSync(path, "# built into the nodepod shell\n");
+        this.volume.chmodSync(path, 0o755);
       }
     } catch {
       // Read-only snapshots can still use the path-aware stream adapters.

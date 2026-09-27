@@ -1405,7 +1405,16 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
+        // node terminates a thread's workers when the thread exits (an
+        // unref()'d worker still listening on parentPort included). the exit
+        // of the owner is held for its children, so end the worker here.
+        const endWithOwner = () => {
+          if (childHandle.state !== "exited") this._killWithFallback(childHandle, "SIGTERM");
+        };
+        handle.on("worker-done", endWithOwner);
+
         childHandle.on("exit", (exitCode: number) => {
+          handle.removeListener("worker-done", endWithOwner);
           if (msg.isEval) {
             try {
               this._volume.unlinkSync(`/__wt_eval_${msg.threadId}__.js`);

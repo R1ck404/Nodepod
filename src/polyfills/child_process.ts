@@ -818,6 +818,18 @@ export function shellCommandFromArgv(command: string, args: string[]): string {
   return `${shellQuote(command)} ${args.map(shellQuote).join(" ")}`;
 }
 
+// spawn's `shell` option, as node does it on POSIX: the command and its args
+// joined into one line that `<shell> -c` parses (zx runs every $`...` so)
+function applyShellOption(
+  command: string,
+  args: string[],
+  shell: SpawnConfig["shell"],
+): [string, string[]] {
+  if (!shell) return [command, args];
+  const line = [command, ...args].join(" ");
+  return [typeof shell === "string" ? shell : "/bin/sh", ["-c", line]];
+}
+
 /** Parent env for spawn when options.env is omitted (Node parity). */
 function resolveSpawnEnv(): Record<string, string> {
   const fromProcess = (globalThis as any).process?.env;
@@ -1520,10 +1532,14 @@ export async function executeNodeBinary(
       proc.connected = false;
     }) as () => void;
 
-    // incoming IPC from parent → emit on process (also replays queued messages)
-    setIPCReceiveHandler((data: unknown) => {
-      proc.emit("message", data);
-    });
+    // incoming IPC from parent → emit on process (also replays queued messages).
+    // a worker thread's parent messages belong to its parentPort, whose
+    // receiver the worker entry already installed: keep that one.
+    if (!opts?.workerThreadsOverride) {
+      setIPCReceiveHandler((data: unknown) => {
+        proc.emit("message", data);
+      });
+    }
   }
 
   const prevLiveStdin = _liveStdin;
@@ -2542,6 +2558,7 @@ export function spawn(
     spawnArgs = argsOrOpts;
     cfg = opts ?? {};
   } else if (argsOrOpts) cfg = argsOrOpts;
+  [command, spawnArgs] = applyShellOption(command, spawnArgs, cfg.shell);
 
   const child = new ShellProcess();
   const unsupportedNativeMessage = getUnsupportedNativeExecutableMessage(command);
@@ -2622,9 +2639,16 @@ export function spawn(
     operation.then(({ pid, exitCode, stdout, stderr }) => {
       childHandle.close();
       child.pid = pid;
-      // For commands that don't stream (builtins), push the buffered output
-      if (!stdoutStreamed && stdout) child.stdout?.push(Buffer.from(stdout));
-      if (!stderrStreamed && stderr) child.stderr?.push(Buffer.from(stderr));
+      // For commands that don't stream (builtins), push the buffered output,
+      // and show it where it is inherited (tsx --version runs node --version)
+      if (!stdoutStreamed && stdout) {
+        child.stdout?.push(Buffer.from(stdout));
+        if (stdoutInherit) getStdoutSink()?.(stdout);
+      }
+      if (!stderrStreamed && stderr) {
+        child.stderr?.push(Buffer.from(stderr));
+        if (stderrInherit) getStderrSink()?.(stderr);
+      }
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = exitCode;
@@ -2693,8 +2717,11 @@ export function spawnSync(
   }
 
   // Keep argv intact for sync builtins and the Atomics path — never join/split
-  // on whitespace (that destroys args that contain spaces).
-  const shellCommand = shellCommandFromArgv(cmd, spawnArgs);
+  // on whitespace (that destroys args that contain spaces). With `shell` the
+  // joined line is what the shell parses (node), so it goes as is.
+  const shellCommand = cfg.shell
+    ? [cmd, ...spawnArgs].join(" ")
+    : shellCommandFromArgv(cmd, spawnArgs);
   const syncResult = handleSyncCommand(shellCommand, {
     cwd: cfg.cwd,
     env: cfg.env,
@@ -2703,6 +2730,11 @@ export function spawnSync(
   if (syncResult !== null) {
     const stdout = Buffer.from(syncResult.stdout);
     const stderr = Buffer.from(syncResult.stderr ?? "");
+    // inherited streams are the parent's, as on the Atomics path: without
+    // this, e.g. the TypeScript 7 native-compiler notice never shows
+    const stdio = normalizeStdio(cfg.stdio);
+    if (stdio[1] === "inherit" && syncResult.stdout) getStdoutSink()?.(syncResult.stdout);
+    if (stdio[2] === "inherit" && syncResult.stderr) getStderrSink()?.(syncResult.stderr);
     return {
       stdout,
       stderr,

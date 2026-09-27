@@ -5,6 +5,7 @@ import {
   VERSIONS,
   NODE_SUB_VERSIONS,
   MOCK_OS,
+  MOCK_IDS,
   MOCK_PROCESS,
   MOCK_MEMORY,
   DEFAULT_ENV,
@@ -135,6 +136,11 @@ export interface ProcessObject {
   abort: () => never;
   kill: (pid: number, signal?: string | number) => boolean;
   umask: (mask?: number) => number;
+  getuid: () => number;
+  geteuid: () => number;
+  getgid: () => number;
+  getegid: () => number;
+  getgroups: () => number[];
   config: {
     variables: Record<string, unknown>;
     target_defaults: Record<string, unknown>;
@@ -789,6 +795,14 @@ export function buildProcessEnv(config?: {
       if (mask !== undefined) currentUmask = mask;
       return old;
     },
+
+    // the user that os.userInfo() reports and files belong to. `which` (zx,
+    // npm) checks exec bits against these and finds nothing without them
+    getuid: () => MOCK_IDS.UID,
+    geteuid: () => MOCK_IDS.UID,
+    getgid: () => MOCK_IDS.GID,
+    getegid: () => MOCK_IDS.GID,
+    getgroups: () => [MOCK_IDS.GID],
 
     config: { variables: {}, target_defaults: {} },
     release: { name: "node", sourceUrl: "", headersUrl: "" },

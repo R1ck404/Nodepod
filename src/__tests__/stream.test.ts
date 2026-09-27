@@ -126,6 +126,30 @@ describe("PassThrough", () => {
     pt.end();
     expect(chunks).toContain("data");
   });
+
+  // fast-glob's static-pattern reader (prettier's file expansion): the
+  // PassThrough's own _write takes each chunk, pushes the entry it resolves
+  // and ends the stream. Writes skipped it, so 'end' never came and
+  // `prettier file.js` exited without output.
+  it("hands writes to a _write of its own", async () => {
+    const stream = new PassThrough({ objectMode: true });
+    const paths = ["a.js", "b.js"];
+    (stream as any)._write = (index: number, _enc: string, done: () => void) => {
+      Promise.resolve({ path: paths[index] }).then((entry) => {
+        stream.push(entry);
+        if (index === paths.length - 1) stream.end();
+        done();
+      });
+    };
+    for (let i = 0; i < paths.length; i++) stream.write(i);
+    const entries = await new Promise<unknown[]>((resolve, reject) => {
+      const seen: unknown[] = [];
+      stream.once("error", reject);
+      stream.on("data", (entry: unknown) => seen.push(entry));
+      stream.once("end", () => resolve(seen));
+    });
+    expect(entries).toEqual([{ path: "a.js" }, { path: "b.js" }]);
+  });
 });
 
 describe("pipe integration", () => {

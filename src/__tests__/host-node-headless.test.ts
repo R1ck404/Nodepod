@@ -140,6 +140,35 @@ describe("node headless host", () => {
     await pod.teardown();
   }, 60_000);
 
+  it("resolves a relative node script against the spawn's cwd", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+
+    const pod = await Nodepod.boot({
+      workdir: "/home",
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/home/app/main.mjs": "console.log('cwd', process.cwd());\n",
+        "/home/app/c.js": "console.log('cjs ran');\n",
+      },
+    });
+
+    const esm = await (await pod.spawn("node", ["main.mjs"], { cwd: "/home/app" })).completion;
+    expect(esm.stderr).toBe("");
+    expect(esm.exitCode).toBe(0);
+    expect(esm.stdout).toBe("cwd /home/app\n");
+    const cjs = await (await pod.spawn("node", ["./c.js"], { cwd: "/home/app" })).completion;
+    expect(cjs.exitCode).toBe(0);
+    expect(cjs.stdout).toBe("cjs ran\n");
+    await pod.teardown();
+  }, 60_000);
+
   it("keeps active-server URLs byte-for-byte unchanged in spawn output", async () => {
     setRuntimeHost(
       createNodeHost({

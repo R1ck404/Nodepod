@@ -777,7 +777,7 @@ export class Nodepod {
       args?.length &&
       !args[0].startsWith("-");
     if (isNodeFileRun) {
-      const filePath = this._resolveCommand(cmd, args);
+      const filePath = this._resolveCommand(cmd, args, execCwd);
       handle.exec({
         type: "exec",
         filePath,
@@ -826,11 +826,12 @@ export class Nodepod {
     this._terminalUrlOutputStreams.delete(stream);
   }
 
-  private _resolveCommand(cmd: string, args?: string[]): string {
+  // a relative script path is relative to the spawn's cwd, not the pod's
+  private _resolveCommand(cmd: string, args: string[] | undefined, cwd: string): string {
     if (cmd === "node" && args?.length) {
       const filePath = args[0];
       if (filePath.startsWith("/")) return filePath;
-      return `${this._cwd}/${filePath}`.replace(/\/+/g, "/");
+      return `${cwd}/${filePath}`.replace(/\/+/g, "/");
     }
     return cmd;
   }
