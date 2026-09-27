@@ -17,4 +17,4 @@ export {
   setRuntimeHost,
 } from "./runtime-host";
 export { createBrowserHost } from "./browser-host";
-// Node host lives in `./node/*` and is only pulled in via `nodepod/headless`.
+// Node host lives in `./node/*` and is only pulled in via `@r1ck404/nodepod/headless`.

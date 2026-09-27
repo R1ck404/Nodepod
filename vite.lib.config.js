@@ -92,7 +92,7 @@ export default defineConfig({
       entry: {
         index: resolve(__dirname, "src/index.ts"),
         // Node/Bun headless host — keeps node:worker_threads out of the
-        // browser bundle (consumers import `nodepod/headless`).
+        // browser bundle (consumers import `@r1ck404/nodepod/headless`).
         headless: resolve(__dirname, "src/headless.ts"),
         // Each framework integration is its own subpath export (see
         // package.json `exports`). Slashes in the key push the output

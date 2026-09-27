@@ -34,7 +34,7 @@ framework, and what error you'll see if you don't.
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
-import nodepod from 'nodepod/vite';
+import nodepod from '@r1ck404/nodepod/vite';
 
 export default defineConfig({
   plugins: [nodepod()],
@@ -56,13 +56,13 @@ by the Next 16 rename.
 
 ```ts
 // app/__sw__.js/route.ts
-export { GET } from 'nodepod/next';
+export { GET } from '@r1ck404/nodepod/next';
 
 // app/__nodepod_bridge__.html/route.ts
-export { GET_PREVIEW_BRIDGE as GET } from 'nodepod/next';
+export { GET_PREVIEW_BRIDGE as GET } from '@r1ck404/nodepod/next';
 
 // app/__nodepod_bridge__.js/route.ts
-export { GET_PREVIEW_BRIDGE_SCRIPT as GET } from 'nodepod/next';
+export { GET_PREVIEW_BRIDGE_SCRIPT as GET } from '@r1ck404/nodepod/next';
 ```
 
 Next matches this file at `GET /__sw__.js` because the folder name is
@@ -75,7 +75,7 @@ If you already have a `proxy.ts`, compose `nodepodProxy`:
 
 ```ts
 // proxy.ts
-import { nodepodProxy, nodepodMatchers } from 'nodepod/next';
+import { nodepodProxy, nodepodMatchers } from '@r1ck404/nodepod/next';
 
 export async function proxy(req) {
   const sw = await nodepodProxy(req);
@@ -93,7 +93,7 @@ still on `middleware.ts`:
 
 ```ts
 // middleware.ts
-import { nodepodMiddleware, nodepodMatchers } from 'nodepod/next';
+import { nodepodMiddleware, nodepodMatchers } from '@r1ck404/nodepod/next';
 
 export async function middleware(req) {
   const sw = await nodepodMiddleware(req);
@@ -111,8 +111,8 @@ export const config = { matcher: [...nodepodMatchers /*, your paths */] };
 ### Any Fetch-style framework (Hono, Bun, Cloudflare, Elysia, etc.)
 
 ```ts
-import { serveSW } from 'nodepod/server';
-import { servePreviewBridge, servePreviewBridgeScript } from 'nodepod/server';
+import { serveSW } from '@r1ck404/nodepod/server';
+import { servePreviewBridge, servePreviewBridgeScript } from '@r1ck404/nodepod/server';
 
 app.get('/__sw__.js', () => serveSW());
 app.get('/__nodepod_bridge__.html', () => servePreviewBridge());
@@ -122,8 +122,8 @@ app.get('/__nodepod_bridge__.js', () => servePreviewBridgeScript());
 ### Express / Fastify / bare `http`
 
 ```ts
-import { serveSWNode } from 'nodepod/server';
-import { servePreviewBridgeNode } from 'nodepod/server';
+import { serveSWNode } from '@r1ck404/nodepod/server';
+import { servePreviewBridgeNode } from '@r1ck404/nodepod/server';
 
 app.get('/__sw__.js', async (_req, res) => {
   const { body, headers } = await serveSWNode();
@@ -153,12 +153,12 @@ No server to edit? Copy the file into your public/static directory and
 let the host serve it:
 
 ```bash
-cp node_modules/nodepod/dist/__sw__.js public/__sw__.js
-cp node_modules/nodepod/dist/__nodepod_bridge__.html public/__nodepod_bridge__.html
-cp node_modules/nodepod/dist/__nodepod_bridge__.js public/__nodepod_bridge__.js
+cp node_modules/@r1ck404/nodepod/dist/__sw__.js public/__sw__.js
+cp node_modules/@r1ck404/nodepod/dist/__nodepod_bridge__.html public/__nodepod_bridge__.html
+cp node_modules/@r1ck404/nodepod/dist/__nodepod_bridge__.js public/__nodepod_bridge__.js
 ```
 
-Re-run the copy when you upgrade `nodepod`.
+Re-run the copy when you upgrade `@r1ck404/nodepod`.
 
 ## What the error looks like
 
@@ -174,7 +174,7 @@ NodepodSWSetupError: service worker at /__sw__.js returned HTTP 404
 Detected Vite. Add the nodepod plugin to serve __sw__.js automatically:
 
   // vite.config.ts
-  import nodepod from 'nodepod/vite';
+  import nodepod from '@r1ck404/nodepod/vite';
   export default defineConfig({ plugins: [nodepod()] });
 ```
 

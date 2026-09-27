@@ -8,7 +8,7 @@ sidebar:
 ## Browser
 
 ```ts
-import { Nodepod } from 'nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const pod = await Nodepod.boot({ headless: true });
 ```
@@ -18,7 +18,7 @@ Headless browser mode defaults the service worker and watermark off. Filesystem,
 ## Node.js and Bun
 
 ```ts
-import { Nodepod } from 'nodepod/headless';
+import { Nodepod } from '@r1ck404/nodepod/headless';
 
 const pod = await Nodepod.boot();
 ```

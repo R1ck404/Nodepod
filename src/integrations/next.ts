@@ -3,13 +3,13 @@
 //   1. App Router route handler (works Next 13 through 16):
 //
 //        // app/__sw__.js/route.ts
-//        export { GET } from 'nodepod/next';
+//        export { GET } from '@r1ck404/nodepod/next';
 //
 //   2. Composable for users who already have a proxy.ts / middleware.ts:
 //
 //        // Next 16+ (proxy.ts)                  // Next <=15 (middleware.ts)
 //        import { nodepodProxy } from            import { nodepodMiddleware } from
-//          'nodepod/next';                 'nodepod/next';
+//          '@r1ck404/nodepod/next';                 '@r1ck404/nodepod/next';
 //
 // `nodepodProxy` and `nodepodMiddleware` are the same function under two
 // names. Next 16 renamed `middleware.ts` to `proxy.ts`
@@ -68,7 +68,7 @@ async function buildBridgeResponse(
  * Route handler for `app/__sw__.js/route.ts`.
  *
  * ```ts
- * export { GET } from 'nodepod/next';
+ * export { GET } from '@r1ck404/nodepod/next';
  * ```
  */
 export async function GET(): Promise<NextResponseType> {

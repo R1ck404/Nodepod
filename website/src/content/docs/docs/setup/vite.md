@@ -9,7 +9,7 @@ Add the Nodepod plugin to your Vite configuration:
 
 ```ts
 import { defineConfig } from 'vite';
-import nodepod from 'nodepod/vite';
+import nodepod from '@r1ck404/nodepod/vite';
 
 export default defineConfig({
   plugins: [nodepod()],
@@ -21,7 +21,7 @@ The plugin serves the service worker, process worker, and preview bridge during 
 Then boot the runtime from application code:
 
 ```ts
-import { Nodepod } from 'nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const pod = await Nodepod.boot();
 ```

@@ -38,8 +38,8 @@ import {
 import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
-// Browser default host is registered by `nodepod` (src/index.ts).
-// Headless installs its host via `nodepod/headless` before boot.
+// Browser default host is registered by `@r1ck404/nodepod` (src/index.ts).
+// Headless installs its host via `@r1ck404/nodepod/headless` before boot.
 import { ensureRuntimeHost } from "../host/runtime-host";
 import type { HttpIngress } from "../host/types";
 import type { CompletedResponse } from "../polyfills/http";
