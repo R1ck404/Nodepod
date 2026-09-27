@@ -30,6 +30,7 @@ import type {
   MainToWorker_Exec,
   VFSSnapshotEntry,
   WorkerToMainMessage,
+  WorkerToMain_VFSBatch,
 } from "./worker-protocol";
 
 let _pid = 0;
@@ -128,8 +129,40 @@ const _httpClientCallbacks = new Map<
   }
 >();
 
+// vfs changes collected during a notification burst (declared before post(),
+// which reads them)
+type VfsOp = WorkerToMain_VFSBatch["ops"][number];
+let _vfsBurstDepth = 0;
+let _vfsBatch: VfsOp[] = [];
+let _vfsBatchTransfer: Transferable[] = [];
+
 function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
+  // vfs changes batched so far go first: the main thread sees everything in
+  // the order it happened here
+  if (_vfsBatch.length > 0) flushVfsBatch();
   (self as unknown as Worker).postMessage(msg, transfer ?? []);
+}
+
+// vfs-write/vfs-delete ops collected during a notification burst (see
+// MemoryVolume.onNotificationBurst): one message for a moved package instead
+// of one per file
+function queueVfsOp(op: VfsOp, transfer?: ArrayBuffer): void {
+  if (_vfsBurstDepth === 0) {
+    if ("deleted" in op) post({ type: "vfs-delete", path: op.path });
+    else post({ type: "vfs-write", path: op.path, content: op.content, isDirectory: op.isDirectory }, transfer ? [transfer] : undefined);
+    return;
+  }
+  _vfsBatch.push(op);
+  if (transfer) _vfsBatchTransfer.push(transfer);
+}
+
+function flushVfsBatch(): void {
+  const ops = _vfsBatch;
+  const transfer = _vfsBatchTransfer;
+  _vfsBatch = [];
+  _vfsBatchTransfer = [];
+  if (ops.length === 0) return;
+  (self as unknown as Worker).postMessage({ type: "vfs-batch", ops } satisfies WorkerToMain_VFSBatch, transfer);
 }
 
 // esbuild-engine asks the main thread for the session's compiled esbuild
@@ -332,29 +365,33 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   _volume.watch("/", { recursive: true }, (event, filename) => {
     if (!filename || _suppressVFSWatch || isInternalVfsPath(filename)) return;
     try {
-      if (_volume!.existsSync(filename)) {
-        const stat = _volume!.statSync(filename);
-        if (stat.isDirectory()) {
-          post({
-            type: "vfs-write",
-            path: filename,
-            content: new ArrayBuffer(0),
-            isDirectory: true,
-          });
+      // existence and kind in one lookup, no stat object
+      const kind = _volume!.kindSync(filename);
+      if (kind !== null) {
+        if (kind === "directory") {
+          queueVfsOp({ path: filename, content: new ArrayBuffer(0), isDirectory: true });
         } else {
           const data = _volume!.readFileSync(filename);
           // must copy into a fresh ArrayBuffer — if the Uint8Array is backed by SAB (e.g. esbuild-wasm or any napi-rs wasm32-wasip1-threads module writing from shared memory), both .buffer.slice() and .slice() return SAB, which isn't transferable
           // postMessage would throw DataCloneError, the catch swallows it, main-thread VFS never learns about the write — this was what caused Vite dep-optimizer 504s (.vite/deps/*.js missing) and downstream 404s
           const buffer = new ArrayBuffer(data.byteLength);
           new Uint8Array(buffer).set(data);
-          post({ type: "vfs-write", path: filename, content: buffer, isDirectory: false }, [buffer]);
+          queueVfsOp({ path: filename, content: buffer, isDirectory: false }, buffer);
         }
       } else {
-        post({ type: "vfs-delete", path: filename });
+        queueVfsOp({ path: filename, deleted: true });
       }
     } catch {
       /* ignore */
     }
+  });
+
+  _volume.onNotificationBurst((start) => {
+    if (start) {
+      _vfsBurstDepth++;
+      return;
+    }
+    if (_vfsBurstDepth > 0 && --_vfsBurstDepth === 0) flushVfsBatch();
   });
 
   // metadata changes fire no watchers, so they get their own channel
@@ -805,10 +842,21 @@ async function handleHttpRequest(msg: {
         bodyVal = result.body;
       } else if (result.body instanceof Uint8Array || Buffer.isBuffer(result.body)) {
         const bytes = result.body instanceof Uint8Array ? result.body : new Uint8Array(result.body);
-        const ab = new ArrayBuffer(bytes.byteLength);
-        new Uint8Array(ab).set(bytes);
-        bodyVal = ab;
-        transferList.push(ab);
+        if (
+          httpMod.isOwnedResponseBody(bytes) &&
+          bytes.buffer instanceof ArrayBuffer &&
+          bytes.byteOffset === 0 &&
+          bytes.byteLength === bytes.buffer.byteLength
+        ) {
+          // the response's own fresh buffer: hand it over as is
+          bodyVal = bytes.buffer;
+          transferList.push(bytes.buffer);
+        } else {
+          const ab = new ArrayBuffer(bytes.byteLength);
+          new Uint8Array(ab).set(bytes);
+          bodyVal = ab;
+          transferList.push(ab);
+        }
       } else {
         bodyVal = String(result.body);
       }

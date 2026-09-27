@@ -445,6 +445,9 @@ function createRealWebWorker(
   )));
 }
 
+// polyfills/fs's bridge helpers for this proxy (same Symbol.for key)
+const FS_PROXY_INTERNALS = Symbol.for("nodepod.fsProxyInternals");
+
 // handles one sequenced synchronous filesystem request from a brokered worker
 export function handleFsProxy(
   req: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
@@ -487,6 +490,9 @@ export function handleFsProxy(
           size,
         };
       });
+    } else if (type === "readFileSync" && payload.length <= 1 && fsBridge[FS_PROXY_INTERNALS]) {
+      // the stored bytes go straight into the reply buffer: no Buffer copy
+      result = fsBridge[FS_PROXY_INTERNALS].readStoredBytes(payload[0]);
     } else {
       const fn = fsBridge[type];
       if (typeof fn !== "function") throw new Error(`fs.${type} is not a function`);
@@ -532,7 +538,7 @@ export function handleFsProxy(
     const errMsg = err?.message || String(err);
     const errCode = err?.code || "";
     const errObj = JSON.stringify({ message: errMsg, code: errCode });
-    const encoded = new TextEncoder().encode(errObj);
+    const encoded = proxyReplyEncoder.encode(errObj);
 
     Atomics.store(sab, 1, 6); // type = json/object
     Atomics.store(sab, 2, encoded.byteLength);
@@ -579,8 +585,10 @@ function getValueType(v: unknown): number {
   return 6; // json/object
 }
 
+const proxyReplyEncoder = new TextEncoder();
+
 function encodeValue(v: unknown): Uint8Array {
-  const enc = new TextEncoder();
+  const enc = proxyReplyEncoder;
   if (v === undefined || v === null) return new Uint8Array(0);
   if (typeof v === "boolean") return enc.encode(v ? "1" : "0");
   if (typeof v === "number") return enc.encode(String(v));

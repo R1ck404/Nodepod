@@ -66,14 +66,21 @@ function remember(key: string, metadata: PackageMetadata): void {
   }
 }
 
-async function openRegistryCache(): Promise<Cache | null> {
-  if (typeof caches === "undefined") return null;
-  try {
-    return await caches.open(REGISTRY_CACHE_NAME);
-  } catch {
-    return null;
+// opened once, not per manifest
+let registryCache: Promise<Cache | null> | null = null;
+
+function openRegistryCache(): Promise<Cache | null> {
+  if (typeof caches === "undefined") return Promise.resolve(null);
+  if (!registryCache) {
+    registryCache = caches.open(REGISTRY_CACHE_NAME).catch(() => {
+      registryCache = null; // try again next time
+      return null;
+    });
   }
+  return registryCache;
 }
+
+const manifestDecoder = new TextDecoder();
 
 // @scope/pkg -> @scope%2fpkg
 function encodeForUrl(pkgName: string): string {
@@ -228,7 +235,7 @@ export class RegistryClient {
         METADATA_TIMEOUT_MS,
         `registry metadata for "${name}"`,
       );
-      metadata = JSON.parse(new TextDecoder().decode(bytes)) as PackageMetadata;
+      metadata = JSON.parse(manifestDecoder.decode(bytes)) as PackageMetadata;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Registry metadata for "${name}" could not be read (${detail})`);

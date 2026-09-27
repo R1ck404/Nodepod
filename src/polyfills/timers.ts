@@ -74,6 +74,102 @@ export interface TimeoutLike {
   [Symbol.toPrimitive](): number;
 }
 
+// the timer object: node's Timeout, methods on the prototype instead of a
+// set of closures per timer (debounces and heartbeats create many)
+class Timeout implements TimeoutLike {
+  _id!: ReturnType<typeof _rawSetTimeout>;
+  _handle: Handle;
+  _isInterval: boolean;
+  _fired = false;
+  _callback: (...args: unknown[]) => void;
+  _args: unknown[];
+  _ms: number;
+
+  constructor(
+    handle: Handle,
+    callback: (...args: unknown[]) => void,
+    ms: number,
+    args: unknown[],
+    isInterval: boolean,
+  ) {
+    this._handle = handle;
+    this._isInterval = isInterval;
+    this._callback = callback;
+    this._args = args;
+    this._ms = ms;
+  }
+
+  ref(): this {
+    if (!this._fired) this._handle.ref();
+    return this;
+  }
+
+  unref(): this {
+    this._handle.unref();
+    return this;
+  }
+
+  hasRef(): boolean {
+    return this._handle.refed;
+  }
+
+  // Timeout.refresh() re-arms the timer with its original delay, cancelling
+  // any pending fire. undici, ws heartbeats, node-fetch, socket.io and many
+  // others rely on this; a no-op here breaks those libraries silently.
+  refresh(): this {
+    if (this._handle.closed) return this;
+    if (this._isInterval) {
+      _rawClearInterval(this._id);
+      this._id = _rawSetInterval(fireTimeout, this._ms, this);
+    } else {
+      _rawClearTimeout(this._id);
+      // refresh resurrects a one-shot Timeout: if it already fired we need
+      // to re-register the handle so the loop counts it again.
+      if (this._fired) {
+        this._fired = false;
+        this._handle.ref();
+      }
+      this._id = _rawSetTimeout(fireTimeout, this._ms, this);
+    }
+    return this;
+  }
+
+  [Symbol.toPrimitive](): number {
+    return this._id as unknown as number;
+  }
+}
+
+function fireTimeout(self: Timeout): void {
+  if (!self._isInterval) {
+    self._fired = true;
+    self._handle.close();
+    untrackTimer(self);
+  }
+  const callback = self._callback;
+  try {
+    // widen the declared void return so we can duck-type async callbacks.
+    // setTimeout(async () => {...}) returns a Promise and plenty of user
+    // code depends on that even though node's types say void.
+    const r: unknown = callback(...self._args);
+    // if the callback is async, a process.exit() inside it becomes a
+    // Promise rejection, not a sync throw, so the try/catch below can't
+    // see it. filter the sentinel out of the rejection path to match
+    // node (process.exit inside a timer doesn't surface as an unhandled
+    // rejection). other rejections propagate normally.
+    if (r && typeof (r as { then?: unknown }).then === "function") {
+      (r as Promise<unknown>).then(undefined, (e: unknown) => {
+        if (isExitSentinel(e)) return;
+        // re-raise on the next microtask so it reaches the global
+        // unhandledrejection handler, same as node.
+        queueMicrotask(() => { throw e as Error; });
+      });
+    }
+  } catch (e) {
+    if (isExitSentinel(e)) return;
+    throw e;
+  }
+}
+
 function makeTimeout(
   kind: HandleType,
   callback: (...args: unknown[]) => void,
@@ -83,79 +179,12 @@ function makeTimeout(
 ): TimeoutLike {
   const ms = normalizeDelay(msRaw);
   const handle = getRegistry().register(kind);
-  const self = {} as TimeoutLike;
-  self._isInterval = isInterval;
-  self._fired = false;
-  self._handle = handle;
-
-  const fire = () => {
-    if (!isInterval) {
-      self._fired = true;
-      handle.close();
-      untrackTimer(self);
-    }
-    try {
-      // widen the declared void return so we can duck-type async callbacks.
-      // setTimeout(async () => {...}) returns a Promise and plenty of user
-      // code depends on that even though node's types say void.
-      const r: unknown = callback(...args);
-      // if the callback is async, a process.exit() inside it becomes a
-      // Promise rejection, not a sync throw, so the try/catch below can't
-      // see it. filter the sentinel out of the rejection path to match
-      // node (process.exit inside a timer doesn't surface as an unhandled
-      // rejection). other rejections propagate normally.
-      if (r && typeof (r as { then?: unknown }).then === "function") {
-        (r as Promise<unknown>).then(undefined, (e: unknown) => {
-          if (isExitSentinel(e)) return;
-          // re-raise on the next microtask so it reaches the global
-          // unhandledrejection handler, same as node.
-          queueMicrotask(() => { throw e as Error; });
-        });
-      }
-    } catch (e) {
-      if (isExitSentinel(e)) return;
-      throw e;
-    }
-  };
-
+  const self = new Timeout(handle, callback, ms, args, isInterval);
+  // (the browser hands the extra argument to the callback)
   self._id = isInterval
-    ? _rawSetInterval(fire, ms)
-    : _rawSetTimeout(fire, ms);
+    ? _rawSetInterval(fireTimeout, ms, self)
+    : _rawSetTimeout(fireTimeout, ms, self);
   trackTimer(self);
-
-  self.ref = () => {
-    if (!self._fired) handle.ref();
-    return self;
-  };
-  self.unref = () => {
-    handle.unref();
-    return self;
-  };
-  self.hasRef = () => handle.refed;
-
-  // Timeout.refresh() re-arms the timer with its original delay, cancelling
-  // any pending fire. undici, ws heartbeats, node-fetch, socket.io and many
-  // others rely on this; a no-op here breaks those libraries silently.
-  self.refresh = () => {
-    if (handle.closed) return self;
-    if (isInterval) {
-      _rawClearInterval(self._id);
-      self._id = _rawSetInterval(fire, ms);
-    } else {
-      _rawClearTimeout(self._id);
-      // refresh resurrects a one-shot Timeout: if it already fired we need
-      // to re-register the handle so the loop counts it again.
-      if (self._fired) {
-        self._fired = false;
-        handle.ref();
-      }
-      self._id = _rawSetTimeout(fire, ms);
-    }
-    return self;
-  };
-
-  self[Symbol.toPrimitive] = () => self._id as unknown as number;
-
   return self;
 }
 

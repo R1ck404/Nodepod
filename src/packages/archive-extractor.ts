@@ -10,7 +10,7 @@ import { offload, profiledOffload, taskId, TaskPriority } from "../threading/off
 import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
-import { getTarballCache } from "../persistence/tarball-cache";
+import { getTarballCache, shouldRefreshTarball } from "../persistence/tarball-cache";
 import { digestSync } from "../polyfills/sync-digest";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
 
@@ -354,12 +354,19 @@ async function downloadAndExtractInternal(
   };
   channel.port1.start();
 
+  // staging directories this extraction already made (tar entries come
+  // grouped by directory: one mkdir per directory, not per file)
+  const stagedDirs = new Set<string>();
   const writeExtractedFile = (file: ExtractResult["files"][number]): void => {
     if (opts.filter && !opts.filter(file.path)) return;
     const staged = safeJoin(stageRoot, file.path);
     const absolute = safeJoin(destDir, file.path);
     if (!staged || !absolute) return;
-    vol.mkdirSync(path.dirname(staged), { recursive: true });
+    const stagedDir = path.dirname(staged);
+    if (!stagedDirs.has(stagedDir)) {
+      vol.mkdirSync(stagedDir, { recursive: true });
+      stagedDirs.add(stagedDir);
+    }
     const bytes = file.data instanceof Uint8Array
       ? file.data
       : file.isBinary
@@ -403,7 +410,9 @@ async function downloadAndExtractInternal(
   if (
     cache &&
     cachedBytes.byteLength > 0 &&
-    cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
+    cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES &&
+    // (one just read back from the cache is already there)
+    shouldRefreshTarball(cachedBytes)
   ) {
     cache.put(url, cachedBytes, opts.expectedShasum).catch(() => {});
   }

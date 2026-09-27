@@ -38,7 +38,18 @@ export function normalize(inputPath: string): string {
 
 export function join(...fragments: string[]): string {
   if (fragments.length === 0) return '.';
-  const combined = fragments.filter(f => f !== '').join('/');
+  let combined = '';
+  let empty = true;
+  for (let i = 0; i < fragments.length; i++) {
+    const fragment = fragments[i];
+    if (fragment === '') continue;
+    if (typeof fragment !== 'string') {
+      // keep Array#join's coercion (null/undefined join as "") exactly
+      return normalize(fragments.filter(f => f !== '').join('/'));
+    }
+    combined = empty ? fragment : combined + '/' + fragment;
+    empty = false;
+  }
   return normalize(combined);
 }
 
@@ -161,6 +172,13 @@ export function relative(fromPath: string, toPath: string): string {
   const absTo = resolve(toPath);
 
   if (absFrom === absTo) return '';
+
+  // both are normalized absolute paths: a target inside `from` (the usual
+  // root-relative id) is just its tail
+  if (absFrom === '/') return absTo.slice(1);
+  if (absTo.startsWith(absFrom) && absTo.charCodeAt(absFrom.length) === 47) {
+    return absTo.slice(absFrom.length + 1);
+  }
 
   const partsFrom = absFrom.split('/').filter(Boolean);
   const partsTo = absTo.split('/').filter(Boolean);

@@ -224,6 +224,8 @@ export class Nodepod {
       );
     });
 
+    this._vfsBridge.setBroadcastTargets(() => this._processManager.hasLiveProcesses());
+
     this._processManager.setVFSBridge(this._vfsBridge);
 
     // VFS watcher broadcasts main-thread file changes to workers (needed for HMR)

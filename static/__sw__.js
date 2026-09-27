@@ -604,13 +604,27 @@ function cleanupPort(mp) {
 // Extract (instanceId, port, restPath) from a /__virtual__/... or /__preview__/... pathname.
 // Returns null if no match. Handles both the new 3-segment form and the legacy
 // 2-segment form (falls back to DEFAULT_INSTANCE).
+// compiled once per kind, not on every fetch event
+const PREVIEW_PATH_RES = {};
+function previewPathRes(kind) {
+  let res = PREVIEW_PATH_RES[kind];
+  if (!res) {
+    const prefix = kind === "virtual" ? "__virtual__" : "__preview__";
+    res = PREVIEW_PATH_RES[kind] = {
+      // New: /__{kind}__/{instanceId}/{port}[/rest]
+      // Require non-digit in first segment so we don't swallow legacy ports.
+      newRe: new RegExp(
+        "^\\/" + prefix + "\\/([A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*)\\/(\\d+)(\\/.*)?$"
+      ),
+      // Legacy: /__{kind}__/{port}[/rest]
+      oldRe: new RegExp("^\\/" + prefix + "\\/(\\d+)(\\/.*)?$"),
+    };
+  }
+  return res;
+}
+
 function matchPreviewOrVirtualPath(pathname, kind /* "virtual" | "preview" */) {
-  const prefix = kind === "virtual" ? "__virtual__" : "__preview__";
-  // New: /__{kind}__/{instanceId}/{port}[/rest]
-  // Require non-digit in first segment so we don't swallow legacy ports.
-  const newRe = new RegExp(
-    "^\\/" + prefix + "\\/([A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*)\\/(\\d+)(\\/.*)?$"
-  );
+  const { newRe, oldRe } = previewPathRes(kind);
   const m1 = pathname.match(newRe);
   if (m1) {
     return {
@@ -619,8 +633,6 @@ function matchPreviewOrVirtualPath(pathname, kind /* "virtual" | "preview" */) {
       rest: m1[3] || "/",
     };
   }
-  // Legacy: /__{kind}__/{port}[/rest]
-  const oldRe = new RegExp("^\\/" + prefix + "\\/(\\d+)(\\/.*)?$");
   const m2 = pathname.match(oldRe);
   if (m2) {
     return {
@@ -959,8 +971,10 @@ function onPortMessage(event, mp) {
   if (!msg) return;
 
   if (msg.type === "response" && pending.has(msg.id)) {
-    const { resolve, reject } = pending.get(msg.id);
+    const { resolve, reject, timer } = pending.get(msg.id);
     pending.delete(msg.id);
+    // answered: the no-answer timeout (and what it holds) can go now
+    if (timer) clearTimeout(timer);
     if (msg.error) reject(new Error(msg.error));
     else resolve(msg.data);
     return;
@@ -1979,9 +1993,11 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
   }
 
-  // Clone the original request before consuming the body, so we can use it
-  // for the 404 fallback fetch later if needed.
-  const fallbackRequest = originalRequest ? originalRequest.clone() : null;
+  // What the 404 fallback fetch needs of the original request. It sends no
+  // body, so no clone (a clone would tee and hold a POST body unread).
+  const fallbackRequest = originalRequest
+    ? { url: originalRequest.url, method: originalRequest.method, headers: originalRequest.headers }
+    : null;
 
   const headers = {};
   request.headers.forEach((v, k) => {
@@ -2053,8 +2069,9 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
 
   const id = nextId++;
   const promise = new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject, port: targetPort });
-    setTimeout(() => {
+    const entry = { resolve, reject, port: targetPort, timer: null };
+    pending.set(id, entry);
+    entry.timer = setTimeout(() => {
       if (pending.has(id)) {
         const entry = pending.get(id);
         pending.delete(id);
@@ -2093,6 +2110,8 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     );
   } catch (err) {
     // port got detached between lookup and post
+    const entry = pending.get(id);
+    if (entry && entry.timer) clearTimeout(entry.timer);
     pending.delete(id);
     cleanupPort(targetPort);
     return errorPage(503, "Service Unavailable", "The owning tab for this server is no longer connected.");
@@ -2251,7 +2270,9 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
 
     if (cacheable) {
       responseCachePut(cacheKey, {
-        body: finalBody,
+        // a Blob: every hit answers with it without copying the bytes again
+        // (a Response over an array copies it), and they live outside the heap
+        body: finalBody ? new Blob([finalBody]) : finalBody,
         size: (finalBody ? finalBody.byteLength : 0) + 512,
         status: data.statusCode,
         statusText: data.statusMessage || "OK",

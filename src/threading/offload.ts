@@ -128,7 +128,6 @@ async function mainThreadExtract(
   task: ExtractTask,
 ): Promise<ExtractResult> {
   const { parseTarArchive } = await import("../packages/archive-extractor");
-  const { bytesToBase64 } = await import("../helpers/byte-encoding");
 
   let compressed: Uint8Array;
   if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
@@ -149,7 +148,18 @@ async function mainThreadExtract(
     if (entry.kind !== "file" || !entry.payload) continue;
 
     let relative = entry.filepath;
-    if (task.stripComponents > 0) {
+    if (
+      task.stripComponents === 1 &&
+      relative.charCodeAt(0) !== 47 &&
+      !relative.endsWith("/") &&
+      !relative.includes("//")
+    ) {
+      // the usual "package/..." prefix of a clean path: same result as the
+      // split below, without building the segment arrays per file
+      const slash = relative.indexOf("/");
+      if (slash === -1) continue;
+      relative = relative.slice(slash + 1);
+    } else if (task.stripComponents > 0) {
       const segments = relative.split("/").filter(Boolean);
       if (segments.length <= task.stripComponents) continue;
       relative = segments.slice(task.stripComponents).join("/");

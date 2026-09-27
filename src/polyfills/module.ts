@@ -62,12 +62,28 @@ export const builtinModules: string[] = [
   "zlib",
 ];
 
+// every require() asks: a Set instead of scanning the list, rebuilt if a
+// caller adds to or removes from the (exported, mutable) array
+let builtinSet: Set<string> | null = null;
+let builtinSetSize = -1;
+function builtinLookup(): Set<string> {
+  if (!builtinSet || builtinSetSize !== builtinModules.length) {
+    builtinSet = new Set(builtinModules);
+    builtinSetSize = builtinModules.length;
+  }
+  return builtinSet;
+}
+
 export function isBuiltin(id: string): boolean {
   const stripped = id.startsWith("node:") ? id.slice(5) : id;
-  if (builtinModules.includes(stripped)) return true;
+  const c = stripped.charCodeAt(0);
+  // relative and absolute paths are never builtins
+  if (c === 46 /* . */ || c === 47 /* / */) return false;
+  const set = builtinLookup();
+  if (set.has(stripped)) return true;
   const slash = stripped.indexOf("/");
   if (slash !== -1) {
-    return builtinModules.includes(stripped.slice(0, slash));
+    return set.has(stripped.slice(0, slash));
   }
   return false;
 }

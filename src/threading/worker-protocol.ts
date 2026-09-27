@@ -281,6 +281,16 @@ export interface WorkerToMain_VFSDelete {
   path: string;
 }
 
+// the vfs-write / vfs-delete messages of one burst of changes (a directory
+// moved or removed: an install's package landing in node_modules), in order
+export interface WorkerToMain_VFSBatch {
+  type: "vfs-batch";
+  ops: Array<
+    | { path: string; content: ArrayBuffer; isDirectory: boolean }
+    | { path: string; deleted: true }
+  >;
+}
+
 export interface WorkerToMain_VFSSnapshot {
   type: "vfs-snapshot";
   snapshot: VFSBinarySnapshot;
@@ -483,6 +493,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_Console
   | WorkerToMain_VFSWrite
   | WorkerToMain_VFSDelete
+  | WorkerToMain_VFSBatch
   | WorkerToMain_VFSSnapshot
   | WorkerToMain_VFSMeta
   | WorkerToMain_SpawnRequest

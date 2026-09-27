@@ -10,6 +10,31 @@ function bufferByteLength(chunk: unknown): number {
   return 0;
 }
 
+// setEncoding("utf8") on a byte stream: decode across chunk boundaries (a
+// character split between two chunks came out as two U+FFFD), without
+// copying each chunk into a Buffer first
+function decodeChunk(stream: any, item: Uint8Array): string | null {
+  const enc = stream._encoding;
+  if (enc !== "utf8" && enc !== "utf-8") return Buffer.from(item).toString(enc);
+  const decoder: TextDecoder = (stream._utf8Decoder ??= new TextDecoder("utf-8"));
+  const bytes = typeof SharedArrayBuffer !== "undefined" && item.buffer instanceof SharedArrayBuffer
+    ? new Uint8Array(item)
+    : item;
+  const text = decoder.decode(bytes, STREAM_DECODE);
+  return text === "" && bytes.length > 0 ? null : text;
+}
+const STREAM_DECODE = { stream: true } as const;
+
+// the end of a decoded stream: whatever a trailing partial character decodes
+// to goes out before 'end'
+function flushEncodedTail(stream: any): void {
+  const decoder: TextDecoder | undefined = stream._utf8Decoder;
+  if (!decoder) return;
+  stream._utf8Decoder = undefined;
+  const rest = decoder.decode();
+  if (rest) stream.emit("data", rest);
+}
+
 // Readable
 
 export interface Readable extends EventEmitter {
@@ -177,6 +202,7 @@ Readable.prototype.on = function on(
     this._endFired = true;
     queueMicrotask(() => {
       this._endEmitted = true;
+      flushEncodedTail(this);
       this.emit("end");
       if (this._autoDestroy) {
         this.destroy();
@@ -206,6 +232,7 @@ Readable.prototype.once = function once(
     EventEmitter.prototype.once.call(this, evt as string, fn);
     queueMicrotask(() => {
       this._endEmitted = true;
+      flushEncodedTail(this);
       this.emit("end");
       if (this._autoDestroy) {
         this.destroy();
@@ -232,6 +259,7 @@ Readable.prototype.push = function push(chunk: any): boolean {
         this._endFired = true;
         queueMicrotask(() => {
           this._endEmitted = true;
+          flushEncodedTail(this);
           this.emit("end");
           // auto-destroy ('close') like the other end paths; a duplex waits
           // for its writable side, as in node
@@ -282,7 +310,9 @@ Readable.prototype._drain = function _drain(): void {
     }
     this.readableDidRead = true;
     if (this._encoding && item instanceof Uint8Array) {
-      this.emit("data", Buffer.from(item).toString(this._encoding));
+      const text = decodeChunk(this, item);
+      // (a chunk that only held the start of a character: nothing yet)
+      if (text !== null) this.emit("data", text);
     } else {
       this.emit("data", item);
     }
@@ -294,6 +324,7 @@ Readable.prototype._drain = function _drain(): void {
     this._endFired = true;
     queueMicrotask(() => {
       this._endEmitted = true;
+      flushEncodedTail(this);
       this.emit("end");
       if (this._autoDestroy) {
         this.destroy();
@@ -330,6 +361,11 @@ Readable.prototype.read = function read(amount?: number): any {
   if (amount === 0) return null;
 
   if (amount === undefined) {
+    // one buffered Buffer: hand it over as is, like node (no concat copy)
+    if (this._queue.length === 1 && Buffer.isBuffer(this._queue[0])) {
+      this._readableByteLength = 0;
+      return this._queue.shift();
+    }
     const combined = Buffer.concat(this._queue as Uint8Array[]);
     this._readableByteLength = 0;
     this._queue.length = 0;
@@ -784,14 +820,12 @@ Writable.prototype.write = function write(
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
 
-  const stored =
-    !this._objectMode && typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-  this._parts.push(stored);
-  const size = this._objectMode ? 1 : bufferByteLength(stored);
+  // written chunks are not kept (node doesn't): only their size counts
+  const size = this._objectMode ? 1 : bufferByteLength(chunk);
   this._writableByteLength += size;
 
   if (this._corked > 0) {
-    this._corkedWrites.push({ chunk, encoding, callback });
+    this._corkedWrites.push({ chunk, encoding, callback, size });
     return this._writableByteLength < this._highWaterMark;
   }
 
@@ -851,8 +885,9 @@ Writable.prototype.end = function end(
   return this;
 };
 
+// (written chunks aren't retained: nothing to return)
 Writable.prototype.getBuffer = function getBuffer(): Buffer {
-  return Buffer.concat(this._parts);
+  return Buffer.alloc(0);
 };
 
 Writable.prototype.getBufferAsString = function getBufferAsString(enc?: BufferEncoding): string {
@@ -895,6 +930,14 @@ Writable.prototype.uncork = function uncork(): void {
   }
   if (this._corked === 0 && this._corkedWrites.length > 0) {
     const writes = this._corkedWrites.splice(0);
+    // a corked write counted toward the buffered length until it is done
+    const settled = (size: number) => {
+      this._writableByteLength -= size;
+      if (this.writableNeedDrain && this._writableByteLength < this._highWaterMark) {
+        this.writableNeedDrain = false;
+        this.emit("drain");
+      }
+    };
     if (this._writev) {
       this._writev(
         writes.map((w: any) => ({ chunk: w.chunk, encoding: w.encoding })),
@@ -902,12 +945,14 @@ Writable.prototype.uncork = function uncork(): void {
           for (const w of writes) {
             if (w.callback) w.callback(err);
           }
+          settled(writes.reduce((n: number, w: any) => n + (w.size ?? 0), 0));
         },
       );
     } else {
       for (const w of writes) {
         this._write(w.chunk, w.encoding, (err: Error | null | undefined) => {
           if (w.callback) w.callback(err);
+          settled(w.size ?? 0);
         });
       }
     }
@@ -920,7 +965,7 @@ Writable.prototype.setDefaultEncoding = function setDefaultEncoding(_enc: string
 
 Object.defineProperty(Writable.prototype, "writableLength", {
   get: function (this: any) {
-    if (this._objectMode) return this._parts.length;
+    // objects in flight in object mode, bytes otherwise
     return this._writableByteLength;
   },
   configurable: true,
@@ -1115,16 +1160,12 @@ Duplex.prototype.write = function write(
   if (this._writeClosed) return false;
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
-  const stored =
-    !this._writeObjectMode && typeof chunk === "string"
-      ? Buffer.from(chunk)
-      : chunk;
-  this._writeParts.push(stored);
-  const size = this._writeObjectMode ? 1 : bufferByteLength(stored);
+  // written chunks are not kept (node doesn't): only their size counts
+  const size = this._writeObjectMode ? 1 : bufferByteLength(chunk);
   this._writableByteLen += size;
 
   if (this._duplexCorked > 0) {
-    this._duplexCorkedWrites.push({ chunk, encoding, callback });
+    this._duplexCorkedWrites.push({ chunk, encoding, callback, size });
     return this._writableByteLen < this._writeHighWaterMark;
   }
 
@@ -1192,6 +1233,14 @@ Duplex.prototype.uncork = function uncork(): void {
   }
   if (this._duplexCorked === 0 && this._duplexCorkedWrites.length > 0) {
     const writes = this._duplexCorkedWrites.splice(0);
+    // a corked write counted toward the buffered length until it is done
+    const settled = (size: number) => {
+      this._writableByteLen -= size;
+      if (this.writableNeedDrain && this._writableByteLen < this._writeHighWaterMark) {
+        this.writableNeedDrain = false;
+        this.emit("drain");
+      }
+    };
     if (this._writev) {
       this._writev(
         writes.map((w: any) => ({ chunk: w.chunk, encoding: w.encoding })),
@@ -1199,12 +1248,14 @@ Duplex.prototype.uncork = function uncork(): void {
           for (const w of writes) {
             if (w.callback) w.callback(err);
           }
+          settled(writes.reduce((n: number, w: any) => n + (w.size ?? 0), 0));
         },
       );
     } else {
       for (const w of writes) {
         this._write(w.chunk, w.encoding, (err: Error | null | undefined) => {
           if (w.callback) w.callback(err);
+          settled(w.size ?? 0);
         });
       }
     }
@@ -1217,7 +1268,7 @@ Duplex.prototype.setDefaultEncoding = function setDefaultEncoding(_enc: string):
 
 Object.defineProperty(Duplex.prototype, "writableLength", {
   get: function (this: any) {
-    if (this._writeObjectMode) return this._writeParts.length;
+    // objects in flight in object mode, bytes otherwise
     return this._writableByteLen;
   },
   configurable: true,

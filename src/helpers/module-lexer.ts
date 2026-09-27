@@ -10,17 +10,39 @@ let ready = false;
 
 export type LexedModule = ReturnType<typeof parse>;
 
+// The loader lexes a module to classify it and, for ES modules, again to
+// transform it, back to back: the second call reuses the first's result.
+// Held only until the current task's microtasks run, so no source outlives
+// its load.
+let lastSource: string | null = null;
+let lastResult: LexedModule | null = null;
+let clearScheduled = false;
+function forgetLast(): void {
+  lastSource = null;
+  lastResult = null;
+  clearScheduled = false;
+}
+
 /** Lex `source`, or return null when the lexer rejects it. */
 export function lexModule(source: string): LexedModule | null {
+  if (source === lastSource) return lastResult;
+  let result: LexedModule | null;
   try {
     if (!ready) {
       initSync();
       ready = true;
     }
-    return parse(source);
+    result = parse(source);
   } catch {
-    return null;
+    result = null;
   }
+  lastSource = source;
+  lastResult = result;
+  if (!clearScheduled) {
+    clearScheduled = true;
+    queueMicrotask(forgetLast);
+  }
+  return result;
 }
 
 // ImportType.Static / StaticSourcePhase / StaticDeferPhase

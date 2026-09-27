@@ -70,15 +70,16 @@ export function bytesToLatin1(data: Uint8Array): string {
 // its AST). Short all-ASCII input is the same in UTF-8 as in ASCII.
 const SHORT_ASCII_MAX = 64;
 
+const fromCharCode = String.fromCharCode;
+
 /** The string for short all-ASCII bytes, or null (use a TextDecoder). */
 export function decodeShortAscii(data: Uint8Array): string | null {
   const n = data.length;
   if (n > SHORT_ASCII_MAX) return null;
-  let out = '';
   for (let i = 0; i < n; i++) {
-    const c = data[i]!;
-    if (c > 0x7f) return null;
-    out += String.fromCharCode(c);
+    if (data[i]! > 0x7f) return null;
   }
-  return out;
+  // one call builds the string flat (per-char += made a rope that is
+  // flattened again when hashed as a key)
+  return fromCharCode.apply(null, data as unknown as number[]);
 }

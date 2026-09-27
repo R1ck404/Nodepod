@@ -3,10 +3,23 @@
 import { scrypt as nobleScrypt } from "@noble/hashes/scrypt";
 import { Buffer } from "./buffer";
 import { EventEmitter } from "./events";
-import { digestSync, hmacSync, createStreamingDigest, type StreamingDigest } from "./sync-digest";
-import { bytesToHex } from "../helpers/byte-encoding";
+import { digestSync, hmacSync, createStreamingDigest, createStreamingHmac, type StreamingDigest } from "./sync-digest";
+import { bytesToHex, bytesToBase64 } from "../helpers/byte-encoding";
+
+// createHash runs per module and per response (etags): name it once
+const normalizedAlgs = new Map<string, string>();
 
 function normalizeAlg(name: string): string {
+  if (typeof name !== "string") return normalizeAlgUncached(name);
+  let known = normalizedAlgs.get(name);
+  if (known === undefined) {
+    known = normalizeAlgUncached(name);
+    if (normalizedAlgs.size < 64) normalizedAlgs.set(name, known);
+  }
+  return known;
+}
+
+function normalizeAlgUncached(name: string): string {
   const upper = name.toUpperCase().replace(/[^A-Z0-9]/g, "");
   switch (upper) {
     case "SHA1":
@@ -48,9 +61,29 @@ function formatOutput(raw: Uint8Array, enc?: string): string | Buffer {
     return bytesToHex(raw);
   }
   if (enc === "base64") {
-    return btoa(String.fromCharCode(...raw));
+    return bytesToBase64(raw);
   }
   return Buffer.from(raw);
+}
+
+// UTF-8 input for a hasher that consumes it right away (noble copies what it
+// needs into its own block buffer): encode into a reused buffer instead of a
+// fresh allocation per update
+const hashTextEncoder = new TextEncoder();
+const HASH_SCRATCH_MAX = 1024 * 1024;
+let hashScratch: Uint8Array | null = null;
+
+function transientUtf8(text: string): Uint8Array {
+  const worst = text.length * 3;
+  if (worst > HASH_SCRATCH_MAX) return hashTextEncoder.encode(text);
+  if (!hashScratch || hashScratch.length < worst) {
+    hashScratch = new Uint8Array(Math.max(worst, 64 * 1024));
+  }
+  return hashScratch.subarray(0, hashTextEncoder.encodeInto(text, hashScratch).written);
+}
+
+function isUtf8(enc: string | undefined): boolean {
+  return enc === undefined || enc === "utf8" || enc === "utf-8";
 }
 
 function toUpdateChunk(input: string | Buffer | Uint8Array, enc?: string): Buffer {
@@ -132,7 +165,7 @@ Hash.prototype.update = function update(input: string | Buffer | Uint8Array, enc
       throw err;
     }
     if (typeof input === "string") {
-      this._stream.update(Buffer.from(input, (enc as BufferEncoding) || "utf8"));
+      this._stream.update(isUtf8(enc) ? transientUtf8(input) : Buffer.from(input, (enc as BufferEncoding) || "utf8"));
     } else if (input instanceof Uint8Array) {
       this._stream.update(input);
     } else {
@@ -196,17 +229,37 @@ export const Hmac = function Hmac(this: any, alg: string, secret: string | Buffe
   this._alg = normalizeAlg(alg);
   this._key = typeof secret === "string" ? Buffer.from(secret) : secret;
   this._parts = [];
+  // HMAC over the SHA family / MD5 incrementally, like Hash
+  this._stream = this._key instanceof Uint8Array
+    ? createStreamingHmac(this._alg, new Uint8Array(this._key))
+    : null;
 } as unknown as HmacConstructor;
 
 Hmac.prototype.update = function update(input: string | Buffer | Uint8Array, enc?: string): any {
   if (input == null) {
     throw new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' + String(input));
   }
+  if (this._stream) {
+    if (this._digested) {
+      const err = new Error("Digest already called") as Error & { code: string };
+      err.code = "ERR_CRYPTO_HASH_FINALIZED";
+      throw err;
+    }
+    if (typeof input === "string") {
+      this._stream.update(isUtf8(enc) ? transientUtf8(input) : Buffer.from(input, (enc as BufferEncoding) || "utf8"));
+    } else if (input instanceof Uint8Array) {
+      this._stream.update(input);
+    } else {
+      this._stream.update(toUpdateChunk(input, enc));
+    }
+    return this;
+  }
   this._parts.push(toUpdateChunk(input, enc));
   return this;
 };
 
 Hmac.prototype.digestAsync = async function digestAsync(enc?: string): Promise<string | Buffer> {
+  if (this._stream) return formatOutput(streamDigest(this), enc);
   const merged = joinChunks(this._parts);
   const keyBuf = new Uint8Array(this._key).buffer as ArrayBuffer;
   const dataBuf = new Uint8Array(merged).buffer as ArrayBuffer;
@@ -222,6 +275,7 @@ Hmac.prototype.digestAsync = async function digestAsync(enc?: string): Promise<s
 };
 
 Hmac.prototype.digest = function digest(enc?: string): string | Buffer {
+  if (this._stream) return formatOutput(streamDigest(this), enc);
   const merged = joinChunks(this._parts);
   const keyBytes = new Uint8Array(this._key);
   const result = hmacSync(this._alg, keyBytes, merged);
