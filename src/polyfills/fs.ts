@@ -465,6 +465,7 @@ export interface FsBridge {
   truncateSync(target: PathArg, len?: number): void;
   lchownSync(target: PathArg, uid: number, gid: number): void;
   lutimesSync(target: PathArg, atime: unknown, mtime: unknown): void;
+  futimesSync(fd: number, atime: unknown, mtime: unknown): void;
   fchownSync(fd: number, uid: number, gid: number): void;
   fchmodSync(fd: number, mode: number): void;
   openSync(target: string, flags: string | number, mode?: number): number;
@@ -705,6 +706,8 @@ interface OpenFile {
   createMode?: number;
   /** the volume's stored array, lent to a read-only open: never written into */
   borrowed?: Uint8Array;
+  /** futimes times, re-applied after each persist (which stamps "now") */
+  times?: [atime: number | Date, mtime: number | Date];
 }
 
 // an fd's bytes are about to be written in place: its own copy first if
@@ -762,7 +765,18 @@ export function buildFileSystemBridge(
         volume.chmodSync(entry.filePath, entry.createMode & 0o777);
         entry.createMode = undefined;
       }
+      if (entry.times) volume.utimesSync(entry.filePath, entry.times[0], entry.times[1]);
     }
+  }
+
+  // futimes: a file created through this fd only reaches the volume on
+  // fsync/close, so persist it first; the persist at close keeps the times
+  function setFdTimes(fd: number, atime: unknown, mtime: unknown): void {
+    const entry = openFiles.get(fd);
+    if (!entry) throw makeBadfError("futimes");
+    entry.times = [atime as number | Date, mtime as number | Date];
+    persistWritableFd(fd);
+    volume.utimesSync(entry.filePath, entry.times[0], entry.times[1]);
   }
 
   const fsConst: FsConstantsShape = {
@@ -1304,10 +1318,8 @@ export function buildFileSystemBridge(
     }
 
     utimes(atime: unknown, mtime: unknown): Promise<void> {
-      const entry = openFiles.get(this.fd);
-      if (!entry) return Promise.reject(makeBadfError("futimes"));
       try {
-        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+        setFdTimes(this.fd, atime, mtime);
         return Promise.resolve();
       } catch (error) {
         return Promise.reject(error);
@@ -1968,9 +1980,7 @@ export function buildFileSystemBridge(
     },
 
     futimesSync(fd: number, atime: unknown, mtime: unknown): void {
-      const entry = openFiles.get(fd);
-      if (!entry) throw makeBadfError("futimes");
-      volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+      setFdTimes(fd, atime, mtime);
     },
 
     fchownSync(fd: number, uid: number, gid: number): void {
@@ -2887,13 +2897,8 @@ export function buildFileSystemBridge(
       mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      const entry = openFiles.get(fd);
-      if (!entry) {
-        if (cb) deferCallback(() => cb(makeBadfError("futimes")));
-        return;
-      }
       try {
-        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+        setFdTimes(fd, atime, mtime);
         if (cb) deferCallback(() => cb(null));
       } catch (error) {
         if (cb) deferCallback(() => cb(error as Error));

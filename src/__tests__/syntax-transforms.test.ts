@@ -94,6 +94,18 @@ import * as c from "c";
       expect(result).toContain('require("mod")');
       expect(result).toContain("Object.assign");
     });
+
+    it("live imports update bindings of any name, `m` included", () => {
+      const out = esmToCjs("import d, { m, x as y } from 'mod';\nexports.read = () => [d, m, y];", { liveImports: true });
+      const exports: Record<string, any> = {};
+      const partial: Record<string, unknown> = {};
+      let settle!: (mod: unknown) => void;
+      const liveImport = (_id: string, update: (mod: unknown) => void) => { settle = update; };
+      new Function("module", "exports", "require", "__liveImport", out)({ exports }, exports, () => partial, liveImport);
+      expect(exports.read()).toEqual([partial, undefined, undefined]);
+      settle({ __esModule: true, default: "D", m: "M", x: "X" });
+      expect(exports.read()).toEqual(["D", "M", "X"]);
+    });
   });
 
   describe("passthrough", () => {

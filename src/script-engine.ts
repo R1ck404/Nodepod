@@ -26,6 +26,7 @@ import {
 const FILE_EXTENSIONS_WITH_NODE: readonly string[] = [...MAIN_FIELD_EXTENSIONS, ".node"];
 import { buildProcessEnv, ProcessObject } from "./polyfills/process";
 import * as httpPolyfill from "./polyfills/http";
+import { proxyUrlForFetch } from "./cross-origin";
 import {
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
@@ -323,6 +324,7 @@ function convertViaAst(
   if (hasImportDecl || hasExportDecl) {
     collectEsmCjsPatches(ast, source, patches, {
       exportTarget: `${moduleExportName}.exports`,
+      liveImports: true,
     });
   }
 
@@ -574,6 +576,7 @@ var __vite_injected_original_import_meta_url = "file://" + $filename;
 var console = $console;
 var import_meta = $importMeta;
 var __asyncLoad = $asyncLoad;
+var __liveImport = $require && $require.__liveImport;
 var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
 var __syncAwaitFn = $syncAwaitFn;
@@ -761,6 +764,7 @@ function convertViaRegex(
   if (hasImport || hasExport) {
     output = esmToCjs(output, {
       exportTarget: `${moduleExportName}.exports`,
+      liveImports: true,
     });
     if (hasExport) {
       // see ESM_SENTINEL above. #56
@@ -2020,6 +2024,9 @@ function buildResolver(
   // Shared across all resolvers — deduplicates same-version packages from nested node_modules
   const _pkgIdentityMap: Record<string, string> =
     (cache as any).__pkgIdentityMap ?? ((cache as any).__pkgIdentityMap = {});
+  // package dir -> name@version of each dependency / peer it resolves
+  const _pkgDepViews: Map<string, string> =
+    (cache as any).__pkgDepViews ?? ((cache as any).__pkgDepViews = new Map());
 
   // paths without a (readable) package.json, apart from the parsed manifests:
   // resolution probes far more directories without one than packages exist,
@@ -2058,6 +2065,42 @@ function buildResolver(
       return vol.readFileSync(p, "utf8");
     }
     return String(fsBridge.readFileSync(p, "utf8"));
+  };
+
+  // Which versions a package's dependencies and peers resolve to from its
+  // directory. Two installed copies of one name@version are only the same
+  // module when they also see the same dependencies: @napi-rs/wasm-runtime
+  // nested under rolldown's wasm binding peers on @emnapi/core 2.x, the copy
+  // nested under satteri's on 1.x, and sharing one instance hands satteri's
+  // wasm the wrong emnapi imports. Only computed when two copies meet.
+  const depViewOf = (pkgDir: string, manifest: PackageManifest): string => {
+    let view = _pkgDepViews.get(pkgDir);
+    if (view !== undefined) return view;
+    const names = new Set([
+      ...Object.keys(manifest.dependencies || {}),
+      ...Object.keys(manifest.peerDependencies || {}),
+      ...Object.keys(manifest.optionalDependencies || {}),
+    ]);
+    const parts: string[] = [];
+    for (const name of names) {
+      let version = "";
+      for (let dir = pkgDir; ; dir = pathPolyfill.dirname(dir)) {
+        if (!dir.endsWith("/node_modules")) {
+          const dep = readManifest(
+            (dir === "/" ? "" : dir) + "/node_modules/" + name + "/package.json",
+          );
+          if (dep) {
+            version = dep.version || "0.0.0";
+            break;
+          }
+        }
+        if (dir === "/" || dir === "" || dir === ".") break;
+      }
+      parts.push(name + "@" + version);
+    }
+    view = parts.join(",");
+    _pkgDepViews.set(pkgDir, view);
+    return view;
   };
 
   // statSync(p).isFile() / isDirectory() without building a stat object
@@ -2442,13 +2485,23 @@ function buildResolver(
         sharedScope = `${transformSalt()}|${pkgName}@${pkgJson.version || "0.0.0"}`;
         sharedRel = afterNm.slice(pkgName.length + 1);
         // Include file path so different subpath exports (svelte vs svelte/compiler) aren't deduped
-        const identity =
+        let identity =
           pkgName + "@" + (pkgJson.version || "0.0.0") + ":" + afterNm;
-        if (!_pkgIdentityMap[identity]) {
+        let canonical = _pkgIdentityMap[identity];
+        if (canonical && canonical !== resolved) {
+          // (both paths end in afterNm, which starts with the package name)
+          const canonicalPkgDir = canonical.slice(0, canonical.length - afterNm.length) + pkgName;
+          const view = depViewOf(pkgDir, pkgJson);
+          if (view !== depViewOf(canonicalPkgDir, pkgJson)) {
+            // a copy seeing other dependencies: shared only with its likes
+            identity += "|" + view;
+            canonical = _pkgIdentityMap[identity];
+          }
+        }
+        if (!canonical) {
           _pkgIdentityMap[identity] = resolved;
-        } else if (_pkgIdentityMap[identity] !== resolved) {
+        } else if (canonical !== resolved) {
           // Only reuse fully-loaded modules — returning mid-execution ones causes "X is not a function"
-          const canonical = _pkgIdentityMap[identity];
           if (cache[canonical] && cache[canonical].loaded) {
             cache[resolved] = cache[canonical];
             return cache[canonical];
@@ -2720,6 +2773,7 @@ function buildResolver(
         record.exports as Record<string, unknown>,
       );
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
+      settleLiveImports(record);
     } catch (err) {
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
       delete cache[resolved];
@@ -3107,6 +3161,25 @@ function buildResolver(
     return resolveId(id, baseDir);
   };
 
+  // `__liveImport` in the wrapper (see ESMToCJSOptions.liveImports): an
+  // import of a module that is still loading re-reads its bindings once
+  // that module finishes
+  Object.defineProperty(resolver, "__liveImport", {
+    value: (id: string, update: (exports: unknown) => void): void => {
+      let resolved: string;
+      try {
+        resolved = resolver.resolve(id);
+      } catch {
+        return;
+      }
+      const rec = cache[resolved];
+      if (!rec || rec.loaded) return;
+      const pending = pendingLiveImports.get(rec);
+      if (pending) pending.push(update);
+      else pendingLiveImports.set(rec, [update]);
+    },
+  });
+
   resolver.cache = cache;
   resolver.extensions = {
     ".js": () => {},
@@ -3132,6 +3205,21 @@ function buildResolver(
 
 function markResolverMain(resolver: ResolverFn, mod: ModuleRecord): void {
   if (resolver.main == null) resolver.main = mod;
+}
+
+// module still loading -> import binding updates of its circular importers
+const pendingLiveImports = new WeakMap<
+  ModuleRecord,
+  Array<(exports: unknown) => void>
+>();
+
+// run once `mod` has finished loading
+function settleLiveImports(mod: ModuleRecord): void {
+  const updates = pendingLiveImports.get(mod);
+  if (!updates) return;
+  pendingLiveImports.delete(mod);
+  if (mod.exports == null) return;
+  for (const update of updates) update(mod.exports);
 }
 
 // ── ScriptEngine class ──
@@ -3332,6 +3420,16 @@ export class ScriptEngine {
           if (local) {
             return fetchVirtualServer(input, init, local).then((resp) =>
               resp ?? origFetch(input, init),
+            );
+          }
+          // cross-origin targets go through the configured CORS proxy (if
+          // any), like http.request does: pages like github.com's send no
+          // CORS headers, so a browser can't read them directly
+          const proxied = url ? proxyUrlForFetch(url) : null;
+          if (proxied) {
+            return origFetch(
+              input instanceof Request ? new Request(proxied, input) : proxied,
+              init,
             );
           }
           return origFetch(input, init);
@@ -3843,6 +3941,7 @@ export class ScriptEngine {
       );
 
       mod.loaded = true;
+      settleLiveImports(mod);
     } catch (err) {
       delete this.moduleRegistry[filename];
       throw err;
@@ -3983,6 +4082,7 @@ export class ScriptEngine {
           SyncPromiseClass,
         );
         mod.loaded = true;
+        settleLiveImports(mod);
       } catch (err) {
         delete this.moduleRegistry[filename];
         throw err;
@@ -4012,6 +4112,7 @@ export class ScriptEngine {
         SyncPromiseClass,
       );
       mod.loaded = true;
+      settleLiveImports(mod);
     } catch (err) {
       delete this.moduleRegistry[filename];
       throw err;
@@ -4030,6 +4131,7 @@ export class ScriptEngine {
     (this.moduleRegistry as any).__resolveCache?.clear();
     (this.moduleRegistry as any).__manifestCache?.clear();
     delete (this.moduleRegistry as any).__pkgIdentityMap;
+    delete (this.moduleRegistry as any).__pkgDepViews;
     delete (this.moduleRegistry as any).__mainModule;
     this.transformCache.clear();
   }

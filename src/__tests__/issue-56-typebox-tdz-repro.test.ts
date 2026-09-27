@@ -219,6 +219,79 @@ describe("issue 56 typebox 1.x TDZ regression", () => {
     expect(r.exports).toBe("parent-helper");
   });
 
+  // same cycle in bundler output, where the functions are exported through
+  // one `export { ... }` list at the end of the file: astro's
+  // core/routing/create-manifest.js <-> assets/endpoint/config.js
+  // ("resolveInjectedRoute is not a function" in astro build / dev)
+  it("circular ESM: functions exported via a trailing export list are observable during a circular load", () => {
+    const engine = createEngine({
+      "/project/parent.mjs": [
+        "import { fromChild } from './child.mjs';",
+        "function helperFromParent() { return 'parent-helper'; }",
+        "function callsChild() { return fromChild(); }",
+        "let counter = 1;",
+        "counter++;",
+        "export {",
+        "  callsChild,",
+        "  counter,",
+        "  helperFromParent as helper",
+        "};",
+      ].join("\n"),
+      "/project/child.mjs": [
+        "import { helper } from './parent.mjs';",
+        "function fromChild() { return helper(); }",
+        "export { fromChild };",
+      ].join("\n"),
+    });
+    const r = engine.execute(
+      "const m = require('./parent.mjs'); module.exports = [m.callsChild(), m.counter];",
+      "/project/__entry.js",
+    );
+    expect(r.exports).toEqual(["parent-helper", 2]);
+  });
+
+  // `export const` can't be hoisted (TDZ), so the importer captured
+  // undefined from the partial exports and kept it: zod 4.6's core.js <->
+  // util.js `globalConfig` ("reading 'jitless'" in astro dev) and astro's
+  // manifest/serialized.js <-> build/plugins/plugin-manifest.js (build).
+  // the bindings are live like real ESM once the exporter finishes.
+  it("circular ESM: const, default and module.exports imports update once the exporter finishes", () => {
+    const engine = createEngine({
+      "/project/core.mjs": [
+        "import { members } from './util.mjs';",
+        "export const globalConfig = { jitless: false };",
+        "export default { kind: 'core-default' };",
+        "export const hasMembers = typeof members === 'function';",
+      ].join("\n"),
+      "/project/util.mjs": [
+        "import core, { globalConfig } from './core.mjs';",
+        "export function members() {}",
+        "export function allowsEval() { return !globalConfig.jitless; }",
+        "export function defaultKind() { return core.kind; }",
+      ].join("\n"),
+      // CommonJS exporter replacing module.exports after the cycle
+      "/project/legacy.cjs": [
+        "require('./consumer.mjs');",
+        "module.exports = { name: 'legacy' };",
+      ].join("\n"),
+      "/project/consumer.mjs": [
+        "import legacy, { name } from './legacy.cjs';",
+        "export function legacyInfo() { return [legacy.name, name]; }",
+      ].join("\n"),
+    });
+    const r = engine.execute(
+      [
+        "const core = require('./core.mjs');",
+        "const util = require('./util.mjs');",
+        "require('./legacy.cjs');",
+        "const consumer = require('./consumer.mjs');",
+        "module.exports = [util.allowsEval(), util.defaultKind(), core.hasMembers, consumer.legacyInfo()];",
+      ].join("\n"),
+      "/project/__entry.js",
+    );
+    expect(r.exports).toEqual([true, "core-default", true, ["legacy", "legacy"]]);
+  });
+
   it("export-all + export-default also exposes `default` correctly", () => {
     const engine = createEngine({
       "/project/inner.mjs":
