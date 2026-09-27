@@ -49,6 +49,12 @@ export interface ESMToCJSOptions {
    */
   exportTarget?: string;
   /**
+   * Function static imports and re-exports load their module through.
+   * Defaults to `require`; the script engine passes its own so it can tell
+   * a module's static imports from its require() calls.
+   */
+  importCall?: string;
+  /**
    * Keep default and named import bindings in step with the exporter when
    * it was still loading (a circular import): the bindings become `let`
    * and a `__liveImport(specifier, update)` call, which the module loader
@@ -100,6 +106,14 @@ export function esmToCjs(
 }
 
 // collect ESM→CJS patches from a pre-parsed AST, pushes into the patches array
+// `export * from`: every export of the source but its default, and none the
+// module exports itself (its own exports win, wherever they are declared).
+// No `Object` reference: modules may declare their own (typebox 1.x, #56).
+// The leading `;` keeps a previous line without one from calling it.
+function exportStarFrom(target: string, source: string): string {
+  return `;(function (t, m) { var h = {}.hasOwnProperty; for (var k in m) if (k !== "default" && h.call(m, k) && !h.call(t, k)) t[k] = m[k]; })(${target}, ${source})`;
+}
+
 export function collectEsmCjsPatches(
   ast: any,
   code: string,
@@ -119,6 +133,7 @@ export function collectEsmCjsPatches(
   const mixedExports = hasDefaultExport && hasNamedExport;
   const defaultExportTarget = options.exportTarget ?? "module.exports";
   const namedTarget = options.exportTarget ?? "exports";
+  const importCall = options.importCall ?? "require";
   // collected during the walk, prepended at the bottom of this fn
   const hoistedFunctionExports: string[] = [];
   // top-level function declarations, exportable before the body runs too
@@ -138,7 +153,7 @@ export function collectEsmCjsPatches(
         patches.push([
           node.start,
           node.end,
-          `require(${JSON.stringify(src)});`,
+          `${importCall}(${JSON.stringify(src)});`,
         ]);
       } else {
         const defSpec = specs.find(
@@ -158,20 +173,20 @@ export function collectEsmCjsPatches(
         const bind = options.liveImports ? "let" : "const";
 
         if (needsTmp) {
-          lines.push(`const ${tmpVar} = require(${JSON.stringify(src)})`);
+          lines.push(`const ${tmpVar} = ${importCall}(${JSON.stringify(src)})`);
           lines.push(
-            `${bind} ${defSpec.local.name} = ${tmpVar}.__esModule ? ${tmpVar}.default : ${tmpVar}`,
+            `${bind} ${defSpec.local.name} = ${tmpVar} && ${tmpVar}.__esModule ? ${tmpVar}.default : ${tmpVar}`,
           );
         } else if (defSpec) {
           lines.push(
-            `${bind} ${defSpec.local.name} = (function(m) { return m.__esModule ? m.default : m; })(require(${JSON.stringify(src)}))`,
+            `${bind} ${defSpec.local.name} = (function(m) { return m && m.__esModule ? m.default : m; })(${importCall}(${JSON.stringify(src)}))`,
           );
         }
 
         if (nsSpec) {
           if (!needsTmp) {
             lines.push(
-              `const ${nsSpec.local.name} = require(${JSON.stringify(src)})`,
+              `const ${nsSpec.local.name} = ${importCall}(${JSON.stringify(src)})`,
             );
           } else {
             lines.push(`const ${nsSpec.local.name} = ${tmpVar}`);
@@ -189,7 +204,7 @@ export function collectEsmCjsPatches(
           if (needsTmp) {
             lines.push(`${bind} { ${binds} } = ${tmpVar}`);
           } else {
-            lines.push(`${bind} { ${binds} } = require(${JSON.stringify(src)})`);
+            lines.push(`${bind} { ${binds} } = ${importCall}(${JSON.stringify(src)})`);
           }
         }
 
@@ -204,7 +219,7 @@ export function collectEsmCjsPatches(
           const m = `__live_${node.start}`;
           const updates: string[] = [];
           if (defSpec) {
-            updates.push(`${defSpec.local.name} = ${m}.__esModule ? ${m}.default : ${m}`);
+            updates.push(`${defSpec.local.name} = ${m} && ${m}.__esModule ? ${m}.default : ${m}`);
           }
           for (const s of namedSpecs) {
             updates.push(`${s.local.name} = ${m}.${s.imported.name}`);
@@ -300,11 +315,11 @@ export function collectEsmCjsPatches(
       } else if (node.source) {
         const src = node.source.value;
         const tmp = `__reexport_${node.start}`;
-        const lines = [`const ${tmp} = require(${JSON.stringify(src)})`];
+        const lines = [`const ${tmp} = ${importCall}(${JSON.stringify(src)})`];
         for (const spec of node.specifiers) {
           if (spec.local.name === "default") {
             lines.push(
-              `${namedTarget}.${spec.exported.name} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}`,
+              `${namedTarget}.${spec.exported.name} = ${tmp} && ${tmp}.__esModule ? ${tmp}.default : ${tmp}`,
             );
           } else {
             lines.push(
@@ -341,13 +356,13 @@ export function collectEsmCjsPatches(
         patches.push([
           node.start,
           node.end,
-          `${namedTarget}[${JSON.stringify(name)}] = require(${JSON.stringify(src)})`,
+          `${namedTarget}[${JSON.stringify(name)}] = ${importCall}(${JSON.stringify(src)})`,
         ]);
       } else {
         patches.push([
           node.start,
           node.end,
-          `Object.assign(${namedTarget}, require(${JSON.stringify(src)}))`,
+          exportStarFrom(namedTarget, `${importCall}(${JSON.stringify(src)})`),
         ]);
       }
     }
@@ -487,13 +502,20 @@ function containsYield(node: any): boolean {
   return false;
 }
 
+// Modes:
+// - topLevelOnly: only top-level awaits are unwrapped, async functions stay native
+// - full: every async function is de-asynced too (its body runs right away)
+// - scoped: top-level awaits are unwrapped and every async function keeps
+//   both bodies: called inside the sync scope (while a top-level await is
+//   unwrapped, `await f()`) it runs de-asynced so the await settles on the
+//   spot; called anywhere else it is still a native async function
 export function stripTopLevelAwait(
   code: string,
-  mode: "topLevelOnly" | "full" = "topLevelOnly",
+  mode: "topLevelOnly" | "full" | "scoped" = "topLevelOnly",
 ): string {
-  const full = mode === "full";
-  if (!full && !RE_AWAIT_QUICK.test(code)) return code;
-  if (full && !RE_AWAIT_QUICK.test(code) && !RE_ASYNC_QUICK.test(code)) return code;
+  const scoped = mode === "scoped";
+  if (mode !== "full" && !RE_AWAIT_QUICK.test(code)) return code;
+  if (mode === "full" && !RE_AWAIT_QUICK.test(code) && !RE_ASYNC_QUICK.test(code)) return code;
 
   try {
     let ast: any;
@@ -513,10 +535,28 @@ export function stripTopLevelAwait(
     const patches: Array<[number, number, string]> = [];
     let insideAsync = 0;
 
-    function walk(node: any) {
+    function removeAsyncKeyword(node: any, patches: Array<[number, number, string]>): void {
+      if (code.slice(node.start, node.start + 5) === "async") {
+        let end = node.start + 5;
+        while (end < code.length && (code[end] === " " || code[end] === "\t")) end++;
+        patches.push([node.start, end, ""]);
+      } else {
+        const searchStart = Math.max(0, node.start - 30);
+        const region = code.slice(searchStart, node.start);
+        const asyncIdx = region.lastIndexOf("async");
+        if (asyncIdx >= 0) {
+          const absStart = searchStart + asyncIdx;
+          let absEnd = absStart + 5;
+          while (absEnd < code.length && (code[absEnd] === " " || code[absEnd] === "\t")) absEnd++;
+          patches.push([absStart, absEnd, ""]);
+        }
+      }
+    }
+
+    function walk(node: any, patches: Array<[number, number, string]>, full: boolean) {
       if (!node || typeof node !== "object") return;
       if (Array.isArray(node)) {
-        for (const child of node) walk(child);
+        for (const child of node) walk(child, patches, full);
         return;
       }
       if (typeof node.type !== "string") return;
@@ -526,6 +566,31 @@ export function stripTopLevelAwait(
           node.type === "FunctionExpression" ||
           node.type === "ArrowFunctionExpression") &&
         node.async;
+
+      if (scoped && !full && isAsyncFn && !node.generator) {
+        // both bodies side by side: this body under the full transform, and
+        // the original run as a native async arrow (which keeps this,
+        // arguments and super); __asyncBody.pick calls one per call
+        const body = node.body;
+        const inner: Array<[number, number, string]> = [];
+        walk(body, inner, true);
+        const deAsynced = applyPatches(
+          code.slice(body.start, body.end),
+          inner.map(([s, e, r]): [number, number, string] => [s - body.start, e - body.start, r]),
+        );
+        const original = code.slice(body.start, body.end);
+        patches.push([
+          body.start,
+          body.end,
+          node.type === "ArrowFunctionExpression" && node.expression
+            ? `__asyncBody.pick(() => (${deAsynced}), async () => (${original}))`
+            : `{return __asyncBody.pick(() => ${deAsynced}, async () => ${original});}`,
+        ]);
+        removeAsyncKeyword(node, patches);
+        // parameter defaults can hold async functions of their own
+        walk(node.params, patches, full);
+        return;
+      }
 
       if (isAsyncFn) insideAsync++;
 
@@ -541,21 +606,7 @@ export function stripTopLevelAwait(
           patches.push([body.start + 1, body.start + 1, "return __asyncBody(() => {"]);
           patches.push([body.end - 1, body.end - 1, "});"]);
         }
-        if (code.slice(node.start, node.start + 5) === "async") {
-          let end = node.start + 5;
-          while (end < code.length && (code[end] === " " || code[end] === "\t")) end++;
-          patches.push([node.start, end, ""]);
-        } else {
-          const searchStart = Math.max(0, node.start - 30);
-          const region = code.slice(searchStart, node.start);
-          const asyncIdx = region.lastIndexOf("async");
-          if (asyncIdx >= 0) {
-            const absStart = searchStart + asyncIdx;
-            let absEnd = absStart + 5;
-            while (absEnd < code.length && (code[absEnd] === " " || code[absEnd] === "\t")) absEnd++;
-            patches.push([absStart, absEnd, ""]);
-          }
-        }
+        removeAsyncKeyword(node, patches);
       }
 
       if (node.type === "AwaitExpression") {
@@ -599,17 +650,17 @@ export function stripTopLevelAwait(
       for (const key in node) {
         if (key === "type" || key === "start" || key === "end") continue;
         const val = node[key];
-        if (val && typeof val === "object") walk(val);
+        if (val && typeof val === "object") walk(val, patches, full);
       }
 
       if (isAsyncFn) insideAsync--;
     }
 
-    walk(ast);
+    walk(ast, patches, mode === "full");
 
     return applyPatches(code, patches);
   } catch {
-    if (full) {
+    if (mode === "full") {
       let out = code.replace(RE_AWAIT_LOOKAHEAD_G, "");
       out = out.replace(RE_ASYNC_FN_G, "");
       out = out.replace(RE_ASYNC_PAREN_G, "");
@@ -654,7 +705,7 @@ function esmToCjsViaRegex(
     (_m, def, named, src) => {
       const tmp = `__import_${def}`;
       const fixed = named.replace(RE_AS_RENAME, "$1: $2");
-      return `const ${tmp} = require("${src}"); const ${def} = ${tmp}.__esModule ? ${tmp}.default : ${tmp}; const {${fixed}} = ${tmp};`;
+      return `const ${tmp} = require("${src}"); const ${def} = ${tmp} && ${tmp}.__esModule ? ${tmp}.default : ${tmp}; const {${fixed}} = ${tmp};`;
     },
   );
   out = out.replace(RE_IMPORT_DEFAULT, 'const $1 = require("$2");');
@@ -673,7 +724,7 @@ function esmToCjsViaRegex(
   out = out.replace(RE_EXPORT_DEFAULT, `${exportTarget} = `);
   // re-exports
   out = out.replace(RE_EXPORT_STAR_AS, `${namedTarget}.$1 = require("$2");`);
-  out = out.replace(RE_EXPORT_STAR, `Object.assign(${namedTarget}, require("$1"));`);
+  out = out.replace(RE_EXPORT_STAR, (_m, src: string) => exportStarFrom(namedTarget, `require(${JSON.stringify(src)})`) + ";");
   out = out.replace(
     RE_EXPORT_NAMED_FROM,
     (_m, specs, src) => {

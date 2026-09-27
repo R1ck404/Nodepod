@@ -92,7 +92,6 @@ import * as c from "c";
     it("converts export * from", () => {
       const result = esmToCjs('export * from "mod";');
       expect(result).toContain('require("mod")');
-      expect(result).toContain("Object.assign");
     });
 
     it("live imports update bindings of any name, `m` included", () => {
@@ -105,6 +104,39 @@ import * as c from "c";
       expect(exports.read()).toEqual([partial, undefined, undefined]);
       settle({ __esModule: true, default: "D", m: "M", x: "X" });
       expect(exports.read()).toEqual(["D", "M", "X"]);
+    });
+
+    it("a default import of a module exporting undefined is undefined", () => {
+      // lodash-es/_coreJsData.js: `export default root['__core-js_shared__']`
+      const out = esmToCjs([
+        "import a from 'x';",
+        "import b, { c } from 'y';",
+        "export { default as d } from 'x';",
+        "exports.seen = [a, b, c];",
+      ].join("\n"));
+      const exports: Record<string, unknown> = {};
+      const mods: Record<string, unknown> = { x: undefined, y: { c: 3 } };
+      new Function("module", "exports", "require", out)({ exports }, exports, (id: string) => mods[id]);
+      expect(exports.seen).toEqual([undefined, { c: 3 }, 3]);
+      expect(exports.d).toBeUndefined();
+    });
+
+    it("export * skips the source's default and never overrides the module's own exports", () => {
+      // yoga-layout: `export default Yoga; export * from "./enums.js"`, whose
+      // default must not replace Yoga
+      const code = [
+        "export const own = 'mine';",
+        "export default 'the default';",
+        // no semicolon before the re-export: it must not be called
+        "const f = () => 1",
+        "export * from 'mod';",
+        "export const later = 'mine too';",
+      ].join("\n");
+      const out = esmToCjs(code);
+      const module = { exports: {} as Record<string, unknown> };
+      const mod = { own: "theirs", later: "theirs", other: "copied", default: "theirs" };
+      new Function("module", "exports", "require", out)(module, module.exports, () => mod);
+      expect(module.exports).toEqual({ own: "mine", default: "the default", other: "copied", later: "mine too" });
     });
   });
 

@@ -86,6 +86,52 @@ describe("event-loop ordering parity with node", () => {
     expect(lines).toEqual(["2"]);
   });
 
+  it("top-level await of an async function with several awaits unwraps on import", async () => {
+    const lines = await runFiles("/a.mjs", {
+      "/lib.mjs": [
+        "async function f() {",
+        "  const a = await Promise.resolve(1);",
+        "  const b = await Promise.resolve(2);",
+        "  return [a, b];",
+        "}",
+        "export const r = await f();",
+      ].join("\n"),
+      "/a.mjs": "import { r } from './lib.mjs';\nconsole.log(r.join(','));\n",
+    });
+    expect(lines).toEqual(["1,2"]);
+  });
+
+  it("async arrows, methods, this and arguments unwrap under top-level await on import", async () => {
+    const lines = await runFiles("/a.mjs", {
+      "/lib.mjs": [
+        "const add = async (a, b) => (await Promise.resolve(a)) + b;",
+        "class C { constructor() { this.k = 3; } async get(x) { return this.k * (await add(x, 1)); } }",
+        "const obj = { async all() { return [...arguments].join('-') + ':' + (await new C().get(1)); } };",
+        "export const r = await obj.all(1, 2);",
+      ].join("\n"),
+      "/a.mjs": "import { r } from './lib.mjs';\nconsole.log(r);\n",
+    });
+    expect(lines).toEqual(["1-2:6"]);
+  });
+
+  it("async functions of a top-level-await module stay async when called outside it", async () => {
+    const lines = await runFiles("/a.mjs", {
+      "/lib.mjs": [
+        "const later = (v) => new Promise(r => setTimeout(() => r(v), 5));",
+        "async function slow(tag) { const v = await later(tag); console.log('got', v); return v; }",
+        "slow('bg');",
+        "export const ready = await Promise.resolve('ready');",
+        "export { slow };",
+      ].join("\n"),
+      "/a.mjs": [
+        "import { ready, slow } from './lib.mjs';",
+        "console.log(ready);",
+        "slow('later').then(v => console.log('done', v));",
+      ].join("\n"),
+    });
+    expect(lines).toEqual(["ready", "got bg", "got later", "done later"]);
+  });
+
   it("top-level await unwraps promise chains built before the await", async () => {
     const lines = await runFiles("/a.mjs", {
       "/lib.mjs": [
