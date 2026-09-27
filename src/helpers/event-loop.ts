@@ -252,3 +252,61 @@ export async function withHandle<T>(type: HandleType, work: () => Promise<T>): P
     h.close();
   }
 }
+
+const WASM_WORK_PATCH = Symbol.for("nodepod.wasmWorkLifetime");
+const WASM_ASYNC_APIS = ["compile", "instantiate", "compileStreaming", "instantiateStreaming"] as const;
+let _untrackedWasm = 0;
+
+/**
+ * Start WebAssembly work that must not keep the process alive: speculative
+ * cache warm-ups nobody awaits. `start` must call the API synchronously.
+ */
+export function untrackedWasm<T>(start: () => T): T {
+  _untrackedWasm++;
+  try {
+    return start();
+  } finally {
+    _untrackedWasm--;
+  }
+}
+
+/**
+ * WebAssembly.compile / instantiate (and the streaming forms) settle from a
+ * browser task that no tracked handle refs, and node keeps the process alive
+ * while V8 finishes them. Without a handle, a process whose only pending work
+ * is a compile is judged drained and exits 0 mid-await: Qwik's Vite plugin
+ * loads its optimizer with fs.readFile, then WebAssembly.compile, then
+ * instantiate, and `vite` quit before listening whenever the compile outlived
+ * the wait loop's last macrotask. Hold a WASMWork handle until each settles.
+ * Patches this realm's WebAssembly namespace: process workers only.
+ */
+export function installWasmWorkLifetime(): void {
+  if (typeof WebAssembly === "undefined") return;
+  const W = WebAssembly as unknown as Record<string, unknown>;
+  for (const name of WASM_ASYNC_APIS) {
+    const native = W[name];
+    if (typeof native !== "function" || (native as { [WASM_WORK_PATCH]?: true })[WASM_WORK_PATCH]) continue;
+    const fn = native as (...args: unknown[]) => unknown;
+    const tracked = function (this: unknown, ...args: unknown[]): unknown {
+      const result = fn.apply(this, args);
+      if (_untrackedWasm > 0 || !result || typeof (result as Promise<unknown>).then !== "function") {
+        return result;
+      }
+      const handle = getRegistry().register("WASMWork");
+      return (result as Promise<unknown>).then(
+        (value) => {
+          handle.close();
+          return value;
+        },
+        (err) => {
+          handle.close();
+          throw err;
+        },
+      );
+    };
+    Object.defineProperty(tracked, "name", { value: name });
+    Object.defineProperty(tracked, "length", { value: fn.length });
+    Object.defineProperty(tracked, WASM_WORK_PATCH, { value: true });
+    W[name] = tracked;
+  }
+}
