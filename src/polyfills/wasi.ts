@@ -1854,8 +1854,11 @@ export function getWasiRuntimeSource(globalName = "__nodepodWasi"): string {
     value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const emittedName = (canonical: string): string => {
     const escaped = escapeRegExp(canonical);
+    // not an identifier followed by `{`: this function's own template text
+    // (`{WASI,ExitStatus:${...}}` below) would read as ExitStatus -> `$`
+    // where the table above keeps shorthand (unminified builds)
     const objectMatch = ownSource.match(
-      new RegExp(`(?:[{,])\\s*${escaped}\\s*:\\s*([A-Za-z_$][\\w$]*)`),
+      new RegExp(`(?:[{,])\\s*${escaped}\\s*:\\s*([A-Za-z_$][\\w$]*)(?![\\w$]|\\{)`),
     );
     if (objectMatch?.[1]) return objectMatch[1];
     const tupleMatch = ownSource.match(

@@ -296,3 +296,43 @@ describe("node:wasi compatibility", () => {
     }
   });
 });
+
+// The worker runtime is this module's own code, stringified: getWasiRuntimeSource
+// finds the names the bundler gave its pieces. Bundled unminified, the lookup
+// used to read ExitStatus as `$` (from its own template text), so a thread
+// worker's WASI threw "ExitStatus is not defined" (Vite 8 hung in
+// NODEPOD_UNMINIFIED=1 builds).
+describe("getWasiRuntimeSource from a bundled build", () => {
+  for (const minify of [true, false]) {
+    it(`declares what WASI refers to (minify: ${minify})`, async () => {
+      const { build } = await import("esbuild");
+      const entry = new URL("../polyfills/wasi.ts", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+      const bundled = await build({
+        stdin: {
+          contents: `import { getWasiRuntimeSource } from ${JSON.stringify(entry)};\nglobalThis.__src = getWasiRuntimeSource("__runtime");`,
+          resolveDir: ".",
+          loader: "ts",
+        },
+        bundle: true,
+        format: "iife",
+        platform: "browser",
+        target: "esnext",
+        write: false,
+        minify,
+      });
+      const scope: Record<string, any> = {};
+      new Function("globalThis", bundled.outputFiles[0].text)(scope);
+      new Function("globalThis", scope.__src)(scope);
+      const { WASI: RuntimeWASI, ExitStatus } = scope.__runtime;
+      const wasi = new RuntimeWASI({ version: "preview1", returnOnExit: true });
+      const exitCode = wasi.start(
+        instance(new WebAssembly.Memory({ initial: 1 }), {
+          _start: () => {
+            throw new ExitStatus(7);
+          },
+        }),
+      );
+      expect(exitCode).toBe(7);
+    });
+  }
+});
