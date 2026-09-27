@@ -1,4 +1,4 @@
-// Alt dev server showing `nodepod/server`. Same behaviour as
+// Alt dev server showing `@r1ck404/nodepod/server`. Same behaviour as
 // examples/serve.js, but serves /__sw__.js via `serveSWNode()` instead of
 // a hand-rolled readFileSync + headers block.
 //
@@ -6,7 +6,7 @@
 //   node examples/sw-setup/server.js
 // Then open http://localhost:3334/examples/sw-setup/
 //
-// In a real app the import would be 'nodepod/server'. Here it
+// In a real app the import would be '@r1ck404/nodepod/server'. Here it
 // reaches into dist/ because the example lives in this repo.
 
 import { createServer } from "node:http";
@@ -35,7 +35,7 @@ await serveSWNode();
 createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
-  // The one-liner from nodepod/server. We tack on COOP/COEP
+  // The one-liner from @r1ck404/nodepod/server. We tack on COOP/COEP
   // because those are the host's job, not nodepod's.
   if (url === "/__sw__.js") {
     const { body, headers } = await serveSWNode();
@@ -65,5 +65,5 @@ createServer(async (req, res) => {
   }
 }).listen(port, () => {
   console.log(`sw-setup example server → http://localhost:${port}/examples/sw-setup/`);
-  console.log("  (uses serveSWNode() from nodepod/server for /__sw__.js)");
+  console.log("  (uses serveSWNode() from @r1ck404/nodepod/server for /__sw__.js)");
 });

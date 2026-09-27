@@ -22,7 +22,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter nodepod...
+        run: pnpm install --frozen-lockfile --filter @r1ck404/nodepod...
 
       - name: Type check
         run: pnpm run type-check

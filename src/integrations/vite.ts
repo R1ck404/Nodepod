@@ -2,7 +2,7 @@
 // build time, so the user never has to copy the file into public/.
 //
 //   // vite.config.ts
-//   import nodepod from 'nodepod/vite';
+//   import nodepod from '@r1ck404/nodepod/vite';
 //   export default defineConfig({ plugins: [nodepod()] });
 //
 // Vite's types are imported as `type` only so `vite` stays an optional
@@ -155,5 +155,5 @@ export default function nodepod(
   };
 }
 
-// Also expose as named for `import { nodepod } from 'nodepod/vite'`.
+// Also expose as named for `import { nodepod } from '@r1ck404/nodepod/vite'`.
 export { nodepod };

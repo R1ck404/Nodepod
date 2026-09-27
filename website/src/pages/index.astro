@@ -34,7 +34,7 @@ const primitives = [
 
     <div class="install-command" data-copy-block>
       <span aria-hidden="true">$</span>
-      <code>npm install nodepod</code>
+      <code>npm install @r1ck404/nodepod</code>
       <button type="button" data-copy-command aria-label="Copy install command">Copy</button>
     </div>
   </section>
@@ -124,7 +124,7 @@ const primitives = [
 <script>
   const button = document.querySelector<HTMLButtonElement>("[data-copy-command]");
   button?.addEventListener("click", async () => {
-    const command = "npm install nodepod";
+    const command = "npm install @r1ck404/nodepod";
     await navigator.clipboard.writeText(command);
     button.textContent = "Copied";
     window.setTimeout(() => { button.textContent = "Copy"; }, 1600);

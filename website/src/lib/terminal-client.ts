@@ -31,7 +31,7 @@ export async function createTerminalSession(root: HTMLElement): Promise<Terminal
   if (!mount) throw new Error("Terminal mount is unavailable.");
   mount.replaceChildren();
 
-  const { Nodepod } = await import("nodepod");
+  const { Nodepod } = await import("@r1ck404/nodepod");
   const nodepod = await Nodepod.boot({
     serviceWorker: false,
     enableSharedArrayBuffer: false,

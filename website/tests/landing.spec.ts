@@ -11,7 +11,7 @@ test("landing page presents the product and copies the install command", async (
 
   await page.getByRole("button", { name: "Copy install command" }).click();
   await expect(page.getByRole("button", { name: "Copy install command" })).toHaveText("Copied");
-  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("npm install nodepod");
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("npm install @r1ck404/nodepod");
 });
 
 test("landing page supports system light, dark, and reduced-motion modes", async ({ page }) => {

@@ -30,7 +30,7 @@ export function registerDefaultHostFactory(
   }
 }
 
-/** Install a runtime host (browser default, or Node via `nodepod/headless`). */
+/** Install a runtime host (browser default, or Node via `@r1ck404/nodepod/headless`). */
 export function setRuntimeHost(host: RuntimeHost): void {
   _host = host;
 }
@@ -44,7 +44,7 @@ export function getRuntimeHost(): RuntimeHost {
     const factory = resolveFactory();
     if (!factory) {
       throw new Error(
-        "[Nodepod] No RuntimeHost registered. Import nodepod or nodepod/headless.",
+        "[Nodepod] No RuntimeHost registered. Import @r1ck404/nodepod or @r1ck404/nodepod/headless.",
       );
     }
     _defaultFactory = factory;

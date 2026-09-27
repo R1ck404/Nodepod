@@ -46,7 +46,7 @@ export default defineConfig({
   ],
   vite: {
     optimizeDeps: {
-      exclude: ["nodepod"],
+      exclude: ["@r1ck404/nodepod"],
     },
   },
 });

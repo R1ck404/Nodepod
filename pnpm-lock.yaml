@@ -108,6 +108,9 @@ importers:
       '@fontsource/ibm-plex-mono':
         specifier: 5.3.0
         version: 5.3.0
+      '@r1ck404/nodepod':
+        specifier: workspace:*
+        version: link:..
       '@xterm/addon-fit':
         specifier: 0.11.0
         version: 0.11.0
@@ -117,9 +120,6 @@ importers:
       astro:
         specifier: 7.2.1
         version: 7.2.1(@astrojs/markdown-remark@7.2.2)(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)(@types/node@25.9.4)(yaml@2.9.0)
-      nodepod:
-        specifier: workspace:*
-        version: link:..
     devDependencies:
       '@astrojs/check':
         specifier: 0.9.7
