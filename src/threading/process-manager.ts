@@ -36,6 +36,7 @@ import type {
 import type { ShellOptions } from "../shell/shell-options";
 import type { VFSBridge } from "./vfs-bridge";
 import { getRuntimeHost } from "../host/runtime-host";
+import { getFetchPolicy } from "../cross-origin";
 import type { HostWorker } from "../host/types";
 import { SyncResultWriter, SYNC_STATUS_ERROR } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
@@ -329,6 +330,7 @@ export class ProcessManager extends EventEmitter {
       // paged-out package content would have to be read back first: the
       // process saves its packs itself then
       deferPackSave: !!this._packSaver && !this._volume.evictionEnabled,
+      fetchPolicy: getFetchPolicy(),
     };
     this._processPorts.set(pid, ownedPorts);
     try {

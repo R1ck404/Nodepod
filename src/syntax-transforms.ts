@@ -48,6 +48,13 @@ export interface ESMToCJSOptions {
    * every named export and the real module would export nothing.
    */
   exportTarget?: string;
+  /**
+   * Keep default and named import bindings in step with the exporter when
+   * it was still loading (a circular import): the bindings become `let`
+   * and a `__liveImport(specifier, update)` call, which the module loader
+   * provides, re-reads them once the exporter finishes.
+   */
+  liveImports?: boolean;
 }
 
 /**
@@ -114,6 +121,13 @@ export function collectEsmCjsPatches(
   const namedTarget = options.exportTarget ?? "exports";
   // collected during the walk, prepended at the bottom of this fn
   const hoistedFunctionExports: string[] = [];
+  // top-level function declarations, exportable before the body runs too
+  const topLevelFunctions = new Set<string>();
+  for (const node of ast.body) {
+    if (node.type === "FunctionDeclaration" && node.id?.name) {
+      topLevelFunctions.add(node.id.name);
+    }
+  }
 
   for (const node of ast.body) {
     if (node.type === "ImportDeclaration") {
@@ -140,15 +154,17 @@ export function collectEsmCjsPatches(
         const lines: string[] = [];
         const tmpVar = `__import_${node.start}`;
         const needsTmp = defSpec && (namedSpecs.length > 0 || nsSpec);
+        // live bindings are reassigned once a circular exporter finishes
+        const bind = options.liveImports ? "let" : "const";
 
         if (needsTmp) {
           lines.push(`const ${tmpVar} = require(${JSON.stringify(src)})`);
           lines.push(
-            `const ${defSpec.local.name} = ${tmpVar}.__esModule ? ${tmpVar}.default : ${tmpVar}`,
+            `${bind} ${defSpec.local.name} = ${tmpVar}.__esModule ? ${tmpVar}.default : ${tmpVar}`,
           );
         } else if (defSpec) {
           lines.push(
-            `const ${defSpec.local.name} = (function(m) { return m.__esModule ? m.default : m; })(require(${JSON.stringify(src)}))`,
+            `${bind} ${defSpec.local.name} = (function(m) { return m.__esModule ? m.default : m; })(require(${JSON.stringify(src)}))`,
           );
         }
 
@@ -171,10 +187,31 @@ export function collectEsmCjsPatches(
             )
             .join(", ");
           if (needsTmp) {
-            lines.push(`const { ${binds} } = ${tmpVar}`);
+            lines.push(`${bind} { ${binds} } = ${tmpVar}`);
           } else {
-            lines.push(`const { ${binds} } = require(${JSON.stringify(src)})`);
+            lines.push(`${bind} { ${binds} } = require(${JSON.stringify(src)})`);
           }
+        }
+
+        // A circular import hands over the exporter's partial exports:
+        // `export const` values (and a later `module.exports = ...`) aren't
+        // there yet. Real ESM bindings are live, so re-read them when the
+        // exporter finishes (zod's core.js <-> util.js `globalConfig`,
+        // astro's manifest/serialized.js <-> build/plugins/plugin-manifest.js).
+        // The update's parameter is named per import, like tmpVar, so it
+        // can't shadow a binding it assigns (`import { m } from ...`).
+        if (options.liveImports && (defSpec || namedSpecs.length > 0)) {
+          const m = `__live_${node.start}`;
+          const updates: string[] = [];
+          if (defSpec) {
+            updates.push(`${defSpec.local.name} = ${m}.__esModule ? ${m}.default : ${m}`);
+          }
+          for (const s of namedSpecs) {
+            updates.push(`${s.local.name} = ${m}.${s.imported.name}`);
+          }
+          lines.push(
+            `typeof __liveImport === "function" && __liveImport(${JSON.stringify(src)}, function (${m}) { ${updates.join("; ")}; })`,
+          );
         }
         patches.push([node.start, node.end, lines.join(";\n") + ";"]);
       }
@@ -210,7 +247,7 @@ export function collectEsmCjsPatches(
           // before the body works, which fixes circular ESM (typebox's
           // instantiate.mjs <-> awaited/instantiate.mjs). #56
           patches.push([node.start, decl.start, ""]);
-          hoistedFunctionExports.push(name);
+          hoistedFunctionExports.push(`${namedTarget}.${name} = ${name};`);
         } else if (decl.type === "ClassDeclaration") {
           const name = decl.id.name;
           // classes are TDZ, can't assign before the decl. keep trailing.
@@ -281,6 +318,21 @@ export function collectEsmCjsPatches(
           (s: any) => `${namedTarget}.${s.exported.name} = ${s.local.name}`,
         );
         patches.push([node.start, node.end, lines.join(";\n") + ";"]);
+        // `function f() {}` ... `export { f }` (bundler output puts the list
+        // last): hoist like `export function f` so a circular importer sees
+        // f during the partial load (astro's create-manifest.js <->
+        // assets/endpoint/config.js). the trailing assignment stays for a
+        // reassigned binding.
+        for (const s of node.specifiers) {
+          if (
+            s.exported.type === "Identifier" &&
+            topLevelFunctions.has(s.local.name)
+          ) {
+            hoistedFunctionExports.push(
+              `${namedTarget}.${s.exported.name} = ${s.local.name};`,
+            );
+          }
+        }
       }
     } else if (node.type === "ExportAllDeclaration") {
       const src = node.source.value;
@@ -305,10 +357,7 @@ export function collectEsmCjsPatches(
   // see populated exports during a partial load. function decls are
   // value-hoisted, classes/let/const arent (TDZ) so they stay trailing. #56
   if (hoistedFunctionExports.length > 0) {
-    const prefix =
-      hoistedFunctionExports
-        .map((n) => `${namedTarget}.${n} = ${n};`)
-        .join("\n") + "\n";
+    const prefix = hoistedFunctionExports.join("\n") + "\n";
     patches.push([0, 0, prefix]);
   }
 }

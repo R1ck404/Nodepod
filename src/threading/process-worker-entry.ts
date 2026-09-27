@@ -18,6 +18,7 @@ import {
   WASM_SAB_MAX_BYTES,
 } from "../polyfills/sqlite";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import { applyFetchPolicy } from "../cross-origin";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
@@ -339,6 +340,7 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   _cwd = msg.cwd || "/";
   _env = msg.env || {};
   _shellOptions = msg.shell;
+  if (msg.fetchPolicy) applyFetchPolicy(msg.fetchPolicy);
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
   _volume.setBulkMountHandler((snapshot) => {

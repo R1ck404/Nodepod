@@ -2,6 +2,7 @@
 // Flows via postMessage. Binary data (VFS snapshots) transferred zero-copy.
 
 import type { ShellOptions } from "../shell/shell-options";
+import type { FetchPolicy } from "../cross-origin";
 
 // --- VFS snapshot (binary transfer) ---
 
@@ -58,6 +59,8 @@ export interface MainToWorker_Init {
   transformScopes?: string[] | null;
   /** the main thread saves this process's installs' package packs (pack-save) */
   deferPackSave?: boolean;
+  /** the host's CORS proxy + fetch allowlist (cross-origin.ts) */
+  fetchPolicy?: FetchPolicy;
 }
 
 export interface MainToWorker_Probe {

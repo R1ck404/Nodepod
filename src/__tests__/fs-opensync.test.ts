@@ -44,6 +44,51 @@ describe("fs.openSync numeric flags", () => {
   });
 });
 
+// modern-tar (create-astro's template extraction) opens with O_CREAT|O_EXCL,
+// writes, then futimes before close: the file isn't in the volume until close
+describe("fs.futimes on a newly created fd", () => {
+  const CREATE = 1 | 64 | 512 | 128 | 131072; // O_WRONLY|O_CREAT|O_TRUNC|O_EXCL|O_NOFOLLOW
+  const mtime = new Date("2020-01-02T03:04:05Z");
+
+  it("sets the times and keeps them across close", async () => {
+    const vol = new MemoryVolume();
+    const fs = buildFileSystemBridge(vol);
+    const fd = fs.openSync("/new.txt", CREATE, 0o644);
+    fs.writeSync(fd, Buffer.from("hello"));
+    const cbFs = fs as unknown as {
+      futimes(fd: number, a: Date, m: Date, cb: (err: Error | null) => void): void;
+    };
+    await new Promise<void>((resolve, reject) =>
+      cbFs.futimes(fd, mtime, mtime, (err) => (err ? reject(err) : resolve())),
+    );
+    fs.closeSync(fd);
+    expect(vol.readFileSync("/new.txt", "utf8")).toBe("hello");
+    expect(vol.statSync("/new.txt").mtimeMs).toBe(mtime.getTime());
+    expect(vol.statSync("/new.txt").mode & 0o777).toBe(0o644);
+  });
+
+  it("works on an empty file (futimesSync, FileHandle.utimes)", async () => {
+    const vol = new MemoryVolume();
+    const fs = buildFileSystemBridge(vol);
+    const fd = fs.openSync("/empty", CREATE);
+    fs.futimesSync(fd, mtime, mtime);
+    fs.closeSync(fd);
+    expect(vol.statSync("/empty").mtimeMs).toBe(mtime.getTime());
+
+    type Handle = { utimes(a: Date, m: Date): Promise<void>; close(): Promise<void> };
+    const promises = fs.promises as unknown as { open(p: string, f: string): Promise<Handle> };
+    const fh = await promises.open("/h.txt", "wx");
+    await fh.utimes(mtime, mtime);
+    await fh.close();
+    expect(vol.statSync("/h.txt").mtimeMs).toBe(mtime.getTime());
+  });
+
+  it("still reports EBADF for an unknown fd", () => {
+    const fs = buildFileSystemBridge(new MemoryVolume());
+    expect(() => fs.futimesSync(999, mtime, mtime)).toThrow(/EBADF/);
+  });
+});
+
 describe("fs.rmSync", () => {
   it("recursively removes a populated Vite optimizer directory", () => {
     const vol = new MemoryVolume();

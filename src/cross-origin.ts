@@ -89,6 +89,40 @@ export async function proxiedFetch(url: string, init?: RequestInit): Promise<Res
   return fetch(url, init);
 }
 
+// proxied URL for a script's global fetch(), or null to fetch directly.
+// only cross-origin http(s) targets on the allowlist use the proxy: others go
+// out as-is and stay subject to the browser's CORS rules
+export function proxyUrlForFetch(url: string): string | null {
+  const proxy = getActiveProxy();
+  if (!proxy) return null;
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return null;
+  }
+  if (target.protocol !== "http:" && target.protocol !== "https:") return null;
+  if (typeof location !== "undefined" && target.origin === location.origin) return null;
+  if (url.startsWith(proxy) || !isDomainAllowed(url)) return null;
+  return proxy + encodeURIComponent(url);
+}
+
+// process workers are separate JS realms: the host hands them its proxy and
+// allowlist at spawn so fetch/http inside a process follow the same policy
+export interface FetchPolicy {
+  proxy: string | null;
+  allowedDomains: string[] | null;
+}
+
+export function getFetchPolicy(): FetchPolicy {
+  return { proxy: getActiveProxy(), allowedDomains: getAllowedDomains() };
+}
+
+export function applyFetchPolicy(policy: FetchPolicy): void {
+  activeProxy = policy.proxy;
+  allowedDomains = policy.allowedDomains ? new Set(policy.allowedDomains) : null;
+}
+
 export function resolveProxyUrl(url: string): string {
   const proxy = getActiveProxy();
   if (proxy && !isDomainAllowed(url)) {

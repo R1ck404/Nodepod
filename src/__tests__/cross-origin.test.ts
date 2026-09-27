@@ -4,8 +4,13 @@ import {
   setProxy,
   resolveProxyUrl,
   isDomainAllowed,
+  proxyUrlForFetch,
+  getFetchPolicy,
+  applyFetchPolicy,
 } from "../cross-origin";
 import { RegistryClient } from "../packages/registry-client";
+import { ScriptEngine } from "../script-engine";
+import { MemoryVolume } from "../memory-volume";
 
 describe("cross-origin allowlist", () => {
   beforeEach(() => {
@@ -89,4 +94,68 @@ describe("cross-origin allowlist", () => {
     );
   });
 
+  it("proxies a script fetch only for cross-origin, allowlisted http(s) targets", () => {
+    expect(proxyUrlForFetch("https://github.com/a/b")).toBeNull(); // no proxy
+
+    setProxy("https://proxy.test/?url=");
+    setAllowedDomains(["example.com"]);
+    expect(proxyUrlForFetch("https://github.com/a/b?x=1")).toBe(
+      "https://proxy.test/?url=" + encodeURIComponent("https://github.com/a/b?x=1"),
+    );
+    // off the allowlist: fetched directly, the browser's CORS rules apply
+    expect(proxyUrlForFetch("https://evil.com/x")).toBeNull();
+    expect(proxyUrlForFetch("data:text/plain,hi")).toBeNull();
+    expect(proxyUrlForFetch("https://proxy.test/?url=x")).toBeNull();
+
+    vi.stubGlobal("location", { origin: "https://github.com" });
+    expect(proxyUrlForFetch("https://github.com/a/b")).toBeNull(); // same-origin
+  });
+
+  it("hands the host's proxy and allowlist to another realm", () => {
+    setProxy("https://proxy.test/?url=");
+    setAllowedDomains(["example.com"]);
+    const policy = structuredClone(getFetchPolicy());
+    expect(policy.proxy).toBe("https://proxy.test/?url=");
+    expect(policy.allowedDomains).toContain("example.com");
+
+    setProxy(null);
+    setAllowedDomains(null);
+    applyFetchPolicy(policy);
+    expect(resolveProxyUrl("https://api.example.com/x")).toContain("proxy.test");
+    expect(() => resolveProxyUrl("https://evil.com/x")).toThrow(/Fetch blocked/);
+
+    applyFetchPolicy({ proxy: null, allowedDomains: null });
+    expect(resolveProxyUrl("https://evil.com/x")).toBe("https://evil.com/x");
+  });
+
+  // create-astro verifies its template with fetch(HEAD github.com/...), a page
+  // without CORS headers: with a proxy configured, a script's fetch uses it
+  it("routes a script's global fetch through the configured proxy", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input, init);
+        seen.push(`${req.method} ${req.url} ${req.headers.get("accept") ?? ""}`);
+        return new Response("ok");
+      }),
+    );
+    new ScriptEngine(new MemoryVolume(), { cwd: "/" });
+
+    const target = "https://github.com/withastro/astro/tree/examples/minimal/";
+    const proxied = "https://proxy.test/?url=" + encodeURIComponent(target);
+    await fetch(target, { method: "HEAD" }); // no proxy yet: direct
+    setAllowedDomains(null);
+    setProxy("https://proxy.test/?url=");
+    await fetch(target, { method: "HEAD", headers: { accept: "application/json" } });
+    await fetch(new Request(target, { headers: { accept: "text/html" } }));
+    await fetch(new URL(target));
+
+    expect(seen).toEqual([
+      `HEAD ${target} `,
+      `HEAD ${proxied} application/json`,
+      `GET ${proxied} text/html`,
+      `GET ${proxied} `,
+    ]);
+  });
 });

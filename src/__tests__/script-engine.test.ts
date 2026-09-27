@@ -182,6 +182,52 @@ describe("ScriptEngine", () => {
       });
     });
 
+    // napi-rs wasm bindings each nest @napi-rs/wasm-runtime@1.2.4 next to the
+    // @emnapi/core they were built with; one shared instance handed satteri's
+    // wasm rolldown's emnapi 2.x ("napi_set_last_error" LinkError in astro)
+    it("keeps same-version package copies apart when their peers differ", () => {
+      const rt = (at: string) => ({
+        [`${at}/rt/package.json`]: JSON.stringify({
+          name: "rt",
+          version: "1.0.0",
+          peerDependencies: { core: "*" },
+        }),
+        [`${at}/rt/index.js`]: 'module.exports = { core: require("core") };',
+      });
+      const core = (at: string, version: string) => ({
+        [`${at}/core/package.json`]: JSON.stringify({ name: "core", version }),
+        [`${at}/core/index.js`]: `module.exports = "core ${version}";`,
+      });
+      const binding = (name: string) => ({
+        [`/project/node_modules/${name}/package.json`]: JSON.stringify({ name }),
+        [`/project/node_modules/${name}/index.js`]: 'module.exports = require("rt");',
+      });
+      const { engine } = createEngine({
+        ...binding("a"),
+        ...rt("/project/node_modules/a/node_modules"),
+        ...core("/project/node_modules/a/node_modules", "2.0.0"),
+        ...binding("b"),
+        ...rt("/project/node_modules/b/node_modules"),
+        ...core("/project/node_modules/b/node_modules", "1.0.0"),
+        ...binding("c"),
+        ...rt("/project/node_modules/c/node_modules"),
+        ...binding("d"),
+        ...rt("/project/node_modules/d/node_modules"),
+        ...core("/project/node_modules", "1.1.0"),
+      });
+      const result = engine.execute(
+        'const [a, b, c, d] = ["a", "b", "c", "d"].map((n) => require(n)); module.exports = { a: a.core, b: b.core, c: c.core, cdShared: c === d };',
+        "/project/index.js",
+      );
+      expect(result.exports).toEqual({
+        a: "core 2.0.0",
+        b: "core 1.0.0",
+        c: "core 1.1.0",
+        // copies that see the same dependencies are still one instance
+        cdShared: true,
+      });
+    });
+
     it("requires JSON files", () => {
       const { engine } = createEngine({
         "/project/data.json": '{"key": "value"}',
