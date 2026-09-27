@@ -14,7 +14,7 @@ import {
   serveSW,
   servePreviewBridge,
   servePreviewBridgeScript,
-} from '@scelar/nodepod/server';
+} from 'nodepod/server';
 
 app.get('/__sw__.js', () => serveSW());
 app.get('/__nodepod_bridge__.html', (context) =>
@@ -27,7 +27,7 @@ app.get('/__nodepod_bridge__.js', () => servePreviewBridgeScript());
 Node-native helpers return a body and header map:
 
 ```ts
-import { serveSWNode, servePreviewBridgeNode } from '@scelar/nodepod/server';
+import { serveSWNode, servePreviewBridgeNode } from 'nodepod/server';
 
 app.get('/__sw__.js', async (_request, response) => {
   const { body, headers } = await serveSWNode();

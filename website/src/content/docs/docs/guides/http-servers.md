@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from 'nodepod';
 
 let markServerReady: (() => void) | undefined;
 const serverReady = new Promise<void>((resolve) => {

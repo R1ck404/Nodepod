@@ -22,7 +22,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter @scelar/nodepod...
+        run: pnpm install --frozen-lockfile --filter nodepod...
 
       - name: Type check
         run: pnpm run type-check
@@ -61,10 +61,10 @@ jobs:
         run: pnpm run docs:check
 
       - name: Install Chromium
-        run: pnpm --filter @scelar/nodepod-site exec playwright install --with-deps chromium
+        run: pnpm --filter nodepod-site exec playwright install --with-deps chromium
 
       - name: Test production documentation preview
-        run: pnpm --filter @scelar/nodepod-site test
+        run: pnpm --filter nodepod-site test
 
       - name: Upload documentation test report
         if: always()

@@ -1,6 +1,6 @@
 # nodepod
 
-[![npm](https://img.shields.io/npm/v/@scelar/nodepod.svg)](https://www.npmjs.com/package/@scelar/nodepod)
+[![npm](https://img.shields.io/npm/v/nodepod.svg)](https://www.npmjs.com/package/nodepod)
 [![CI](https://github.com/R1ck404/Nodepod/actions/workflows/ci.yml/badge.svg)](https://github.com/R1ck404/Nodepod/actions/workflows/ci.yml)
 
 Run Node.js inside the browser. Nodepod provides a virtual filesystem, shell,
@@ -8,8 +8,12 @@ npm packages, worker-backed processes, and Node-compatible HTTP servers without
 requiring an application backend.
 
 ```bash
-npm install @scelar/nodepod
+npm install nodepod
 ```
+
+> Nodepod used to be published as `@scelar/nodepod`. That name is deprecated;
+> switch to `nodepod` (same API and subpaths: `nodepod/headless`,
+> `nodepod/server`, `nodepod/vite`, `nodepod/next`).
 
 Nodepod is source-available under the MIT License with the Commons Clause. See
 [License](#license) before using it in a product.
@@ -17,7 +21,7 @@ Nodepod is source-available under the MIT License with the Commons Clause. See
 ## Quick start
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from 'nodepod';
 
 const nodepod = await Nodepod.boot({
   files: {
@@ -63,7 +67,7 @@ Vite can serve and emit Nodepod's runtime assets automatically:
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
-import nodepod from '@scelar/nodepod/vite';
+import nodepod from 'nodepod/vite';
 
 export default defineConfig({ plugins: [nodepod()] });
 ```
@@ -137,7 +141,7 @@ No private email address is published for sponsor listings.
 
 ## Links
 
-- [npm package](https://www.npmjs.com/package/@scelar/nodepod)
+- [npm package](https://www.npmjs.com/package/nodepod)
 - [GitHub repository](https://github.com/R1ck404/Nodepod)
 - [Contributing](./CONTRIBUTING.md)
 - [Sponsor policy](https://r1ck404.github.io/Nodepod/sponsors/)

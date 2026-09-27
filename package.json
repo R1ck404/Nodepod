@@ -1,5 +1,5 @@
 {
-  "name": "@scelar/nodepod",
+  "name": "nodepod",
   "version": "1.11.0",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
@@ -107,10 +107,10 @@
     "test:watch": "vitest",
     "test:browser:preview": "playwright test --config playwright.preview.config.ts",
     "test:browser:perf": "pnpm run build:publish && playwright test --config playwright.perf.config.ts",
-    "docs:dev": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site dev",
-    "docs:build": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site build",
-    "docs:check": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site check",
-    "docs:test": "pnpm run docs:build && pnpm --filter @scelar/nodepod-site test",
+    "docs:dev": "pnpm run build:publish && pnpm --filter nodepod-site dev",
+    "docs:build": "pnpm run build:publish && pnpm --filter nodepod-site build",
+    "docs:check": "pnpm run build:publish && pnpm --filter nodepod-site check",
+    "docs:test": "pnpm run docs:build && pnpm --filter nodepod-site test",
     "bench": "vitest bench",
     "bench:run": "vitest bench --run",
     "prepublishOnly": "pnpm run build:publish"

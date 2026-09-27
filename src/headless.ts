@@ -1,12 +1,12 @@
 /**
- * `@scelar/nodepod/headless` — Node/Bun host adapter for isomorphic headless mode.
+ * `nodepod/headless` — Node/Bun host adapter for isomorphic headless mode.
  *
  * Installs a `worker_threads` RuntimeHost (plus local HTTP ingress) before
  * re-exporting the public SDK. Prefer this entry for agents, CI, and CLIs.
  *
  * @example
  * ```ts
- * import { Nodepod } from "@scelar/nodepod/headless";
+ * import { Nodepod } from "nodepod/headless";
  * const pod = await Nodepod.boot();
  * await pod.fs.writeFile("/hello.txt", "hi");
  * const res = await pod.request(3000, { path: "/" });

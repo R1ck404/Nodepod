@@ -10,16 +10,19 @@ sidebar:
 Nodepod's browser entry requires Node 20 or newer in your build tooling.
 
 ```bash
-npm install @scelar/nodepod
+npm install nodepod
 ```
 
 For pnpm or Yarn, use the equivalent add command. Nodepod publishes both ESM
 and CommonJS builds; the examples here use ESM syntax.
 
+Nodepod used to be published as `@scelar/nodepod`. That name is deprecated;
+replace it with `nodepod` (same API and subpaths).
+
 ## Boot and run
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from 'nodepod';
 
 const nodepod = await Nodepod.boot({
   files: {
