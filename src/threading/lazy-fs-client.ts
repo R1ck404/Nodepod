@@ -137,9 +137,11 @@ function throwIfTransient(res: ProxyResult | null, type: string, target: unknown
   }
 }
 
+const replyDecoder = new TextDecoder();
+
 function decodeJson(bytes: Uint8Array): unknown {
   try {
-    return JSON.parse(new TextDecoder().decode(bytes));
+    return JSON.parse(replyDecoder.decode(bytes));
   } catch {
     return null;
   }

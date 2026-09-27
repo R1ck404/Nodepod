@@ -22,6 +22,8 @@ import {
   INDEX_FILES,
   IMPORTS_FIELD_EXTENSIONS,
 } from "./constants/config";
+// a module path's candidate extensions, in probe order
+const FILE_EXTENSIONS_WITH_NODE: readonly string[] = [...MAIN_FIELD_EXTENSIONS, ".node"];
 import { buildProcessEnv, ProcessObject } from "./polyfills/process";
 import * as httpPolyfill from "./polyfills/http";
 import {
@@ -384,9 +386,15 @@ declare const __NODEPOD_BUILD_ID__: string | undefined;
 // Transform caches store this instead of code when the transform left the
 // source unchanged (most CommonJS in node_modules): the loader has the source
 // in hand already, so a second copy would only cost memory and transfer.
-const SAME_AS_SOURCE = "\u0000=";
-// shared-pack flag: see SAME_AS_SOURCE
+// transform flags: 1 top-level await, 2 lexer fast path, 4 the transform
+// left the source as it was (no code stored)
 const FLAG_SAME_AS_SOURCE = 4;
+// a cached transform is one string: a flags character, then the code
+const CACHED_FLAGS_BASE = 0x30;
+function encodeCachedTransform(code: string | null, hasTLA: boolean, fast: boolean): string {
+  const flags = (hasTLA ? 1 : 0) | (fast ? 2 : 0) | (code === null ? FLAG_SAME_AS_SOURCE : 0);
+  return String.fromCharCode(CACHED_FLAGS_BASE + flags) + (code ?? "");
+}
 
 // ── Shared transform store (see threading/transform-store.ts) ──
 
@@ -1995,12 +2003,22 @@ function buildResolver(
   const _pkgIdentityMap: Record<string, string> =
     (cache as any).__pkgIdentityMap ?? ((cache as any).__pkgIdentityMap = {});
 
+  // paths without a (readable) package.json, apart from the parsed manifests:
+  // resolution probes far more directories without one than packages exist,
+  // and in one LRU the misses kept evicting (and re-parsing) real manifests
+  const missingManifests: Map<string, null> =
+    (cache as any).__missingManifestCache ??
+    ((cache as any).__missingManifestCache = opts.handler
+      ? new _LRUCache<string, null>(opts.handler.options.resolveCacheSize)
+      : new Map());
+
   const readManifest = (manifestPath: string): PackageManifest | null => {
-    if (manifestCache.has(manifestPath))
-      return manifestCache.get(manifestPath)!;
+    const cachedManifest = manifestCache.get(manifestPath);
+    if (cachedManifest) return cachedManifest;
+    if (missingManifests.has(manifestPath)) return null;
     // most lookups probe directories without a package.json; skip the ENOENT
     if (!vol.existsSync(manifestPath)) {
-      manifestCache.set(manifestPath, null);
+      missingManifests.set(manifestPath, null);
       return null;
     }
     try {
@@ -2009,9 +2027,16 @@ function buildResolver(
       manifestCache.set(manifestPath, parsed);
       return parsed;
     } catch {
-      manifestCache.set(manifestPath, null);
+      missingManifests.set(manifestPath, null);
       return null;
     }
+  };
+
+  // statSync(p).isFile() / isDirectory() without building a stat object
+  const kindOf = (p: string): "file" | "directory" | null => {
+    if (typeof vol.kindSync === "function") return vol.kindSync(p);
+    if (!vol.existsSync(p)) return null;
+    return vol.statSync(p).isFile() ? "file" : "directory";
   };
 
   // dir -> whether the nearest package.json declares "type": "module"
@@ -2142,16 +2167,13 @@ function buildResolver(
     }
 
     const tryFile = (base: string): string | null => {
-      if (vol.existsSync(base)) {
-        const s = vol.statSync(base);
-        if (s.isFile()) return base;
+      const kind = kindOf(base);
+      if (kind !== null) {
+        if (kind === "file") return base;
         const localMf = readManifest(pathPolyfill.join(base, "package.json"));
         if (localMf?.main) {
           const mainPath = pathPolyfill.join(base, localMf.main);
-          if (vol.existsSync(mainPath)) {
-            const ms = vol.statSync(mainPath);
-            if (ms.isFile()) return mainPath;
-          }
+          if (kindOf(mainPath) === "file") return mainPath;
           for (const ext of MAIN_FIELD_EXTENSIONS) {
             const withExt = mainPath + ext;
             if (vol.existsSync(withExt)) return withExt;
@@ -2162,7 +2184,7 @@ function buildResolver(
           if (vol.existsSync(idxPath)) return idxPath;
         }
       }
-      for (const ext of [...MAIN_FIELD_EXTENSIONS, ".node"]) {
+      for (const ext of FILE_EXTENSIONS_WITH_NODE) {
         const withExt = base + ext;
         if (vol.existsSync(withExt)) return withExt;
       }
@@ -2206,6 +2228,9 @@ function buildResolver(
     };
 
     const tryNodeModules = (nmDir: string, moduleId: string): string | null => {
+      // nothing resolves under a node_modules that isn't there: skip the
+      // manifest and ~10 extension probes for each ancestor without one
+      if (!vol.existsSync(nmDir)) return null;
       const parts = moduleId.split("/");
       const pkgName =
         parts[0].startsWith("@") && parts.length > 1
@@ -2278,7 +2303,13 @@ function buildResolver(
                 if (found) {
                   if (found.endsWith(".cjs")) {
                     try {
-                      const content = vol.readFileSync(found, "utf8");
+                      // a stub that only throws: its first statement is
+                      // enough, no need to decode the whole file
+                      const bytes = vol.readFileSync(found);
+                      let content = new TextDecoder().decode(bytes.subarray(0, 512));
+                      if (content.trim() === "" && bytes.length > 512) {
+                        content = vol.readFileSync(found, "utf8");
+                      }
                       if (content.trimStart().startsWith("throw ")) continue;
                     } catch {
                       /* proceed */
@@ -2335,7 +2366,9 @@ function buildResolver(
 
     // Fallback: resolve from cwd (handles modules loaded from temp/bundled locations)
     const cwd = proc.cwd();
-    if (cwd !== fromDir && cwd !== "/") {
+    // (a cwd at or above fromDir: the walk above already probed every
+    // directory this one would)
+    if (cwd !== fromDir && cwd !== "/" && !fromDir.startsWith(cwd + "/")) {
       let fallbackDir = cwd;
       while (fallbackDir !== "/" && fallbackDir !== fromDir) {
         const nmDir = pathPolyfill.join(fallbackDir, "node_modules");
@@ -2443,12 +2476,25 @@ function buildResolver(
 
     const sourceDigest = contentDigest(rawSource);
     const codeCacheKey = `${resolved}|${sourceDigest}`;
-    let processedCode = codeCache?.get(codeCacheKey);
-    if (processedCode === SAME_AS_SOURCE) processedCode = rawSource;
-    let moduleHasTLA = codeCache?.get(`${codeCacheKey}|tla`) === "1";
-    // "f" marks output of the lexer fast path, which is re-derived through
-    // the full AST path if V8 rejects it (see the eval below).
-    let usedFastPath = codeCache?.get(`${codeCacheKey}|fast`) === "1";
+    // one cache entry per module: its flags, then its code (see
+    // encodeCachedTransform), so the flags can't be evicted apart from it
+    let processedCode: string | undefined;
+    let moduleHasTLA = false;
+    // output of the lexer fast path is re-derived through the full AST path
+    // if V8 rejects it (see the eval below)
+    let usedFastPath = false;
+    // whether moduleHasTLA is known (cached or computed with the transform)
+    let tlaKnown = false;
+    const cachedTransform = codeCache?.get(codeCacheKey);
+    if (cachedTransform !== undefined) {
+      const flags = cachedTransform.charCodeAt(0) - CACHED_FLAGS_BASE;
+      if (flags >= 0 && flags < 8) {
+        moduleHasTLA = (flags & 1) !== 0;
+        usedFastPath = (flags & 2) !== 0;
+        processedCode = (flags & FLAG_SAME_AS_SOURCE) !== 0 ? rawSource : cachedTransform.slice(1);
+        tlaKnown = true;
+      }
+    }
 
     const transformSource = (allowFast: boolean): void => {
       processedCode = rawSource;
@@ -2514,12 +2560,13 @@ function buildResolver(
         processedCode = converted.code;
         moduleHasTLA = converted.hasTLA;
       }
-      codeCache?.set(
-        codeCacheKey,
-        processedCode === rawSource ? SAME_AS_SOURCE : processedCode!,
-      );
-      codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
-      codeCache?.set(`${codeCacheKey}|fast`, usedFastPath ? "1" : "0");
+      if (codeCache) {
+        codeCache.set(
+          codeCacheKey,
+          encodeCachedTransform(processedCode === rawSource ? null : processedCode!, moduleHasTLA, usedFastPath),
+        );
+        tlaKnown = true;
+      }
     };
 
     const sharedTransforms = sharedScope ? getSharedTransformClient() : null;
@@ -2533,9 +2580,12 @@ function buildResolver(
         processedCode = same ? rawSource : hit[0];
         moduleHasTLA = (hit[1] & 1) !== 0;
         usedFastPath = (hit[1] & 2) !== 0;
-        codeCache?.set(codeCacheKey, same ? SAME_AS_SOURCE : processedCode);
-        codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
-        codeCache?.set(`${codeCacheKey}|fast`, usedFastPath ? "1" : "0");
+        if (codeCache) {
+          // the shared store keeps the code; a local copy would only double
+          // what this process already holds (only the tiny "unchanged" mark)
+          if (same) codeCache.set(codeCacheKey, encodeCachedTransform(null, moduleHasTLA, usedFastPath));
+          tlaKnown = true;
+        }
       }
     }
     const publishTransform = (): void => {
@@ -2550,6 +2600,9 @@ function buildResolver(
         same ? "" : processedCode!,
         (moduleHasTLA ? 1 : 0) | (usedFastPath ? 2 : 0) | (same ? FLAG_SAME_AS_SOURCE : 0),
       );
+      // published: repeat loads get it from the shared store, the local cache
+      // needn't hold a second copy of the code
+      if (!same) codeCache?.delete(codeCacheKey);
     };
     if (processedCode === undefined) {
       transformSource(true);
@@ -2560,7 +2613,7 @@ function buildResolver(
     let useFullDeAsync = false;
     let childResolver!: ResolverFn;
     const finishTransform = (): void => {
-      if (!isCjs && !codeCache?.has(`${codeCacheKey}|tla`)) {
+      if (!isCjs && !tlaKnown) {
         moduleHasTLA = hasTopLevelAwait(processedCode!);
       }
       useFullDeAsync = deAsyncImports || moduleHasTLA;

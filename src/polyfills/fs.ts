@@ -663,6 +663,33 @@ function resolvePath(target: unknown, cwdFn?: () => string): string {
 
 // plain Uint8Array.toString() returns comma-separated bytes, not UTF-8 text --
 // must wrap with Buffer.from() so .toString() works like Node's Buffer
+// dst[dstOff + i] = src[srcOff + i] for i < count: one native copy when both
+// are byte arrays and the range fits, the element loop otherwise (it
+// silently skips out-of-range indices, which set() would throw on)
+function copyBytes(
+  dst: ArrayLike<number> & { [i: number]: number },
+  dstOff: number,
+  src: ArrayLike<number>,
+  srcOff: number,
+  count: number,
+): void {
+  if (
+    count > 16 &&
+    dst instanceof Uint8Array &&
+    src instanceof Uint8Array &&
+    Number.isInteger(dstOff) &&
+    Number.isInteger(srcOff) &&
+    dstOff >= 0 &&
+    srcOff >= 0 &&
+    dstOff + count <= dst.length &&
+    srcOff + count <= src.length
+  ) {
+    dst.set(new Uint8Array(src.buffer, src.byteOffset + srcOff, count), dstOff);
+    return;
+  }
+  for (let i = 0; i < count; i++) dst[dstOff + i] = src[srcOff + i];
+}
+
 function wrapAsBuffer(raw: Uint8Array): Buffer {
   if (typeof (raw as any).readUInt8 === "function") return raw as Buffer;
   return Buffer.from(raw) as Buffer;
@@ -676,7 +703,20 @@ interface OpenFile {
   isDirectory?: boolean;
   /** Permission bits to apply on first persist of a newly created file. */
   createMode?: number;
+  /** the volume's stored array, lent to a read-only open: never written into */
+  borrowed?: Uint8Array;
 }
+
+// an fd's bytes are about to be written in place: its own copy first if
+// they are still the volume's
+function ownFdData(entry: OpenFile): void {
+  if (entry.borrowed === undefined) return;
+  if (entry.data === entry.borrowed) entry.data = new Uint8Array(entry.data);
+  entry.borrowed = undefined;
+}
+
+/** Key of the fs bridge's proxy helpers (a symbol, so user code never meets them). */
+export const FS_PROXY_INTERNALS = Symbol.for("nodepod.fsProxyInternals");
 
 export function buildFileSystemBridge(
   volume: MemoryVolume,
@@ -772,7 +812,16 @@ export function buildFileSystemBridge(
 
   // Helper to build Dirent array from directory entries
   function toDirents(dirPath: string, names: string[]): Dirent[] {
-    return names.map((name) => {
+    // every entry's kind from one lookup of the directory, not an lstat
+    // (and a stat object) per entry
+    const kinds = typeof volume.childKindsSync === "function"
+      ? volume.childKindsSync(dirPath, names)
+      : null;
+    return names.map((name, i) => {
+      const kind = kinds ? kinds[i] : null;
+      if (kind !== null) {
+        return new Dirent(name, kind === "directory", kind === "file", dirPath, kind === "symlink");
+      }
       const full = dirPath.endsWith("/")
         ? dirPath + name
         : dirPath + "/" + name;
@@ -839,7 +888,8 @@ export function buildFileSystemBridge(
 
   function decodeBytes(raw: Uint8Array, enc?: string | null): Buffer | string {
     if (!enc || enc === "buffer") return wrapAsBuffer(raw);
-    return Buffer.from(raw).toString(enc as BufferEncoding);
+    // decoding never writes: a view over the stored bytes, not a copy
+    return Buffer.from(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength).toString(enc as BufferEncoding);
   }
 
   function normalizeWriteData(
@@ -1160,7 +1210,7 @@ export function buildFileSystemBridge(
       const readAt = pos !== null ? pos : entry.cursor;
       const count = Math.min(len, entry.data.length - readAt);
       if (count <= 0) return Promise.resolve({ bytesRead: 0, buffer: buf });
-      for (let i = 0; i < count; i++) buf[off + i] = entry.data[readAt + i];
+      copyBytes(buf, off, entry.data, readAt, count);
       if (pos === null) entry.cursor += count;
       return Promise.resolve({ bytesRead: count, buffer: buf });
     }
@@ -1212,7 +1262,7 @@ export function buildFileSystemBridge(
         const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
         const count = Math.min(u8.length, entry.data.length - readPos);
         if (count <= 0) break;
-        for (let i = 0; i < count; i++) u8[i] = entry.data[readPos + i];
+        copyBytes(u8, 0, entry.data, readPos, count);
         readPos += count;
         totalRead += count;
         if (count < u8.length) break;
@@ -1299,7 +1349,8 @@ export function buildFileSystemBridge(
         expanded.set(entry.data);
         entry.data = expanded;
       }
-      for (let i = 0; i < len; i++) entry.data[writeAt + i] = bytes[off + i];
+      ownFdData(entry);
+      copyBytes(entry.data, writeAt, bytes, off, len);
       if (pos === null || pos === undefined) entry.cursor = endAt;
       return Promise.resolve({ bytesWritten: len, buffer: buf });
     }
@@ -1326,7 +1377,8 @@ export function buildFileSystemBridge(
           expanded.set(entry.data);
           entry.data = expanded;
         }
-        for (let i = 0; i < u8.length; i++) entry.data[writePos + i] = u8[i];
+        ownFdData(entry);
+        copyBytes(entry.data, writePos, u8, 0, u8.length);
         writePos += u8.length;
         totalWritten += u8.length;
       }
@@ -1726,6 +1778,37 @@ export function buildFileSystemBridge(
     return volume.realpathSync(abs(target));
   };
 
+  // readFileSync's bytes as stored (not a copy: callers must not write to
+  // them), with its .wasm asset handling
+  function readStoredBytes(target: unknown): Uint8Array {
+    const p = abs(target);
+    const wasmPath =
+      p.endsWith(".wasm") && p.includes("/node_modules/")
+        ? resolveWasmAssetPath(volume, p)
+        : p;
+
+    try {
+      const raw = volume.readFileSync(wasmPath);
+      if (wasmPath.endsWith(".wasm")) precompileWasm(raw);
+      return raw;
+    } catch (err: any) {
+      // .wasm under node_modules missing from the VFS (e.g. >15MB binary
+      // that skipped extraction): kick an async CDN prefetch so a retry
+      // succeeds, but never block this thread with a sync download.
+      if (
+        err?.code === "ENOENT" &&
+        p.endsWith(".wasm") &&
+        p.includes("/node_modules/")
+      ) {
+        console.warn(
+          `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
+        );
+        prefetchWasmFromCdn(volume, wasmPath).catch(() => {});
+      }
+      throw err;
+    }
+  }
+
   const bridge: FsBridge = {
     __openFileHandleSync(target: PathArg): VolumeFileHandle {
       return volume.openFileHandleSync(abs(target));
@@ -1734,35 +1817,10 @@ export function buildFileSystemBridge(
       target: unknown,
       encOrOpts?: string | { encoding?: string | null },
     ): Buffer | string {
-      const p = abs(target);
       let enc: string | undefined;
       if (typeof encOrOpts === "string") enc = encOrOpts;
       else if (encOrOpts?.encoding) enc = encOrOpts.encoding ?? undefined;
-      const wasmPath =
-        p.endsWith(".wasm") && p.includes("/node_modules/")
-          ? resolveWasmAssetPath(volume, p)
-          : p;
-
-      try {
-        const raw = volume.readFileSync(wasmPath);
-        if (wasmPath.endsWith(".wasm")) precompileWasm(raw);
-        return decodeBytes(raw, enc);
-      } catch (err: any) {
-        // .wasm under node_modules missing from the VFS (e.g. >15MB binary
-        // that skipped extraction): kick an async CDN prefetch so a retry
-        // succeeds, but never block this thread with a sync download.
-        if (
-          err?.code === "ENOENT" &&
-          p.endsWith(".wasm") &&
-          p.includes("/node_modules/")
-        ) {
-          console.warn(
-            `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
-          );
-          prefetchWasmFromCdn(volume, wasmPath).catch(() => {});
-        }
-        throw err;
-      }
+      return decodeBytes(readStoredBytes(target), enc);
     },
 
     writeFileSync(
@@ -2038,12 +2096,16 @@ export function buildFileSystemBridge(
       }
 
       const fd = fdCounter++;
+      // a read-only open reads the stored bytes in place (writes to the file
+      // replace them, never change them); writing through it copies first
+      const borrow = isReadOnly && !isWrite && exists;
       openFiles.set(fd, {
         filePath: p,
         cursor: flagStr.includes("a") ? content.length : 0,
         mode: flagStr,
-        data: new Uint8Array(content),
+        data: borrow ? content : new Uint8Array(content),
         createMode: created ? createMode : undefined,
+        borrowed: borrow ? content : undefined,
       });
       if (exists && flagStr.includes("w") && !flagStr.includes("a")) {
         // truncate on open for 'w' — deferred until first persist so fsync
@@ -2082,9 +2144,7 @@ export function buildFileSystemBridge(
       const readAt = pos !== null ? pos : entry.cursor;
       const count = Math.min(len, entry.data.length - readAt);
       if (count <= 0) return 0;
-      for (let i = 0; i < count; i++) {
-        buf[off + i] = entry.data[readAt + i];
-      }
+      copyBytes(buf, off, entry.data, readAt, count);
       if (pos === null) entry.cursor += count;
       return count;
     },
@@ -2127,9 +2187,8 @@ export function buildFileSystemBridge(
         entry.data = expanded;
       }
 
-      for (let i = 0; i < len; i++) {
-        entry.data[writeAt + i] = bytes[off + i];
-      }
+      ownFdData(entry);
+      copyBytes(entry.data, writeAt, bytes, off, len);
 
       if (pos === null || pos === undefined) entry.cursor = endAt;
       return len;
@@ -3534,7 +3593,15 @@ export function buildFileSystemBridge(
     constants: fsConst,
   } as FsBridge;
 
+  // for the main thread's fs proxy (helpers/napi-wasm-worker handleFsProxy):
+  // answers it copies straight into the shared reply buffer
+  Object.defineProperty(bridge, FS_PROXY_INTERNALS, {
+    value: { readStoredBytes },
+    enumerable: false,
+  });
+
   return bridge;
 }
+
 
 export default buildFileSystemBridge;

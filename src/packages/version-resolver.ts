@@ -94,24 +94,43 @@ export function compareSemver(left: string, right: string): number {
   return 0;
 }
 
+// a prerelease's identifiers, numeric ones as numbers: sorting a package's
+// thousands of canary/rc versions compares the same prereleases many times
+const prereleaseIds = new Map<string, Array<string | number>>();
+const PRERELEASE_IDS_MAX = 50_000;
+
+function prereleaseIdsOf(prerelease: string): Array<string | number> {
+  let ids = prereleaseIds.get(prerelease);
+  if (ids === undefined) {
+    ids = prerelease.split(".").map((part) => (/^\d+$/.test(part) ? Number(part) : part));
+    if (prereleaseIds.size >= PRERELEASE_IDS_MAX) prereleaseIds.clear();
+    prereleaseIds.set(prerelease, ids);
+  }
+  return ids;
+}
+
 /** Semver prerelease identifier compare: numeric by number, else ASCII. */
 function comparePrereleaseIds(left: string, right: string): number {
-  const aParts = left.split(".");
-  const bParts = right.split(".");
+  if (left === right) return 0;
+  const aParts = prereleaseIdsOf(left);
+  const bParts = prereleaseIdsOf(right);
   const len = Math.max(aParts.length, bParts.length);
   for (let i = 0; i < len; i++) {
     if (i >= aParts.length) return -1;
     if (i >= bParts.length) return 1;
-    const aNum = /^\d+$/.test(aParts[i]);
-    const bNum = /^\d+$/.test(bParts[i]);
+    const a = aParts[i];
+    const b = bParts[i];
+    if (a === b) continue;
+    const aNum = typeof a === "number";
+    const bNum = typeof b === "number";
     if (aNum && bNum) {
-      const diff = Number(aParts[i]) - Number(bParts[i]);
+      const diff = (a as number) - (b as number);
       if (diff !== 0) return diff;
     } else if (aNum !== bNum) {
       // numeric identifiers have lower precedence than non-numeric
       return aNum ? -1 : 1;
     } else {
-      const cmp = aParts[i].localeCompare(bParts[i]);
+      const cmp = (a as string).localeCompare(b as string);
       if (cmp !== 0) return cmp;
     }
   }

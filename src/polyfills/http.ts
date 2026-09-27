@@ -402,6 +402,9 @@ ServerResponse.prototype.end = function end(
     // HEAD responses must not carry a body (RFC 9110)
     const isHead = this.req?.method === "HEAD";
     const finalBody = isHead ? Buffer.alloc(0) : Buffer.concat(this._chunks);
+    // a fresh buffer only the completed response holds: whoever ships the
+    // response on may hand its memory over instead of copying it
+    ownedResponseBodies.add(finalBody);
     this._completionCallback({
       statusCode: this.statusCode,
       statusMessage: this.statusMessage,
@@ -459,6 +462,14 @@ ServerResponse.prototype.redirect = function redirect(target: string | number, l
 ServerResponse.prototype.addTrailers = function addTrailers(_headers: Record<string, string>): void {
   // No-op
 };
+
+// response bodies built for a completed response and referenced nowhere else
+const ownedResponseBodies = new WeakSet<object>();
+
+/** Whether `body` is a completed response's own buffer (see end()). */
+export function isOwnedResponseBody(body: unknown): boolean {
+  return typeof body === "object" && body !== null && ownedResponseBodies.has(body);
+}
 
 ServerResponse.prototype._collectedBody = function _collectedBody(): Buffer {
   return Buffer.concat(this._chunks);

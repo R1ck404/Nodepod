@@ -3,21 +3,35 @@
 import { sha384 as nobleSha384, sha512 as nobleSha512 } from "@noble/hashes/sha512";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha256";
 import { sha1 as nobleSha1 } from "@noble/hashes/sha1";
+import { md5 as nobleMd5 } from "@noble/hashes/legacy";
+import { hmac as nobleHmac } from "@noble/hashes/hmac";
 
 export interface StreamingDigest {
   update(data: Uint8Array): unknown;
   digest(): Uint8Array;
 }
 
-/** Incremental hasher for the SHA family, or null for other algorithms. */
-export function createStreamingDigest(alg: string): StreamingDigest | null {
+function nobleHashFor(alg: string) {
   switch (alg) {
-    case "SHA-1": return nobleSha1.create();
-    case "SHA-256": return nobleSha256.create();
-    case "SHA-384": return nobleSha384.create();
-    case "SHA-512": return nobleSha512.create();
+    case "SHA-1": return nobleSha1;
+    case "SHA-256": return nobleSha256;
+    case "SHA-384": return nobleSha384;
+    case "SHA-512": return nobleSha512;
+    case "MD5": return nobleMd5;
     default: return null;
   }
+}
+
+/** Incremental hasher for the SHA family and MD5, or null for other algorithms. */
+export function createStreamingDigest(alg: string): StreamingDigest | null {
+  const hash = nobleHashFor(alg);
+  return hash ? hash.create() : null;
+}
+
+/** Incremental HMAC over the same hashes, or null for other algorithms. */
+export function createStreamingHmac(alg: string, key: Uint8Array): StreamingDigest | null {
+  const hash = nobleHashFor(alg);
+  return hash ? nobleHmac.create(hash, key) : null;
 }
 
 function md5(data: Uint8Array): Uint8Array {

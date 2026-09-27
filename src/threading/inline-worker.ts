@@ -117,14 +117,30 @@ function uint8ToBase64(data) {
   return btoa(segments.join(""));
 }
 
+const headerDecoder = new TextDecoder();
+
 function readNullTerminated(buf, start, len) {
-  // TextDecoder rejects SharedArrayBuffer-backed views, copy first
   const section = buf.subarray(start, start + len);
   const zeroPos = section.indexOf(0);
   const effLen = zeroPos >= 0 ? zeroPos : section.byteLength;
+  // header fields are nearly always ASCII: no decoder call for those
+  let ascii = "";
+  let i = 0;
+  for (; i < effLen; i++) {
+    const c = section[i];
+    if (c > 127) break;
+    ascii += String.fromCharCode(c);
+  }
+  if (i === effLen) return ascii;
+  // TextDecoder rejects SharedArrayBuffer-backed views, copy first
   const copy = new Uint8Array(effLen);
   copy.set(section.subarray(0, effLen));
-  return new TextDecoder().decode(copy);
+  return headerDecoder.decode(copy);
+}
+
+function isZeroBlock(header) {
+  for (let i = 0; i < header.length; i++) if (header[i] !== 0) return false;
+  return true;
 }
 
 function readOctalField(buf, start, len) {
@@ -147,7 +163,7 @@ function* parseTar(raw) {
   while (cursor + BLOCK <= raw.length) {
     const header = raw.slice(cursor, cursor + BLOCK);
     cursor += BLOCK;
-    if (header.every(function(b) { return b === 0; })) break;
+    if (isZeroBlock(header)) break;
     const nameField = readNullTerminated(header, 0, 100);
     if (!nameField) continue;
     const byteSize = readOctalField(header, 124, 12);
@@ -189,11 +205,26 @@ class ByteQueue {
     }
     return output;
   }
-  skip(length) { this.take(length); }
+  // padding: dropped without being copied anywhere
+  skip(length) {
+    if (length > this.available) throw new Error("tar stream underflow");
+    let left = length;
+    while (left > 0) {
+      const first = this.chunks[0];
+      const count = Math.min(left, first.byteLength - this.offset);
+      left -= count;
+      this.offset += count;
+      this.available -= count;
+      if (this.offset === first.byteLength) {
+        this.chunks.shift();
+        this.offset = 0;
+      }
+    }
+  }
 }
 
 function parseTarHeader(header) {
-  if (header.every(function(b) { return b === 0; })) return null;
+  if (isZeroBlock(header)) return null;
   const nameField = readNullTerminated(header, 0, 100);
   if (!nameField) return null;
   const byteSize = readOctalField(header, 124, 12);

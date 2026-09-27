@@ -47,6 +47,18 @@ export function format(template?: unknown, ...values: unknown[]): string {
   return result;
 }
 
+// format() with inspect options first (the `debug` package logs through it)
+export function formatWithOptions(inspectOptions: unknown, ...args: unknown[]): string {
+  if (inspectOptions === null || typeof inspectOptions !== "object") {
+    const err = new TypeError(
+      `The "inspectOptions" argument must be of type object. Received ${inspectOptions === null ? "null" : typeof inspectOptions}`,
+    ) as TypeError & { code?: string };
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  return (format as (...a: unknown[]) => string)(...args);
+}
+
 export function inspect(
   target: unknown,
   opts?: { depth?: number; colors?: boolean },
@@ -736,6 +748,7 @@ export const TextDecoder = globalThis.TextDecoder;
 
 export default {
   format,
+  formatWithOptions,
   inspect,
   inherits,
   _extend,

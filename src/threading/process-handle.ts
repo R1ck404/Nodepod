@@ -265,6 +265,14 @@ export class ProcessHandle extends EventEmitter {
           this.emit("vfs-delete", msg.path);
           break;
 
+        case "vfs-batch":
+          // the same events, in order, as separate messages would have made
+          for (const op of msg.ops) {
+            if ("deleted" in op) this.emit("vfs-delete", op.path);
+            else this.emit("vfs-write", op.path, op.content, op.isDirectory);
+          }
+          break;
+
         case "vfs-snapshot":
           this.emit("vfs-snapshot", msg.snapshot);
           break;

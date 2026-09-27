@@ -1406,6 +1406,14 @@ export class RequestProxy extends EventEmitter {
 
     this.heartbeat = setInterval(() => {
       this.channel?.port1.postMessage({ type: "keepalive" });
+      // port messages don't count as service worker activity: an idle SW
+      // was stopped (dropping its response cache and routing state) despite
+      // the heartbeat. A message event to the worker itself does count.
+      try {
+        navigator.serviceWorker?.controller?.postMessage({ type: "keepalive" });
+      } catch {
+        /* no controller right now */
+      }
     }, TIMEOUTS.SW_HEARTBEAT);
 
     this.swReady = true;

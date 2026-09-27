@@ -72,6 +72,13 @@ function viewOf(bytes: Uint8Array): BufferPolyfill {
   return new BufferPolyfill(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
 }
 
+const nativeIndexOf = Uint8Array.prototype.indexOf;
+
+const KNOWN_ENCODINGS = new Set([
+  'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'base64', 'base64url', 'hex',
+  'utf16le', 'utf-16le', 'ucs2', 'ucs-2',
+]);
+
 // ---- The main BufferPolyfill class ----
 
 class BufferPolyfill extends Uint8Array {
@@ -96,6 +103,10 @@ class BufferPolyfill extends Uint8Array {
     }
 
     if (typeof source === 'string') {
+      // the common case first, without normalizing the encoding name
+      if (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') {
+        return viewOf(textEnc.encode(source));
+      }
       const enc = (encoding || 'utf8').toLowerCase();
 
       if (enc === 'base64' || enc === 'base64url') {
@@ -228,11 +239,7 @@ class BufferPolyfill extends Uint8Array {
   }
 
   static isEncoding(enc: string): boolean {
-    const lower = enc.toLowerCase();
-    return [
-      'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'base64', 'base64url', 'hex',
-      'utf16le', 'utf-16le', 'ucs2', 'ucs-2',
-    ].includes(lower);
+    return KNOWN_ENCODINGS.has(enc.toLowerCase());
   }
 
   static byteLength(text: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer, enc?: string): number {
@@ -267,7 +274,7 @@ class BufferPolyfill extends Uint8Array {
   // ---- Instance methods ----
 
   toString(enc: BufferEncoding = 'utf8', start?: number, end?: number): string {
-    const lower = (enc || 'utf8').toLowerCase();
+    const lower = enc === 'utf8' ? 'utf8' : (enc || 'utf8').toLowerCase();
 
     // Node supports toString(encoding, start, end) — webpack's wasm-hash
     // relies on it to read a small hex digest out of a whole-memory Buffer view
@@ -311,8 +318,15 @@ class BufferPolyfill extends Uint8Array {
   }
 
   subarray(begin?: number, end?: number): BufferPolyfill {
-    const view = super.subarray(begin, end);
-    return Object.setPrototypeOf(view, BufferPolyfill.prototype) as BufferPolyfill;
+    // %TypedArray%.prototype.subarray's index rules, but constructing the
+    // view directly: the species lookup it does for a subclass is V8's slow
+    // path, and Rollup/Vite slice buffers constantly
+    const len = this.length;
+    let from = begin === undefined ? 0 : Math.trunc(Number(begin)) || 0;
+    from = from < 0 ? Math.max(len + from, 0) : Math.min(from, len);
+    let to = end === undefined ? len : Math.trunc(Number(end)) || 0;
+    to = to < 0 ? Math.max(len + to, 0) : Math.min(to, len);
+    return new BufferPolyfill(this.buffer as ArrayBuffer, this.byteOffset + from, Math.max(to - from, 0));
   }
 
   write(string: string, encoding?: BufferEncoding): number;
@@ -351,6 +365,7 @@ class BufferPolyfill extends Uint8Array {
   }
 
   equals(other: Uint8Array): boolean {
+    if (this.length !== other.length) return false;
     return this.compare(other) === 0;
   }
 
@@ -365,18 +380,30 @@ class BufferPolyfill extends Uint8Array {
   indexOf(needle: number | Uint8Array | string, fromIndex?: number): number {
     const start = fromIndex || 0;
     if (typeof needle === 'number') {
-      for (let i = start; i < this.length; i++) {
-        if (this[i] === needle) return i;
-      }
-      return -1;
+      // (a non-numeric or fractional start never lined up with an index)
+      if (typeof start !== 'number' || start !== Math.floor(start)) return -1;
+      // native scan (memchr) from the same start the loop used
+      return nativeIndexOf.call(this, needle, start < 0 ? 0 : start);
     }
     const search = typeof needle === 'string' ? BufferPolyfill.from(needle) : needle;
-    for (let i = start; i <= this.length - search.length; i++) {
-      let match = true;
-      for (let j = 0; j < search.length; j++) {
-        if (this[i + j] !== search[j]) { match = false; break; }
-      }
-      if (match) return i;
+    const n = search.length;
+    const last = this.length - n;
+    if (n === 0) return start <= last ? start : -1;
+    if (typeof start !== 'number') return -1;
+    // jump between occurrences of the first byte natively, then compare
+    const first = search[0];
+    let i = start < 0 ? 0 : start;
+    if (i !== Math.floor(i)) {
+      // (a fractional start never lined up with an index in the old loop)
+      return -1;
+    }
+    while (i <= last) {
+      i = nativeIndexOf.call(this, first, i);
+      if (i === -1 || i > last) return -1;
+      let j = 1;
+      while (j < n && this[i + j] === search[j]) j++;
+      if (j === n) return i;
+      i++;
     }
     return -1;
   }
@@ -771,6 +798,12 @@ const Buffer = new Proxy(BufferPolyfill, {
   apply(_target, _thisArg, args) {
     // Buffer(string, encoding) or Buffer(size) or Buffer(array) — deprecated but still works in Node
     return (BufferPolyfill as any).from(...args);
+  },
+  construct(target, args, newTarget) {
+    // new Buffer("abc"[, enc]) is node's (deprecated) string form; as a
+    // typed array constructor it made an empty buffer
+    if (typeof args[0] === 'string') return (BufferPolyfill as any).from(...args);
+    return Reflect.construct(target, args, newTarget);
   },
 }) as unknown as BufferConstructor & typeof BufferPolyfill;
 

@@ -635,8 +635,6 @@ export function buildProcessEnv(config?: {
     env: envVars,
 
     cwd() {
-      if (!proc._debugCwdCalls) proc._debugCwdCalls = 0;
-      proc._debugCwdCalls++;
       return workingDir;
     },
 
@@ -686,16 +684,22 @@ export function buildProcessEnv(config?: {
     // as uncaught (node dies there); anything left runs on a later pump in
     // case the process survives it. process.exit() ends the drain.
     nextTick: (() => {
-      const pending: Array<() => void> = [];
+      // callbacks and their arguments side by side (undefined: none), no
+      // closure per tick
+      const pending: Array<(...args: unknown[]) => void> = [];
+      const pendingArgs: Array<unknown[] | undefined> = [];
       let pumpScheduled = false;
       const drain = () => {
         pumpScheduled = false;
         let i = 0;
         try {
           while (i < pending.length) {
-            const cb = pending[i++];
+            const fn = pending[i];
+            const args = pendingArgs[i];
+            i++;
             try {
-              cb();
+              if (args === undefined) fn();
+              else fn(...args);
             } catch (e) {
               // process.exit() already ran; the sentinel only unwinds.
               // Drop the rest of the queue, as timers do.
@@ -712,6 +716,7 @@ export function buildProcessEnv(config?: {
           }
         } finally {
           pending.splice(0, i);
+          pendingArgs.splice(0, i);
           if (pending.length > 0 && !pumpScheduled) {
             pumpScheduled = true;
             queueMicrotask(drain);
@@ -719,7 +724,8 @@ export function buildProcessEnv(config?: {
         }
       };
       return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {
-        pending.push(() => fn(...args));
+        pending.push(fn);
+        pendingArgs.push(args.length === 0 ? undefined : args);
         if (!pumpScheduled) {
           pumpScheduled = true;
           queueMicrotask(drain);

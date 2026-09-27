@@ -26,6 +26,15 @@ export class VFSBridge {
     this._broadcaster = fn;
   }
 
+  // whether any process would receive a broadcast right now: with none (a
+  // process started later gets a snapshot), main-thread writes skip copying
+  // each changed file for nobody
+  private _hasBroadcastTargets: (() => boolean) | null = null;
+
+  setBroadcastTargets(fn: (() => boolean) | null): void {
+    this._hasBroadcastTargets = fn;
+  }
+
   onWorkerSnapshot(fn: ((snapshot: VFSBinarySnapshot) => void) | null): void {
     this._onWorkerSnapshot = fn;
   }
@@ -308,6 +317,7 @@ export class VFSBridge {
       // SharedVFS and broadcast keys are absolute, promote it here.
       const absPath = filename.startsWith("/") ? filename : "/" + filename;
       if (isInternalVfsPath(absPath)) return;
+      if (!this._sharedVFS && this._hasBroadcastTargets && !this._hasBroadcastTargets()) return;
 
       // paged-out package content (memory.evictPackageContent): bring it
       // back in, then broadcast it
@@ -326,9 +336,10 @@ export class VFSBridge {
 
   private _broadcastPath(absPath: string): void {
     try {
-      if (this._volume.existsSync(absPath)) {
-        const stat = this._volume.statSync(absPath);
-        if (stat.isDirectory()) {
+      // existence and kind in one lookup, no stat object
+      const kind = this._volume.kindSync(absPath);
+      if (kind !== null) {
+        if (kind === "directory") {
           this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
           if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
         } else {

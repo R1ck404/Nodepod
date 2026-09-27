@@ -1850,6 +1850,14 @@ export class ProcessManager extends EventEmitter {
   // path can become the norm for all sizes (pure pull model, no byte traffic).
   private static readonly VFS_BROADCAST_MAX_BYTES = 4 * 1024 * 1024;
 
+  /** Whether any process that hasn't exited would receive a broadcast. */
+  hasLiveProcesses(): boolean {
+    for (const handle of this._processes.values()) {
+      if (handle.state !== "exited") return true;
+    }
+    return false;
+  }
+
   broadcastVFSChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
     // build the outgoing payload once — postMessage without a transfer list
     // structured-clones per recipient, so no explicit per-recipient copy is

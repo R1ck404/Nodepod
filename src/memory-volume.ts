@@ -440,37 +440,42 @@ export interface SystemError extends Error {
   path?: string;
 }
 
+const SYSTEM_ERRNOS: Record<string, number> = {
+  ENOENT: -2,
+  ENOTDIR: -20,
+  EISDIR: -21,
+  EEXIST: -17,
+  ENOTEMPTY: -39,
+  ELOOP: -40,
+  EACCES: -13,
+};
+
+const SYSTEM_ERROR_DESCRIPTIONS: Record<string, string> = {
+  ENOENT: 'no such file or directory',
+  ENOTDIR: 'not a directory',
+  EISDIR: 'is a directory',
+  EEXIST: 'file already exists',
+  ENOTEMPTY: 'directory not empty',
+  ELOOP: 'too many symbolic links encountered',
+  EACCES: 'permission denied',
+};
+
+// stat predicates: one shared function per answer instead of a closure per
+// stat (node.kind never changes, so the answers are fixed at stat time)
+const STAT_TRUE = (): boolean => true;
+const STAT_FALSE = (): boolean => false;
+
 export function makeSystemError(
   code: 'ENOENT' | 'ENOTDIR' | 'EISDIR' | 'EEXIST' | 'ENOTEMPTY' | 'ELOOP' | 'EACCES',
   syscall: string,
   targetPath: string,
   detail?: string
 ): SystemError {
-  const errnoTable: Record<string, number> = {
-    ENOENT: -2,
-    ENOTDIR: -20,
-    EISDIR: -21,
-    EEXIST: -17,
-    ENOTEMPTY: -39,
-    ELOOP: -40,
-    EACCES: -13,
-  };
-
-  const descriptions: Record<string, string> = {
-    ENOENT: 'no such file or directory',
-    ENOTDIR: 'not a directory',
-    EISDIR: 'is a directory',
-    EEXIST: 'file already exists',
-    ENOTEMPTY: 'directory not empty',
-    ELOOP: 'too many symbolic links encountered',
-    EACCES: 'permission denied',
-  };
-
   const err = new Error(
-    detail || `${code}: ${descriptions[code]}, ${syscall} '${targetPath}'`
+    detail || `${code}: ${SYSTEM_ERROR_DESCRIPTIONS[code]}, ${syscall} '${targetPath}'`
   ) as SystemError;
   err.code = code;
-  err.errno = errnoTable[code];
+  err.errno = SYSTEM_ERRNOS[code];
   err.syscall = syscall;
   err.path = targetPath;
   return err;
@@ -500,7 +505,9 @@ export class MemoryVolume {
   // Reverse index for hardlink-aware lazy eviction and file-handle writes.
   // Keeping this alongside the tree avoids a full filesystem walk whenever
   // all aliases of an inode need to be updated.
-  private _inodePaths = new Map<VolumeFileInode, Set<string>>();
+  // an inode's paths: the path itself while it has one (nearly every file),
+  // a Set once hard links give it more
+  private _inodePaths = new Map<VolumeFileInode, string | Set<string>>();
   private _mutationListeners = new Set<(mutation: VolumeMutation) => void>();
   private _metaListeners = new Set<(path: string, change: MetaChange) => void>();
   private _silentMountListeners = new Set<(paths: string[]) => void>();
@@ -558,19 +565,31 @@ export class MemoryVolume {
   }
 
   private _linkInodePath(path: string, inode: VolumeFileInode): void {
-    let paths = this._inodePaths.get(inode);
-    if (!paths) {
-      paths = new Set<string>();
-      this._inodePaths.set(inode, paths);
+    const paths = this._inodePaths.get(inode);
+    if (paths === undefined) {
+      this._inodePaths.set(inode, path);
+    } else if (typeof paths === 'string') {
+      if (paths !== path) this._inodePaths.set(inode, new Set([paths, path]));
+    } else {
+      paths.add(path);
     }
-    paths.add(path);
   }
 
   private _unlinkInodePath(path: string, inode: VolumeFileInode): void {
     const paths = this._inodePaths.get(inode);
-    if (!paths) return;
+    if (paths === undefined) return;
+    if (typeof paths === 'string') {
+      if (paths === path) this._inodePaths.delete(inode);
+      return;
+    }
     paths.delete(path);
     if (paths.size === 0) this._inodePaths.delete(inode);
+  }
+
+  private _inodePathCount(inode: VolumeFileInode): number | undefined {
+    const paths = this._inodePaths.get(inode);
+    if (paths === undefined) return undefined;
+    return typeof paths === 'string' ? 1 : paths.size;
   }
 
   private _fileInodeAt(path: string, node: VolumeNode): VolumeFileInode {
@@ -584,7 +603,9 @@ export class MemoryVolume {
   }
 
   private _pathsForInode(inode: VolumeFileInode): string[] {
-    return [...(this._inodePaths.get(inode) ?? [])];
+    const paths = this._inodePaths.get(inode);
+    if (paths === undefined) return [];
+    return typeof paths === 'string' ? [paths] : [...paths];
   }
 
   // nodes currently linked to this inode (skips stale registrations)
@@ -1363,9 +1384,16 @@ export class MemoryVolume {
   private normalize(p: string): string {
     if (this._disposed) throw new Error('[Nodepod] Filesystem has been disposed');
     // nearly every path arrives normalized already
-    if (p.charCodeAt(0) === 47 && !NEEDS_NORMALIZING.test(p)) return p;
+    if (p.charCodeAt(0) === 47) {
+      if (!NEEDS_NORMALIZING.test(p)) return p;
+    } else {
+      // a clean relative path (watcher events carry them) is just rooted
+      const rooted = '/' + p;
+      if (!NEEDS_NORMALIZING.test(rooted)) return rooted;
+    }
+    const key = p;
     if (this._handler) {
-      const cached = this._handler.pathNormCache.get(p);
+      const cached = this._handler.pathNormCache.get(key);
       if (cached !== undefined) return cached;
     }
     if (!p.startsWith('/')) p = '/' + p;
@@ -1376,7 +1404,7 @@ export class MemoryVolume {
       else if (part !== '.') resolved.push(part);
     }
     const result = '/' + resolved.join('/');
-    if (this._handler) this._handler.pathNormCache.set(p, result);
+    if (this._handler) this._handler.pathNormCache.set(key, result);
     return result;
   }
 
@@ -1513,7 +1541,7 @@ export class MemoryVolume {
     norm: string,
     data: string | Uint8Array | unknown,
     notify: boolean,
-    seen: Set<string> = new Set(),
+    seen?: Set<string>,
   ): void {
     const lastSlash = norm.lastIndexOf('/');
     const parentPath = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
@@ -1548,6 +1576,7 @@ export class MemoryVolume {
       existing.lazy = false;
       existing.lazySize = undefined;
     } else if (existing?.kind === 'symlink') {
+      seen ??= new Set();
       if (seen.has(norm) || seen.size >= 40) throw makeSystemError('ELOOP', 'open', norm);
       seen.add(norm);
       const targetPath = existing.target!.startsWith('/')
@@ -2099,7 +2128,7 @@ export class MemoryVolume {
     try {
       const node = this._locateCanonical(this.normalize(p));
       if (node?.kind !== 'file' || !node.inode) return node ? 1 : 0;
-      return this._inodePaths.get(node.inode)?.size ?? 1;
+      return this._inodePathCount(node.inode) ?? 1;
     } catch {
       return 0;
     }
@@ -2408,6 +2437,7 @@ export class MemoryVolume {
   }
 
   private _untrackLazyTree(prefix: string): void {
+    if (this._lazyResident.size === 0) return;
     for (const path of Array.from(this._lazyResident.keys())) {
       if (path === prefix || path.startsWith(prefix + '/')) {
         this._untrackLazyResident(path);
@@ -2416,6 +2446,7 @@ export class MemoryVolume {
   }
 
   private _remapLazyTree(from: string, to: string): void {
+    if (this._lazyResident.size === 0) return;
     const moved: Array<[string, number]> = [];
     for (const [path, size] of this._lazyResident) {
       if (path === from || path.startsWith(from + '/')) {
@@ -2782,6 +2813,40 @@ export class MemoryVolume {
     return node !== undefined;
   }
 
+  /**
+   * For each name in a directory: what lstatSync(dir/name) would say it is,
+   * from one lookup of the directory (readdir withFileTypes asks this for
+   * every entry). null where the entry isn't a child of the directory
+   * right now; lstat decides those.
+   */
+  childKindsSync(dirPath: string, names: string[]): Array<'file' | 'directory' | 'symlink' | null> {
+    const norm = this.normalize(dirPath);
+    let dir = this.locate(norm);
+    if (!dir && this._missHandler && this._hydrateMiss(norm)) dir = this.locate(norm);
+    const children = dir?.kind === 'directory' ? dir.children : undefined;
+    const kinds: Array<'file' | 'directory' | 'symlink' | null> = new Array(names.length);
+    for (let i = 0; i < names.length; i++) {
+      const child = children?.get(names[i]);
+      kinds[i] = child ? child.kind : null;
+    }
+    return kinds;
+  }
+
+  /**
+   * Whether statSync(p).isFile() would be true ('file'), false ('directory'),
+   * or statSync would throw ENOENT (null): existsSync plus the kind, without
+   * building a stat.
+   */
+  kindSync(p: string): 'file' | 'directory' | null {
+    const norm = this.normalize(p);
+    let node = this.locate(norm);
+    if (!node && this._missHandler && this._hydrateMiss(norm)) {
+      node = this.locate(norm);
+    }
+    if (!node) return null;
+    return node.kind === 'file' ? 'file' : 'directory';
+  }
+
   statSync(p: string): FileStat {
     const norm = this.normalize(p);
 
@@ -2806,13 +2871,13 @@ export class MemoryVolume {
     const gid = inode?.gid ?? node.gid ?? MOCK_IDS.GID;
 
     const result: FileStat = {
-      isFile: () => node.kind === 'file',
-      isDirectory: () => node.kind === 'directory',
-      isSymbolicLink: () => false,
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
+      isFile: node.kind === 'file' ? STAT_TRUE : STAT_FALSE,
+      isDirectory: node.kind === 'directory' ? STAT_TRUE : STAT_FALSE,
+      isSymbolicLink: STAT_FALSE,
+      isBlockDevice: STAT_FALSE,
+      isCharacterDevice: STAT_FALSE,
+      isFIFO: STAT_FALSE,
+      isSocket: STAT_FALSE,
       size: fileSize,
       mode: node.kind === 'directory' ? (node.mode ?? 0o755) : (inode?.mode ?? 0o644),
       mtime: new Date(ts),
@@ -2854,13 +2919,13 @@ export class MemoryVolume {
       const atimeMs = node.atime ?? mtimeMs;
       const mode = 0o120000 | ((node.mode ?? 0o777) & 0o777);
       return {
-        isFile: () => false,
-        isDirectory: () => false,
-        isSymbolicLink: () => true,
-        isBlockDevice: () => false,
-        isCharacterDevice: () => false,
-        isFIFO: () => false,
-        isSocket: () => false,
+        isFile: STAT_FALSE,
+        isDirectory: STAT_FALSE,
+        isSymbolicLink: STAT_TRUE,
+        isBlockDevice: STAT_FALSE,
+        isCharacterDevice: STAT_FALSE,
+        isFIFO: STAT_FALSE,
+        isSocket: STAT_FALSE,
         size: (node.target || '').length,
         mode,
         mtime: new Date(mtimeMs),
@@ -3111,13 +3176,18 @@ export class MemoryVolume {
     this._untrackLazyTree(norm);
     this._invalidateLazyListedFor(norm);
     if (this._journaling) this._journal({ op: 'remove', path: this._canonicalPath(norm) });
-    for (const removedPath of removed) {
-      this._lazyListed.delete(removedPath);
-      this._lazyNegative.add(removedPath);
-      if (this._handler) this._handler.invalidateStat(removedPath);
-      this.triggerWatchers(removedPath, 'rename');
-      this.broadcast('delete', removedPath);
-      this.notifyGlobalListeners(removedPath, 'unlink');
+    this._beginBurst(removed.length > 1);
+    try {
+      for (const removedPath of removed) {
+        this._lazyListed.delete(removedPath);
+        if (this._missHandler) this._lazyNegative.add(removedPath);
+        if (this._handler) this._handler.invalidateStat(removedPath);
+        this.triggerWatchers(removedPath, 'rename');
+        this.broadcast('delete', removedPath);
+        this.notifyGlobalListeners(removedPath, 'unlink');
+      }
+    } finally {
+      this._endBurst(removed.length > 1);
     }
   }
 
@@ -3214,21 +3284,55 @@ export class MemoryVolume {
       this._journal({ op: 'rename', from: canonicalFrom ?? normFrom, to: this._canonicalPath(normTo) });
     }
 
-    // fire watcher + global-listener events for the top-level move
-    this.triggerWatchers(normFrom, 'rename');
-    this.triggerWatchers(normTo, 'rename');
-    this.notifyGlobalListeners(normFrom, 'unlink');
-    this.notifyGlobalListeners(normTo, node.kind === 'directory' ? 'addDir' : 'add');
+    this._beginBurst(descendantPairs.length > 0);
+    try {
+      // fire watcher + global-listener events for the top-level move
+      this.triggerWatchers(normFrom, 'rename');
+      this.triggerWatchers(normTo, 'rename');
+      this.notifyGlobalListeners(normFrom, 'unlink');
+      this.notifyGlobalListeners(normTo, node.kind === 'directory' ? 'addDir' : 'add');
 
-    // fire events for every descendant so recursive watchers (the worker→main
-    // vfs-sync handler, HMR watchers, etc.) see every moved path. without this,
-    // Vite's atomic commit `deps_temp_XXX` → `deps` is invisible to the main
-    // thread's VFS and all bundled dep files stay at the old path
-    for (const pair of descendantPairs) {
-      this.triggerWatchers(pair.oldPath, 'rename');
-      this.triggerWatchers(pair.newPath, 'rename');
-      this.notifyGlobalListeners(pair.oldPath, 'unlink');
-      this.notifyGlobalListeners(pair.newPath, pair.isDir ? 'addDir' : 'add');
+      // fire events for every descendant so recursive watchers (the worker→main
+      // vfs-sync handler, HMR watchers, etc.) see every moved path. without this,
+      // Vite's atomic commit `deps_temp_XXX` → `deps` is invisible to the main
+      // thread's VFS and all bundled dep files stay at the old path
+      for (const pair of descendantPairs) {
+        this.triggerWatchers(pair.oldPath, 'rename');
+        this.triggerWatchers(pair.newPath, 'rename');
+        this.notifyGlobalListeners(pair.oldPath, 'unlink');
+        this.notifyGlobalListeners(pair.newPath, pair.isDir ? 'addDir' : 'add');
+      }
+    } finally {
+      this._endBurst(descendantPairs.length > 0);
+    }
+  }
+
+  // ---- Notification bursts ----
+  // One operation that notifies for many paths (a directory moved or removed)
+  // tells burst listeners where it starts and ends, so a listener forwarding
+  // every event elsewhere can send them together. The end is announced
+  // before the operation returns.
+  private _burstListeners: Array<(start: boolean) => void> = [];
+
+  onNotificationBurst(cb: (start: boolean) => void): () => void {
+    this._burstListeners.push(cb);
+    return () => {
+      const i = this._burstListeners.indexOf(cb);
+      if (i >= 0) this._burstListeners.splice(i, 1);
+    };
+  }
+
+  private _beginBurst(many: boolean): void {
+    if (!many) return;
+    for (const cb of this._burstListeners) {
+      try { cb(true); } catch (e) { console.error('VFS burst listener error:', e); }
+    }
+  }
+
+  private _endBurst(many: boolean): void {
+    if (!many) return;
+    for (const cb of this._burstListeners) {
+      try { cb(false); } catch (e) { console.error('VFS burst listener error:', e); }
     }
   }
 
@@ -3688,11 +3792,13 @@ export class MemoryVolume {
   private triggerWatchers(changedPath: string, event: WatchEventKind): void {
     // changedPath is already normalized by the caller — no need to re-normalize
     const norm = changedPath;
+    const watchers = this.activeWatchers;
+    if (watchers.size === 0) return;
     const lastSlash = norm.lastIndexOf('/');
     const fileName = norm.slice(lastSlash + 1);
     const directParent = lastSlash <= 0 ? '/' : norm.slice(0, lastSlash);
 
-    const direct = this.activeWatchers.get(norm);
+    const direct = watchers.get(norm);
     if (direct) {
       for (const w of direct) {
         if (w.active) {
@@ -3701,26 +3807,43 @@ export class MemoryVolume {
       }
     }
 
-    // walk up the tree to notify parent/recursive watchers
-    let current = directParent;
-    let relative = fileName;
-
-    while (current) {
-      const parentWatchers = this.activeWatchers.get(current);
-      if (parentWatchers) {
-        for (const w of parentWatchers) {
-          if (w.active) {
-            if (w.recursive || current === directParent) {
-              try { w.callback(event, relative); } catch (e) { console.error('Watcher error:', e); }
-            }
+    // notify parent/recursive watchers, nearest ancestor first. Few paths
+    // are watched (usually just '/'): find the watched ancestors among them
+    // instead of slicing out and looking up every ancestor of the path
+    const fire = (current: string, list: Set<ActiveWatcher>) => {
+      const relative = current === '/' ? norm.slice(1) : norm.slice(current.length + 1);
+      for (const w of list) {
+        if (w.active) {
+          if (w.recursive || current === directParent) {
+            try { w.callback(event, relative); } catch (e) { console.error('Watcher error:', e); }
           }
         }
       }
+    };
+    if (watchers.size <= 8) {
+      let ancestors: string[] | null = null;
+      for (const key of watchers.keys()) {
+        // ('/' is its own parent: a change at '/' reaches its watchers twice)
+        if (key === '/' || (norm.startsWith(key) && norm.charCodeAt(key.length) === 47)) {
+          (ancestors ??= []).push(key);
+        }
+      }
+      if (ancestors) {
+        if (ancestors.length > 1) ancestors.sort((a, b) => b.length - a.length);
+        for (const key of ancestors) {
+          const list = watchers.get(key);
+          if (list) fire(key, list);
+        }
+      }
+      return;
+    }
 
+    let current = directParent;
+    while (current) {
+      const parentWatchers = watchers.get(current);
+      if (parentWatchers) fire(current, parentWatchers);
       if (current === '/') break;
       const idx = current.lastIndexOf('/');
-      const currentName = current.slice(idx + 1);
-      relative = currentName + '/' + relative;
       current = idx <= 0 ? '/' : current.slice(0, idx);
     }
 

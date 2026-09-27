@@ -25,25 +25,29 @@ export class LRUCache<K, V> {
   }
 
   get(key: K): V | undefined {
-    if (!this._map.has(key)) return undefined;
-    const value = this._map.get(key)!;
+    const map = this._map;
+    const value = map.get(key);
+    // a stored undefined reads the same either way
+    if (value === undefined) return undefined;
     // Move to most-recently-used position
-    this._map.delete(key);
-    this._map.set(key, value);
+    map.delete(key);
+    map.set(key, value);
     return value;
   }
 
   set(key: K, value: V): void {
+    const map = this._map;
     const valueBytes = Math.max(0, this._sizeOf(value));
-    if (this._map.has(key)) {
-      this._bytes -= this._sizeOf(this._map.get(key)!);
-      this._map.delete(key);
+    const previous = map.get(key);
+    if (previous !== undefined || map.has(key)) {
+      this._bytes -= this._sizeOf(previous as V);
+      map.delete(key);
     }
-    this._map.set(key, value);
+    map.set(key, value);
     this._bytes += valueBytes;
     while (
-      (this._map.size > this._capacity || this._bytes > this._maxBytes) &&
-      this._map.size > 1
+      (map.size > this._capacity || this._bytes > this._maxBytes) &&
+      map.size > 1
     ) {
       this._evictOldest();
     }

@@ -7,6 +7,8 @@ export interface StringDecoder {
   end(buf?: Uint8Array | Buffer): string;
 }
 
+const STREAM = { stream: true } as const;
+
 export const StringDecoder = function StringDecoder(this: any, encoding?: string) {
   if (!this) return;
   this.encoding = encoding || "utf8";
@@ -18,7 +20,7 @@ StringDecoder.prototype.write = function write(buf: Uint8Array | Buffer): string
     this._decoder = new TextDecoder(this.encoding, { fatal: false });
   }
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  return this._decoder.decode(bytes, { stream: true });
+  return this._decoder.decode(bytes, STREAM);
 };
 
 StringDecoder.prototype.end = function end(buf?: Uint8Array | Buffer): string {
@@ -28,7 +30,7 @@ StringDecoder.prototype.end = function end(buf?: Uint8Array | Buffer): string {
   let out = "";
   if (buf && buf.length) {
     const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    out = this._decoder.decode(bytes, { stream: true });
+    out = this._decoder.decode(bytes, STREAM);
   }
   out += this._decoder.decode();
   return out;
