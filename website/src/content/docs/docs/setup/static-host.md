@@ -8,9 +8,9 @@ sidebar:
 Copy the three runtime assets into your host's public directory during the build:
 
 ```bash
-cp node_modules/@scelar/nodepod/dist/__sw__.js public/__sw__.js
-cp node_modules/@scelar/nodepod/dist/__nodepod_bridge__.html public/__nodepod_bridge__.html
-cp node_modules/@scelar/nodepod/dist/__nodepod_bridge__.js public/__nodepod_bridge__.js
+cp node_modules/nodepod/dist/__sw__.js public/__sw__.js
+cp node_modules/nodepod/dist/__nodepod_bridge__.html public/__nodepod_bridge__.html
+cp node_modules/nodepod/dist/__nodepod_bridge__.js public/__nodepod_bridge__.js
 ```
 
 Your deployment must serve the files at the root paths shown above with the content types and service-worker scope headers described in [Preview deployment](/Nodepod/docs/setup/preview-deployment/).

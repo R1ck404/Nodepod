@@ -9,11 +9,11 @@ Nodepod publishes five supported entry points.
 
 | Import | Purpose |
 | --- | --- |
-| `@scelar/nodepod` | Browser runtime, types, filesystem, terminal, packages, process, HTTP, profiling, and inspection APIs |
-| `@scelar/nodepod/headless` | Node.js, Bun, and explicitly headless runtime defaults |
-| `@scelar/nodepod/server` | Fetch-style and Node-style runtime asset response helpers |
-| `@scelar/nodepod/vite` | Vite plugin for development and production assets |
-| `@scelar/nodepod/next` | Next.js route, middleware, proxy, matcher, and asset helpers |
+| `nodepod` | Browser runtime, types, filesystem, terminal, packages, process, HTTP, profiling, and inspection APIs |
+| `nodepod/headless` | Node.js, Bun, and explicitly headless runtime defaults |
+| `nodepod/server` | Fetch-style and Node-style runtime asset response helpers |
+| `nodepod/vite` | Vite plugin for development and production assets |
+| `nodepod/next` | Next.js route, middleware, proxy, matcher, and asset helpers |
 
 ## Main browser lifecycle
 

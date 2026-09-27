@@ -12,7 +12,7 @@ Nodepod recreates useful Node.js development primitives with browser-native buil
 The browser entry exports `Nodepod` from [`src/index.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/index.ts). A host application creates an instance and owns its lifecycle:
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from 'nodepod';
 
 const pod = await Nodepod.boot({
   files: {
@@ -112,11 +112,11 @@ Headless mode is the same core runtime with UI-oriented defaults turned off:
 
 ```ts
 // Browser: Web Workers, service worker off by default.
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from 'nodepod';
 const browserPod = await Nodepod.boot({ headless: true });
 
 // Node.js or Bun: worker threads and loopback HTTP ingress.
-import { Nodepod as HeadlessNodepod } from '@scelar/nodepod/headless';
+import { Nodepod as HeadlessNodepod } from 'nodepod/headless';
 const hostPod = await HeadlessNodepod.boot();
 ```
 

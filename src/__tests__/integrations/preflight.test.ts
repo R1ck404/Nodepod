@@ -67,7 +67,7 @@ describe("preflight: NodepodSWSetupError", () => {
     expect(err.details.swUrl).toBe("/__sw__.js");
     expect(err.details.framework).toBe("generic");
     // toString() should include the actionable hint.
-    expect(err.toString()).toMatch(/@scelar\/nodepod\/server|public\//);
+    expect(err.toString()).toMatch(/nodepod\/server|public\//);
   });
 
   it("throws when Content-Type is HTML (SPA fallback)", async () => {
@@ -131,6 +131,6 @@ describe("preflight: NodepodSWSetupError", () => {
     const s = err.toString();
     expect(s).toMatch(/NodepodSWSetupError/);
     expect(s).toMatch(/404/);
-    expect(s).toMatch(/@scelar\/nodepod\/vite/);
+    expect(s).toMatch(/nodepod\/vite/);
   });
 });

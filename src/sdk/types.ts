@@ -44,7 +44,7 @@ export interface NodepodOptions {
   /**
    * Headless mode: no terminal/preview UI required. Defaults `serviceWorker`
    * and `watermark` to false (can still be overridden). Implied when importing
-   * from `@scelar/nodepod/headless`.
+   * from `nodepod/headless`.
    */
   headless?: boolean;
   /** URL of the nodepod service worker. Defaults to `/__sw__.js`. */

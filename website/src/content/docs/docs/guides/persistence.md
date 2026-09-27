@@ -113,7 +113,7 @@ then restores it.
 ## Clearing and listing workspaces
 
 ```ts
-import { listIndexedDBWorkspaces, deleteIndexedDBWorkspace } from '@scelar/nodepod';
+import { listIndexedDBWorkspaces, deleteIndexedDBWorkspace } from 'nodepod';
 
 const saved = await listIndexedDBWorkspaces(); // [{ id, updatedAt }]
 await deleteIndexedDBWorkspace('old-project');
@@ -129,7 +129,7 @@ native bridge. Nodepod keeps the running filesystem in memory and only calls
 the store asynchronously, so a store can be as slow as a network request.
 
 ```ts
-import type { WorkspaceStore } from '@scelar/nodepod';
+import type { WorkspaceStore } from 'nodepod';
 
 const store: WorkspaceStore = {
   // the saved entries, or null if the workspace was never saved
@@ -151,7 +151,7 @@ blob. Hardlinks share one blob. A rename only rewrites entries and never
 re-sends file content. `createMemoryWorkspaceStore()` is a complete reference
 implementation. Nodepod calls the store's optional `close()` when the pod is torn down; a
 store you pass to another boot afterwards must be usable again. On Node.js, `createFsWorkspaceStore(dir)` is also exported
-from `@scelar/nodepod/headless`.
+from `nodepod/headless`.
 
 Treat saved workspaces as untrusted local state, not as your application's
 source of truth. Anything with access to the origin's storage can read or

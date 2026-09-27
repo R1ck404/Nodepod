@@ -46,7 +46,7 @@ export default defineConfig({
   ],
   vite: {
     optimizeDeps: {
-      exclude: ["@scelar/nodepod"],
+      exclude: ["nodepod"],
     },
   },
 });
