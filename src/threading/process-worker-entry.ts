@@ -8,6 +8,7 @@ import {
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
 } from "../polyfills/fetch-response";
+import { installWasmWorkLifetime } from "../helpers/event-loop";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
 import {
   setSqliteHostBridge,
@@ -21,6 +22,8 @@ import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
 installBodyReadLifetime();
+// before the memory clamp (handleInit) wraps these, so its paths are held too
+installWasmWorkLifetime();
 import { SyncChannelWorker } from "./sync-channel";
 import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client";
 import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp";

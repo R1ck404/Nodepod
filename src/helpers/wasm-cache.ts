@@ -9,6 +9,7 @@
 //   L2 — IndexedDB keyed by SHA-256, storing the compiled WebAssembly.Module
 //        via structured clone (Chromium/Firefox). Warm reloads skip compile.
 
+import { untrackedWasm } from "./event-loop";
 import {
   getWasmModuleCache,
   quickWasmHash,
@@ -111,7 +112,8 @@ export function precompileWasm(bytes: Uint8Array | ArrayBuffer): void {
     promise: (async () => {
       const persisted = await loadPersistedModule(stable);
       if (persisted) return persisted;
-      const mod = await WebAssembly.compile(stable as BufferSource);
+      // a warm-up nobody awaits: it mustn't keep the process alive
+      const mod = await untrackedWasm(() => WebAssembly.compile(stable as BufferSource));
       persistModule(stable, mod);
       return mod;
     })(),
