@@ -54,12 +54,14 @@ test("documentation search opens in the production build", async ({ page }) => {
   await expect(page.locator("dialog, [role=dialog]").first()).toBeVisible();
 });
 
-test("sponsor page remains transparent about pending approval", async ({ page }) => {
+test("sponsor page links to GitHub Sponsors and lists the tiers", async ({ page }) => {
   await page.goto("./sponsors/");
-  await expect(page.getByText(/the GitHub Sponsors profile is under review/i)).toBeVisible();
-  await expect(page.getByRole("heading", { name: /Proposed monthly tiers/i })).toHaveCount(0);
+  await expect(page.getByText(/profile is under review/i)).toHaveCount(0);
   await expect(page.getByText("$5", { exact: true })).toBeVisible();
   await expect(page.getByText("$25", { exact: true })).toBeVisible();
   await expect(page.getByText("$100", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: /sponsor on github/i })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: /sponsor on github/i })).toHaveAttribute(
+    "href",
+    "https://github.com/sponsors/R1ck404",
+  );
 });

@@ -131,9 +131,10 @@ expectations.
 
 ## Sponsorship
 
-Sponsorship will be offered through GitHub Sponsors after the profile and public
-tiers are approved. Proposed details are documented on the
-[sponsor page](https://r1ck404.github.io/Nodepod/sponsors/). Sponsorship will not
+Nodepod is maintained independently. You can support it through
+[GitHub Sponsors](https://github.com/sponsors/R1ck404); tiers and listing details
+are documented on the
+[sponsor page](https://r1ck404.github.io/Nodepod/sponsors/). Sponsorship does not
 include an SLA, priority issue handling, private support, or early repository
 access.
 
@@ -144,6 +145,7 @@ No private email address is published for sponsor listings.
 - [npm package](https://www.npmjs.com/package/@r1ck404/nodepod)
 - [GitHub repository](https://github.com/R1ck404/Nodepod)
 - [Contributing](./CONTRIBUTING.md)
+- [Sponsor on GitHub](https://github.com/sponsors/R1ck404)
 - [Sponsor policy](https://r1ck404.github.io/Nodepod/sponsors/)
 - [License](./LICENSE)
 
