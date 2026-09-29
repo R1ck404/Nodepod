@@ -13,11 +13,11 @@ const tiers = [
     <div class="section-kicker">Sponsorship</div>
     <h1>Fund the runtime,<br />not a support queue.</h1>
     <p>Nodepod is maintained independently. Sponsorship helps pay for sustained engineering, browser compatibility work, documentation, and infrastructure.</p>
-    <div class="notice" role="status"><strong>Pending approval:</strong> the GitHub Sponsors profile is under review. Sponsor checkout and funding links will appear after GitHub approves it.</div>
+    <a class="button button--coral" href="https://github.com/sponsors/R1ck404">Sponsor on GitHub</a>
   </section>
 
   <section class="tier-list ruled" aria-labelledby="tiers-title">
-    <div class="section-kicker">Proposed monthly tiers</div>
+    <div class="section-kicker">Monthly tiers</div>
     <h2 id="tiers-title">Simple, public acknowledgement.</h2>
     {tiers.map(([amount, name, detail]) => (
       <article>
@@ -26,7 +26,7 @@ const tiers = [
         <p>{detail}</p>
       </article>
     ))}
-    <p class="tier-note">GitHub’s custom one-time amount will also be available after profile approval.</p>
+    <p class="tier-note">GitHub’s custom one-time amount is also available.</p>
   </section>
 
   <section class="sponsor-policy ruled" aria-labelledby="policy-title">
@@ -35,7 +35,7 @@ const tiers = [
       <h2 id="policy-title">What sponsorship does and does not buy.</h2>
       <div>
         <p>Sponsorship does not include an SLA, priority issue handling, private support, or early access to a private repository.</p>
-        <p>Backer and company listings are optional. Once Sponsors is active, listing details will be collected through a public issue or pull request and active status will be verified before publication.</p>
+        <p>Backer and company listings are optional. Listing details are collected through a <a href="https://github.com/R1ck404/Nodepod/issues/new?template=sponsor-listing.yml">public issue</a> or pull request, and active status is verified before publication.</p>
         <p>No sponsor wall appears until there is a verified active sponsor.</p>
       </div>
     </div>

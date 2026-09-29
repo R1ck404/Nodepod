@@ -13,6 +13,10 @@
     "url": "https://github.com/R1ck404/Nodepod/issues"
   },
   "homepage": "https://r1ck404.github.io/Nodepod/",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/R1ck404"
+  },
   "keywords": [
     "node",
     "browser",

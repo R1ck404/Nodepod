@@ -9,15 +9,13 @@ review.
 
 - Landing page, Starlight docs, generated API reference, and reduced terminal demo are public.
 - Generated API source links are recreated during every docs build and pinned to the build revision.
-- The Sponsors profile is still pending GitHub approval. Do not publish funding metadata until it is active.
+- The GitHub Sponsors profile (`https://github.com/sponsors/R1ck404`) is approved and public. `.github/FUNDING.yml` and the root package `funding` field point at it.
 
-## Sponsors launch gate
+## Sponsors checklist
 
-- Confirm `https://github.com/sponsors/R1ck404` is an approved, active GitHub Sponsors profile.
-- Confirm the monthly tiers are active: $5 Supporter, $25 Backer, and $100 Company sponsor.
+- Confirm the monthly tiers are published on the Sponsors dashboard: $5 Supporter, $25 Backer, and $100 Company sponsor. The site and issue template describe them.
 - Confirm GitHub's custom one-time amount is enabled.
 - Confirm no tier promises an SLA, priority issues, private support, or early repository access.
-- Only then add `.github/FUNDING.yml` and the root package `funding` field.
 - Do not add an empty sponsor logo wall.
 
 ## Release checklist
