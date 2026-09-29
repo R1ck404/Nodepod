@@ -23,18 +23,44 @@ export interface WasmModuleCache {
   close(): void;
 }
 
-// Fast synchronous content hash: dual-lane FNV-1a over the full buffer plus
-// the byte length. Used as the in-memory (L1) cache key where we cannot
-// await crypto.subtle. One pass over 16MB costs single-digit milliseconds.
+// Fast synchronous content hash: dual-lane FNV-1a plus the byte length. Used
+// as the in-memory (L1) cache key where we cannot await crypto.subtle. A
+// module is looked up by it several times per load, so a large binary is
+// sampled (both ends in full, plus ~64k bytes spread over the rest: about a
+// millisecond for 16MB instead of a byte-by-byte pass); the persistent key is
+// still a SHA-256 of every byte (wasmContentHash).
+const FULL_HASH_LIMIT = 256 * 1024;
+const HASH_END_BYTES = 64 * 1024;
+const HASH_SAMPLES = 65536;
 export function quickWasmHash(bytes: Uint8Array): string {
   let h1 = 0x811c9dc5;
   let h2 = 0xcbf29ce4;
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
+  const n = bytes.length;
+  if (n <= FULL_HASH_LIMIT) {
+    for (let i = 0; i < n; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
+    }
+  } else {
+    const step = Math.max(1, Math.floor((n - 2 * HASH_END_BYTES) / HASH_SAMPLES));
+    for (let i = 0; i < HASH_END_BYTES; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
+    }
+    for (let i = HASH_END_BYTES; i < n - HASH_END_BYTES; i += step) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
+    }
+    for (let i = n - HASH_END_BYTES; i < n; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
+    }
   }
-  return `${h1.toString(16)}-${h2.toString(16)}-${bytes.length.toString(16)}`;
+  return `${h1.toString(16)}-${h2.toString(16)}-${n.toString(16)}`;
 }
 
 // Strong content hash for the persistent (IDB) key. Falls back to the quick
@@ -43,10 +69,12 @@ export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
   try {
     const subtle = globalThis.crypto?.subtle;
     if (subtle) {
-      const buf = bytes.buffer.slice(
-        bytes.byteOffset,
-        bytes.byteOffset + bytes.byteLength,
-      ) as ArrayBuffer;
+      // (a view is hashed as it is, unless it is over shared memory, which
+      // subtle rejects: then a copy)
+      const buf =
+        typeof SharedArrayBuffer !== "undefined" && bytes.buffer instanceof SharedArrayBuffer
+          ? ((bytes.buffer as SharedArrayBuffer).slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as unknown as ArrayBuffer)
+          : (bytes as Uint8Array<ArrayBuffer>);
       const digest = await subtle.digest("SHA-256", buf);
       return Array.from(new Uint8Array(digest))
         .map((b) => b.toString(16).padStart(2, "0"))

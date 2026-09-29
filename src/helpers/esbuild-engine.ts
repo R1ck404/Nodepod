@@ -7,6 +7,7 @@ import {
   CDN_ESBUILD_BROWSER_SCRIPT,
   CDN_ESBUILD_BINARY,
   CDN_ESBUILD_BUNDLE,
+  ESBUILD_HAS_BINARY,
   cdnImport,
 } from "../constants/cdn-urls";
 
@@ -28,6 +29,10 @@ interface Instance {
   engine: EsbuildEngine;
   // null if esbuild's worker couldn't be captured: never terminated
   worker: Worker | null;
+  // a JavaScript engine (no Go binary): its worker is the engine's own and
+  // is stopped with stop(); its memory is garbage collected, so it is never
+  // retired for size
+  js?: boolean;
   // calls running on it
   pending: number;
   // of which build()s: a bundle keeps the instance's one thread busy for
@@ -76,7 +81,14 @@ function initializeCapturingWorker(
   }
   let ready: Promise<void>;
   try {
-    ready = engine.initialize(options);
+    // fast-esbuild-wasm: the engine's service (build(), context(), the plugin
+    // protocol) runs in the engine's worker as well as its transforms, so
+    // nothing of esbuild's work occupies this thread (the tool's: a dev
+    // server's or bundler's) but forwarding packets and running plugin
+    // callbacks
+    ready = engine.initialize(
+      ESBUILD_HAS_BINARY ? options : ({ ...options, serviceInWorker: true, smallInput: -1 } as typeof options),
+    );
   } finally {
     if (NativeWorker) g.Worker = NativeWorker;
   }
@@ -152,7 +164,7 @@ export function getEsbuild(opts?: { wasmURL?: string }): Promise<EsbuildEngine> 
         loadEngineCopy(`nodepod-instance=${state.generation}`),
         customWasmURL ? null : requestSharedModule(),
       ]);
-      const instance: Instance = { engine, worker: null, pending: 0, detached: false };
+      const instance: Instance = { engine, worker: null, pending: 0, detached: false, js: !ESBUILD_HAS_BINARY };
       let init: ReturnType<typeof initializeCapturingWorker> | null = null;
       try {
         init = initializeCapturingWorker(
@@ -248,7 +260,7 @@ function lease(instance: Instance | null, engine: EsbuildEngine, isBuild = false
       released = true;
       instance.pending--;
       if (isBuild) instance.builds!--;
-      if (inputBytes >= RETIRE_CALL_BYTES) detach(instance);
+      if (inputBytes >= RETIRE_CALL_BYTES && !instance.js) detach(instance);
       if (instance.detached && instance.pending === 0) terminate(instance);
     },
   };
@@ -274,7 +286,7 @@ export async function acquireEsbuild(opts?: { wasmURL?: string; build?: boolean 
 }
 
 function detach(instance: Instance): void {
-  if (instance.detached || !instance.worker) return;
+  if (instance.detached || (!instance.worker && !instance.js)) return;
   const state = engineState();
   // the primary is replaced by a new instance: keep it past the limit
   if (state.primary === instance && _moduleCopies >= MAX_MODULE_COPIES) return;
@@ -300,6 +312,7 @@ function detach(instance: Instance): void {
 function terminate(instance: Instance): void {
   try {
     instance.worker?.terminate();
+    if (instance.js) void (instance.engine as unknown as { stop?: () => Promise<void> }).stop?.();
   } catch {
     /* already gone */
   }
@@ -313,10 +326,14 @@ function terminate(instance: Instance): void {
 // forms on the one instance. When it does, extra instances (instantiated from
 // the same compiled module) take transforms too, and are retired once idle.
 // build()/context() stay on the primary instance.
-const MAX_EXTRA_LANES = Math.max(
-  0,
-  Math.min(2, ((globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 2) - 2),
-);
+// (a JavaScript engine transforms in well under a millisecond: extra
+// instances would cost more to start than they save)
+const MAX_EXTRA_LANES = !ESBUILD_HAS_BINARY
+  ? 0
+  : Math.max(
+      0,
+      Math.min(2, ((globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 2) - 2),
+    );
 // calls on every instance before another lane is started
 const LANE_SPAWN_BACKLOG = 3;
 const LANE_IDLE_MS = 3000;
@@ -339,11 +356,11 @@ function spawnLane(): void {
         loadEngineCopy(`nodepod-lane=${++_laneCounter}`),
         requestSharedModule(),
       ]);
-      if (!sharedModule) throw new Error("no shared module");
-      init = initializeCapturingWorker(engine, { wasmModule: sharedModule });
+      if (!sharedModule && ESBUILD_HAS_BINARY) throw new Error("no shared module");
+      init = initializeCapturingWorker(engine, sharedModule ? { wasmModule: sharedModule } : { wasmURL: CDN_ESBUILD_BINARY });
       await init.ready;
-      const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: false };
-      if (!_lanes.includes(lane) || !instance.worker) {
+      const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: false, js: !ESBUILD_HAS_BINARY };
+      if (!_lanes.includes(lane) || (!instance.worker && !instance.js)) {
         // disposed while starting, or not stoppable: don't keep it
         terminate(instance);
         throw new Error("lane dropped");
@@ -385,11 +402,11 @@ export async function acquireDedicatedEsbuild(): Promise<EsbuildLease | null> {
       loadEngineCopy(`nodepod-dedicated=${++_laneCounter}`),
       requestSharedModule(),
     ]);
-    if (!sharedModule) throw new Error("no shared module");
-    init = initializeCapturingWorker(engine, { wasmModule: sharedModule });
+    if (!sharedModule && ESBUILD_HAS_BINARY) throw new Error("no shared module");
+    init = initializeCapturingWorker(engine, sharedModule ? { wasmModule: sharedModule } : { wasmURL: CDN_ESBUILD_BINARY });
     await init.ready;
-    const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: true };
-    if (!instance.worker) {
+    const instance: Instance = { engine, worker: init.worker(), pending: 0, detached: true, js: !ESBUILD_HAS_BINARY };
+    if (!instance.worker && !instance.js) {
       terminate(instance);
       return null;
     }

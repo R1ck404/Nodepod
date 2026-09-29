@@ -379,6 +379,9 @@ function createRealWebWorker(
 
   if (brokerWorkerFn) {
     let unrefTimer: ReturnType<typeof setTimeout> | null = null;
+    // When the worker last sent or received a message: unref() is honored
+    // once it has been quiet for a while (see unref below)
+    let lastActivity = Date.now();
     const close = (code: number): void => {
       if (self._terminated) return;
       if (unrefTimer) clearTimeout(unrefTimer);
@@ -400,15 +403,20 @@ function createRealWebWorker(
       cwd: (globalThis as any).process?.cwd?.() ?? "/",
       env: processEnv,
       onOnline: () => {
+        lastActivity = Date.now();
         if (!self._terminated) self.emit("online");
       },
-      onMessage: (data: unknown) => self.emit("message", data),
+      onMessage: (data: unknown) => {
+        lastActivity = Date.now();
+        self.emit("message", data);
+      },
       onError: (error: Error) => self.emit("error", error),
       onExit: close,
     });
     self._handle = handle;
     self._elHandle = getRegistry().register("Worker");
     self.postMessage = (value: unknown) => {
+      lastActivity = Date.now();
       if (!self._terminated) handle.postMessage(value);
     };
     self.terminate = () => {
@@ -427,12 +435,30 @@ function createRealWebWorker(
     self.unref = () => {
       // napi-rs unrefs its bootstrap worker before Vite binds the HTTP server.
       // Delay that transition through the startup gap, then honor Node's
-      // unref semantics so one-shot native-module processes can drain.
+      // unref semantics so one-shot native-module processes can drain. The
+      // gap is bridged by activity, not by a fixed 3s from this call: the
+      // worker is let go once it has been quiet for UNREF_QUIET_MS (a build
+      // that has finished stops talking to it, so `vite build` ends right
+      // after its last output instead of up to 3s after rolldown loaded),
+      // and in any case UNREF_MAX_MS after this call.
       if (!self._terminated && !unrefTimer) {
-        unrefTimer = setTimeout(() => {
+        const UNREF_QUIET_MS = 750;
+        const UNREF_MAX_MS = 3_000;
+        const startedAt = Date.now();
+        const check = (): void => {
           unrefTimer = null;
-          (self._elHandle as Handle | null)?.unref();
-        }, 3_000);
+          if (self._terminated) return;
+          const now = Date.now();
+          const quiet = now - lastActivity;
+          const elapsed = now - startedAt;
+          if (quiet >= UNREF_QUIET_MS || elapsed >= UNREF_MAX_MS) {
+            (self._elHandle as Handle | null)?.unref();
+            return;
+          }
+          unrefTimer = setTimeout(check, Math.max(25, Math.min(UNREF_QUIET_MS - quiet, UNREF_MAX_MS - elapsed)));
+          (unrefTimer as any)?.unref?.();
+        };
+        unrefTimer = setTimeout(check, UNREF_QUIET_MS);
         (unrefTimer as any)?.unref?.();
       }
       return self;
