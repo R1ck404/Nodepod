@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@noble/hashes':
-        specifier: npm:@r1ck404/fast-noble-hashes@1.8.1
-        version: '@r1ck404/fast-noble-hashes@1.8.1'
+        specifier: ^1.8.0
+        version: 1.8.0
       '@xterm/addon-fit':
         specifier: ^0.11.0
         version: 0.11.0
@@ -39,11 +39,11 @@ importers:
         specifier: ^4.4.2
         version: 4.4.2
       es-module-lexer:
-        specifier: npm:@r1ck404/fast-es-module-lexer@1.7.1
-        version: '@r1ck404/fast-es-module-lexer@1.7.1'
+        specifier: 1.7.0
+        version: 1.7.0
       pako:
-        specifier: npm:@r1ck404/fast-pako@2.1.1
-        version: '@r1ck404/fast-pako@2.1.1'
+        specifier: ^2.1.0
+        version: 2.2.0
       resolve.exports:
         specifier: ^2.0.3
         version: 2.0.3
@@ -1160,6 +1160,10 @@ packages:
     resolution: {integrity: sha512-Z6pjIZ/8IJcCGzb2S/0Px5J81yij85xASuk1teLNeg75bfT07MV3a/O2Mtn1I2se43k3lkVEcFaR10N4cgQcZA==}
     engines: {node: '>= 20.19.0'}
 
+  '@noble/hashes@1.8.0':
+    resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
+    engines: {node: ^14.21.3 || >=16}
+
   '@noble/hashes@2.2.0':
     resolution: {integrity: sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==}
     engines: {node: '>= 20.19.0'}
@@ -1229,18 +1233,6 @@ packages:
   '@r1ck404/fast-brotli-wasm@3.0.2':
     resolution: {integrity: sha512-tK3HFBnjqRiZu1IiBjqX928Wc7+ycrHOFTr0sBD1C6t8GgNjysK8ubKWJKmNZmvgC/UmwFOI97MKc9QQWTKUMg==}
     engines: {node: '>=20.19'}
-
-  '@r1ck404/fast-es-module-lexer@1.7.1':
-    resolution: {integrity: sha512-EO+yKQDvG6w0HhAVnu2M+KV3gBM7VxGORS7CEaU8FDlzdeKlGm5K7a6dlgIPRkBgSHf8oYUA1zM9buKCsUILdQ==}
-    engines: {node: '>=18'}
-
-  '@r1ck404/fast-noble-hashes@1.8.1':
-    resolution: {integrity: sha512-mYv49UA71eyzazviJUHi2myjFl8PLjt+bAmj+Sk6TJ5J+gI8XhoadhTWlKj3qH/NfYKpv9rXuuw4c0fdO5cC4w==}
-    engines: {node: ^14.21.3 || >=16}
-
-  '@r1ck404/fast-pako@2.1.1':
-    resolution: {integrity: sha512-o4Zx38huK/qxEbyZ0r2vL3AGiW0/npDe3gHrYxbAPYwXYPRTlcFsXzviXH49Dn5n+34TqvUGTSMsWWoUz409Wg==}
-    engines: {node: '>=18'}
 
   '@rolldown/binding-android-arm64@1.2.4':
     resolution: {integrity: sha512-jHC2cnyKz5xU2fhECtFl8OZ83cYNt13GZQD+0uMJ/X3o+ijmd56okHhTUwxVSHPx1IRVIJEZ1/1pPzeLCU6XKA==}
@@ -2779,6 +2771,9 @@ packages:
   pagefind@1.5.2:
     resolution: {integrity: sha512-XTUaK0hXMCu2jszWE584JGQT7y284TmMV9l/HX3rnG5uo3rHI/uHU56XTyyyPFjeWEBxECbAi0CaFDJOONtG0Q==}
     hasBin: true
+
+  pako@2.2.0:
+    resolution: {integrity: sha512-zJq6RP/5q+TO2OpFV3FHzlPnFjmkb7Nc99a5SNjJE+uu/PkpChs+NIZSSzbBoD+6kjiISXjfYdwj1ZRQ81dz/w==}
 
   parse-entities@4.0.2:
     resolution: {integrity: sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw==}
@@ -4417,6 +4412,8 @@ snapshots:
 
   '@noble/ciphers@2.2.0': {}
 
+  '@noble/hashes@1.8.0': {}
+
   '@noble/hashes@2.2.0': {}
 
   '@opentelemetry/semantic-conventions@1.41.1': {}
@@ -4459,12 +4456,6 @@ snapshots:
   '@r1ck404/fast-acorn@8.18.1': {}
 
   '@r1ck404/fast-brotli-wasm@3.0.2': {}
-
-  '@r1ck404/fast-es-module-lexer@1.7.1': {}
-
-  '@r1ck404/fast-noble-hashes@1.8.1': {}
-
-  '@r1ck404/fast-pako@2.1.1': {}
 
   '@rolldown/binding-android-arm64@1.2.4':
     optional: true
@@ -6331,6 +6322,8 @@ snapshots:
       '@pagefind/linux-x64': 1.5.2
       '@pagefind/windows-arm64': 1.5.2
       '@pagefind/windows-x64': 1.5.2
+
+  pako@2.2.0: {}
 
   parse-entities@4.0.2:
     dependencies:
