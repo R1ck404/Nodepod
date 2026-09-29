@@ -4,7 +4,7 @@
 // first build. A WebAssembly.Module can be posted to workers, so the
 // compile (and V8's optimized tier-up of it) happens once per session.
 
-import { CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
+import { CDN_ESBUILD_BINARY, ESBUILD_HAS_BINARY } from "../constants/cdn-urls";
 
 let modulePromise: Promise<WebAssembly.Module | null> | null = null;
 let compiling = false;
@@ -47,6 +47,8 @@ async function compile(url: string): Promise<WebAssembly.Module | null> {
 
 /** The shared module, compiling it on first call. Resolves null on failure. */
 export function getSharedEsbuildModule(): Promise<WebAssembly.Module | null> {
+  // an engine without a binary has nothing to compile or share
+  if (!ESBUILD_HAS_BINARY) return Promise.resolve(null);
   scheduleRelease();
   if (!modulePromise) {
     compiling = true;

@@ -24,17 +24,17 @@ importers:
         specifier: ^6.0.0
         version: 6.0.0
       acorn:
-        specifier: ^8.15.0
-        version: 8.17.0
+        specifier: npm:@r1ck404/fast-acorn@8.18.1
+        version: '@r1ck404/fast-acorn@8.18.1'
       acorn-jsx:
-        specifier: ^5.3.2
-        version: 5.3.2(acorn@8.17.0)
+        specifier: npm:@r1ck404/fast-acorn-jsx@5.3.3
+        version: '@r1ck404/fast-acorn-jsx@5.3.3(@r1ck404/fast-acorn@8.18.1)'
       brotli:
         specifier: ^1.3.3
         version: 1.3.3
       brotli-wasm:
-        specifier: ^3.0.1
-        version: 3.0.1
+        specifier: npm:@r1ck404/fast-brotli-wasm@3.0.2
+        version: '@r1ck404/fast-brotli-wasm@3.0.2'
       comlink:
         specifier: ^4.4.2
         version: 4.4.2
@@ -1221,6 +1221,19 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  '@r1ck404/fast-acorn-jsx@5.3.3':
+    resolution: {integrity: sha512-c+2rDo9O6sdKnrTIrk/bLjCSeojZ96TdVXQdrg2iR/0tp3bXMfXbM5UwdlbDt1P9DkbQBeubGDrwPRC4LjjH/Q==}
+    peerDependencies:
+      acorn: ^6.0.0 || ^7.0.0 || ^8.0.0
+
+  '@r1ck404/fast-acorn@8.18.1':
+    resolution: {integrity: sha512-DIZTPu6gr/krGhx2XRYZaBmk3E3P4icbPa7DTZQCKMA1a61jEzF4IEdg9POxr2O2Nu+KDO/sdQlXWewkrNTjRA==}
+    engines: {node: '>=18'}
+
+  '@r1ck404/fast-brotli-wasm@3.0.2':
+    resolution: {integrity: sha512-tK3HFBnjqRiZu1IiBjqX928Wc7+ycrHOFTr0sBD1C6t8GgNjysK8ubKWJKmNZmvgC/UmwFOI97MKc9QQWTKUMg==}
+    engines: {node: '>=20.19'}
+
   '@rolldown/binding-android-arm64@1.2.4':
     resolution: {integrity: sha512-jHC2cnyKz5xU2fhECtFl8OZ83cYNt13GZQD+0uMJ/X3o+ijmd56okHhTUwxVSHPx1IRVIJEZ1/1pPzeLCU6XKA==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -1909,10 +1922,6 @@ packages:
   brace-expansion@5.0.9:
     resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
     engines: {node: 20 || >=22}
-
-  brotli-wasm@3.0.1:
-    resolution: {integrity: sha512-U3K72/JAi3jITpdhZBqzSUq+DUY697tLxOuFXB+FpAE/Ug+5C3VZrv4uA674EUZHxNAuQ9wETXNqQkxZD6oL4A==}
-    engines: {node: '>=v18.0.0'}
 
   brotli@1.3.3:
     resolution: {integrity: sha512-oTKjJdShmDuGW94SyyaoQvAjf30dZaHnjJ8uAF+u2/vGJkJbJPJAT1gDiOJP5v1Zb6f9KEyW/1HpuaWIXtGHPg==}
@@ -4440,6 +4449,14 @@ snapshots:
     dependencies:
       playwright: 1.61.1
 
+  '@r1ck404/fast-acorn-jsx@5.3.3(@r1ck404/fast-acorn@8.18.1)':
+    dependencies:
+      acorn: '@r1ck404/fast-acorn@8.18.1'
+
+  '@r1ck404/fast-acorn@8.18.1': {}
+
+  '@r1ck404/fast-brotli-wasm@3.0.2': {}
+
   '@rolldown/binding-android-arm64@1.2.4':
     optional: true
 
@@ -5051,8 +5068,6 @@ snapshots:
   brace-expansion@5.0.9:
     dependencies:
       balanced-match: 4.0.4
-
-  brotli-wasm@3.0.1: {}
 
   brotli@1.3.3:
     dependencies:
