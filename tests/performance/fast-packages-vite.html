@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8"><title>Nodepod fast-package Vite comparison</title>
+<div id="status">starting</div><iframe id="frame" style="width:900px;height:300px"></iframe><pre id="results"></pre>
+<script type="module">
+import {makeProject,appSource,crawl} from './fast-packages-project.mjs';
+const params=new URLSearchParams(location.search);
+const {Nodepod}=await import(/* @vite-ignore */ (params.get('dist')||'/dist')+'/index.mjs');
+const status=document.getElementById('status'),frame=document.getElementById('frame');
+const results={components:100,viteVersion:'8.0.10'};
+let pod,dev,waiter;
+addEventListener('message',event=>{
+  if(event.source!==frame.contentWindow || event.data?.type!=='bench-rendered')return;
+  if(waiter?.test(event.data)){const current=waiter;waiter=null;current.resolve(event.data)}
+});
+function waitRendered(test){return new Promise((resolve,reject)=>{
+  const timeout=setTimeout(()=>reject(new Error('render timeout')),20000);
+  waiter={test,resolve:value=>{clearTimeout(timeout);resolve(value)}};
+})}
+async function run(cmd,args,until){
+  const proc=await pod.spawn(cmd,args,{cwd:'/app'});let output='';
+  proc.on('output',chunk=>output+=chunk);proc.on('error',chunk=>output+=chunk);
+  if(until){await new Promise((resolve,reject)=>{
+    const interval=setInterval(()=>{if(until.test(output)){clearInterval(interval);resolve()}},2);
+    proc.completion.then(result=>{clearInterval(interval);reject(new Error(cmd+' exited '+result.exitCode+': '+output.slice(-3000)))})
+  });return proc}
+  const result=await proc.completion;
+  if(result.exitCode!==0)throw new Error(cmd+' exited '+result.exitCode+': '+output.slice(-3000));
+}
+try{
+  let ready;const server=new Promise(resolve=>ready=resolve);
+  const files=Object.fromEntries(Object.entries(makeProject({components:100,viteVersion:'8.0.10',pluginReact:'5.0.4'})).map(([path,content])=>['/app/'+path,content]));
+  let start=performance.now();
+  pod=await Nodepod.boot({files,workdir:'/app',watermark:false,onServerReady:(_port,url)=>ready(url)});
+  results.bootMs=performance.now()-start;
+  status.textContent='installing';start=performance.now();await run('npm',['install']);results.installMs=performance.now()-start;
+  status.textContent='dev';start=performance.now();dev=await run('npx',['vite'],/ready in/);results.devReadyMs=performance.now()-start;
+  const url=await server;
+  status.textContent='cold load';start=performance.now();let rendered=waitRendered(data=>data.count===100);frame.src=url;await rendered;results.coldRenderMs=performance.now()-start;
+  status.textContent='warm load';start=performance.now();rendered=waitRendered(data=>data.count===100&&data.href.includes('r=1'));frame.src=url+'?r=1';await rendered;results.warmRenderMs=performance.now()-start;
+  status.textContent='hmr';const hmr=[];
+  for(let i=1;i<=5;i++){
+    await new Promise(resolve=>setTimeout(resolve,150));start=performance.now();
+    rendered=waitRendered(data=>data.marker==='MARKER_'+i);
+    await pod.fs.writeFile('/app/src/App.tsx',appSource('MARKER_'+i));await rendered;hmr.push(performance.now()-start);
+  }
+  results.hmrAllMs=hmr;results.hmrMs=[...hmr].sort((a,b)=>a-b)[2];
+  status.textContent='crawl';start=performance.now();
+  const warm=await crawl(async path=>{
+    const response=await pod.request(5173,{path,headers:{host:'localhost:5173',accept:'*/*'}});
+    return response.statusCode>=400?'':new TextDecoder().decode(response.body);
+  });results.warmCrawlMs=performance.now()-start;results.warmRequests=warm.requests;
+  frame.src='about:blank';dev.kill();await dev.completion.catch(()=>{});
+  status.textContent='build';start=performance.now();await run('npx',['vite','build']);results.buildMs=performance.now()-start;
+  results.buildFiles=await pod.fs.readdir('/app/dist');results.ok=true;
+}catch(error){results.ok=false;results.error=String(error.stack||error)}
+finally{if(dev)dev.kill();if(pod)await pod.teardown()}
+document.getElementById('results').textContent=JSON.stringify(results,null,2);
+window.__bench=results;status.textContent=results.ok?'DONE':'FAIL';
+</script>

@@ -26,7 +26,7 @@ import {
   saveSnapshotParts,
 } from "../persistence/binary-snapshot";
 import { getTarballCache } from "../persistence/tarball-cache";
-import { PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
+import { CDN_ESBUILD_ESM } from "../constants/cdn-urls";
 import type { PerformanceTracker } from "../performance-tracker";
 import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler";
 import { resolveWithCache } from "./resolution-cache";
@@ -42,7 +42,9 @@ const RESOLVER_CACHE_VERSION = 3;
 const MATERIALIZE_ATTEMPTS = 3;
 const MATERIALIZE_RETRY_DELAY_MS = 750;
 const SNAPSHOT_CACHE_VERSION = 5;
-const TRANSFORMER_CACHE_VERSION = `esbuild-wasm@${PINNED_ESBUILD_WASM}:cjs-esnext-neutral-v1`;
+// Cache generated output against the selected engine revision, not only its
+// upstream API version (different implementations can expose the same API).
+const TRANSFORMER_CACHE_VERSION = `${CDN_ESBUILD_ESM}:cjs-esnext-neutral-v1`;
 
 // Some package managers and bundlers derive their WASI package name at
 // runtime instead of declaring it in optionalDependencies. Keep this generic:

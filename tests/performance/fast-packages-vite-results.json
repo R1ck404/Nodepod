@@ -1,0 +1,218 @@
+[
+  {
+    "round": -1,
+    "label": "candidate",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 83.54000008106232,
+    "installMs": 2295.850000023842,
+    "devReadyMs": 1056.414999961853,
+    "coldRenderMs": 907.1850000619888,
+    "warmRenderMs": 93.48000001907349,
+    "hmrAllMs": [
+      59.00499999523163,
+      53.6800000667572,
+      53.96000003814697,
+      46.46499991416931,
+      54.62000000476837
+    ],
+    "hmrMs": 53.96000003814697,
+    "warmCrawlMs": 29.170000076293945,
+    "warmRequests": 126,
+    "buildMs": 2816.289999961853,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": -1,
+    "label": "baseline",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 80.97000002861023,
+    "installMs": 1616.4650000333786,
+    "devReadyMs": 1167.0900000333786,
+    "coldRenderMs": 750.7299998998642,
+    "warmRenderMs": 85.74499988555908,
+    "hmrAllMs": [
+      46.10000002384186,
+      44.394999980926514,
+      44.480000019073486,
+      49.16500008106232,
+      37.25499999523163
+    ],
+    "hmrMs": 44.480000019073486,
+    "warmCrawlMs": 28.110000014305115,
+    "warmRequests": 126,
+    "buildMs": 2746.1349999904633,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 0,
+    "label": "baseline",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 68.35999989509583,
+    "installMs": 1276.3650000095367,
+    "devReadyMs": 983.1000000238419,
+    "coldRenderMs": 844.164999961853,
+    "warmRenderMs": 92.78999996185303,
+    "hmrAllMs": [
+      42.62000000476837,
+      50.03999996185303,
+      64.71499991416931,
+      47.4650000333786,
+      40.1599999666214
+    ],
+    "hmrMs": 47.4650000333786,
+    "warmCrawlMs": 26.62000000476837,
+    "warmRequests": 126,
+    "buildMs": 3010.4199999570847,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 0,
+    "label": "candidate",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 76.66499996185303,
+    "installMs": 1510.1449999809265,
+    "devReadyMs": 893.539999961853,
+    "coldRenderMs": 841.3650000095367,
+    "warmRenderMs": 93.54499995708466,
+    "hmrAllMs": [
+      52.33500003814697,
+      46.13499999046326,
+      70.44000005722046,
+      47.12999999523163,
+      48.82000005245209
+    ],
+    "hmrMs": 48.82000005245209,
+    "warmCrawlMs": 32.16500008106232,
+    "warmRequests": 126,
+    "buildMs": 2731.6999999284744,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 1,
+    "label": "candidate",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 70.79999995231628,
+    "installMs": 1459.1200000047684,
+    "devReadyMs": 905.3249999284744,
+    "coldRenderMs": 753.6000000238419,
+    "warmRenderMs": 105.86000001430511,
+    "hmrAllMs": [
+      51.17999994754791,
+      48.66499996185303,
+      50.25499999523163,
+      45.544999957084656,
+      45.72500002384186
+    ],
+    "hmrMs": 48.66499996185303,
+    "warmCrawlMs": 29.615000009536743,
+    "warmRequests": 126,
+    "buildMs": 2645.5950000286102,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 1,
+    "label": "baseline",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 81.03999996185303,
+    "installMs": 1360.4649999141693,
+    "devReadyMs": 1012.9450000524521,
+    "coldRenderMs": 769.4900000095367,
+    "warmRenderMs": 92.66499996185303,
+    "hmrAllMs": [
+      48.43499994277954,
+      47.49000000953674,
+      46.59999990463257,
+      46.80499994754791,
+      44.85000002384186
+    ],
+    "hmrMs": 46.80499994754791,
+    "warmCrawlMs": 31.075000047683716,
+    "warmRequests": 126,
+    "buildMs": 2889.314999938011,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 2,
+    "label": "baseline",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 67.7150000333786,
+    "installMs": 1449.5650000572205,
+    "devReadyMs": 1067.7649999856949,
+    "coldRenderMs": 753.414999961853,
+    "warmRenderMs": 88.6800000667572,
+    "hmrAllMs": [
+      47.49000000953674,
+      46.77999997138977,
+      39.66500008106232,
+      49.31500005722046,
+      44.79000008106232
+    ],
+    "hmrMs": 46.77999997138977,
+    "warmCrawlMs": 28.264999985694885,
+    "warmRequests": 126,
+    "buildMs": 2942.625,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  },
+  {
+    "round": 2,
+    "label": "candidate",
+    "components": 100,
+    "viteVersion": "8.0.10",
+    "bootMs": 66.84499990940094,
+    "installMs": 1523.2299998998642,
+    "devReadyMs": 967.5449999570847,
+    "coldRenderMs": 726.8799999952316,
+    "warmRenderMs": 99.8400000333786,
+    "hmrAllMs": [
+      54.420000076293945,
+      44.56499993801117,
+      49.05999994277954,
+      45.42999994754791,
+      40.9449999332428
+    ],
+    "hmrMs": 45.42999994754791,
+    "warmCrawlMs": 30.81499993801117,
+    "warmRequests": 126,
+    "buildMs": 2594.764999985695,
+    "buildFiles": [
+      "assets",
+      "index.html"
+    ],
+    "ok": true
+  }
+]

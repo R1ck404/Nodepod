@@ -28,8 +28,21 @@ export interface WasmModuleCache {
 
 // Sync constructors cannot await crypto.subtle. Hash every byte before
 // reusing executable code: a sampled key can miss changes to instructions.
+let activeContentHashes = 0;
+
+// A hash implementation may compile WASM on first use. Its own constructor
+// must bypass caching until the content hash is ready, avoiding recursion.
+export function isHashingWasmContent(): boolean {
+  return activeContentHashes > 0;
+}
+
 export function quickWasmHash(bytes: Uint8Array): string {
-  return bytesToHex(sha256(bytes));
+  activeContentHashes++;
+  try {
+    return bytesToHex(sha256(bytes));
+  } finally {
+    activeContentHashes--;
+  }
 }
 
 // Persistent keys use the same digest even without crypto.subtle.

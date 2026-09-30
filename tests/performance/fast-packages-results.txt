@@ -1,0 +1,146 @@
+Nodepod fast-package update and comparison — 2026-09-30
+
+Baseline: 4c68f9f (perf/runtime-hotspots, the previously pushed Nodepod).
+Candidate: perf/update-fast-packages, based on that commit.
+Latest versions verified against registry.npmjs.org on 2026-09-30.
+
+Selected implementations
+                         baseline                        candidate
+acorn                    fast-acorn 8.18.1                fast-acorn 8.18.2
+acorn-jsx                fast-acorn-jsx 5.3.3              fast-acorn-jsx 5.3.4
+brotli-wasm              fast-brotli-wasm 3.0.2            fast-brotli-wasm 3.0.3
+esbuild runtime (CDN)    fast-esbuild-wasm 0.28.4          fast-esbuild-wasm 0.28.5
+pako                     pako 2.2.0 (worker CDN 2.1.0)     fast-pako 2.1.2
+es-module-lexer          es-module-lexer 1.7.0            fast-es-module-lexer 1.7.2
+@noble/hashes            @noble/hashes 1.8.0               fast-noble-hashes 1.8.2
+
+The installed aliases and worker CDN URLs both use the selected versions.
+Upstream esbuild's API version remains 0.28.2; the replacement's own revision
+is 0.28.5. Transformed-package cache identity now includes the selected engine
+URL so changing implementation revisions invalidates previously generated code.
+
+Compatibility fix
+An accelerated content hash can compile a WASM kernel on first use. Nodepod's
+patched Module constructor was trying to hash that kernel for the WASM cache,
+recursively initializing the hash. The cache now bypasses lookup/registration
+while a synchronous content hash is in progress, then resumes normal caching.
+The guard is generic and names no package. A cold-bootstrap regression checks
+that compilation terminates, the digest matches Node crypto, and subsequent
+module lookups work. No guest framework code or browser timer API is patched.
+
+Native runtime comparison
+Node v24.16.0, Windows. Same-process bundles against each checkout's own
+dependencies; seven rounds per task, alternating AB/BA, ten warm-up calls.
+Medians below are milliseconds per operation. Every task's full output checksum
+matched before timing (AST, transformed text, compressed bytes, digests or
+extracted files). These are warm synthetic component measurements, not overall
+Nodepod speedups. No build/test process ran during the timed comparisons.
+
+Corpus: 64,169-byte ESM, 41,369-byte JSX, 256,676-byte compression/hash input,
+300 generated package files of 4 KiB each for archive extraction. The Brotli
+input is 288,000 bytes of repeated source text, quality 6.
+
+task                     baseline ms    candidate ms    speedup
+acorn ESM parse          1.7800         1.6953          1.05x
+acorn JSX parse          1.2150         1.2138          1.00x
+ESM-to-CJS               2.3339         2.2393          1.04x
+module lexer             0.2078         0.0528          3.94x
+gzip                     3.0930         0.7479          4.14x
+ungzip                   0.9470         0.1406          6.74x
+streaming SHA-256        1.0560         0.5561          1.90x
+streaming SHA-512        2.6630         0.3657          7.28x
+extract 300-file archive 5.3788         1.6777          3.21x
+Brotli compress q6       0.5788         0.6164          0.94x
+Brotli decompress        0.0837         0.0831          1.01x
+
+An earlier repeat without the two Brotli probes gave lexer 4.29x, gzip 4.06x,
+ungzip 6.94x, SHA-256 1.83x, SHA-512 5.38x and extraction 2.91x. Acorn/JSX
+varied around parity. Do not treat their small changes as established gains.
+The Brotli update did not establish a performance improvement on this corpus.
+
+Vite end-to-end comparison
+Unmodified compiled Nodepod bundles, same 100-component React/TypeScript app,
+Vite 8.0.10 + plugin-react 5.0.4 + React 19.1.0. Native Chromium visibility was
+asserted visible. No visibility/timer overrides. One warm-up per implementation
+excluded; three measured pairs alternating AB, BA, AB. A fresh browser context
+per run means application/IndexedDB caches do not carry between implementations.
+Install includes registry/CDN network latency; local Windows/Chromium results
+are exploratory medians, not CI thresholds or universal speedup claims.
+
+phase                    baseline ms    candidate ms    change in time
+boot                     68.36          70.80           +3.6%
+fresh install            1360.46        1510.14         +11.0%
+dev server ready         1012.95        905.32          -10.6%
+cold render              769.49         753.60          -2.1%
+warm render              92.66          99.84           +7.7%
+HMR (median of 5 edits)  46.80          48.66           +4.0%
+warm 126-request crawl   28.26          30.81           +9.0%
+production build         2942.63        2645.60         -10.1%
+
+All eight runs (including warm-ups) rendered 100 components, completed all five
+HMR edits, and produced dist/index.html. The new bundle is somewhat larger:
+roughly 21 KiB added to the main ESM shared chunk, 8 KiB to the sandbox shared
+chunk and 6 KiB to the process worker. Startup/build gains do not imply install
+or all interaction paths became faster.
+
+Fresh-install phase investigation (follow-up)
+The original three-pair online +11% result did not reproduce. Do not treat it
+as an established install regression. We cannot reconstruct its precise cause
+because that original run did not capture request/installer phase timings.
+
+Both built versions were copied to unique benchmark directories and given the
+same lightweight span collector at shell-installer construction. Checkout dist
+and runtime source were not modified. SDK profiling captures process startup;
+worker spans capture resolution and materialization. Span logs emit once at
+install completion. Each run uses a fresh browser context and empty IDB, so
+first-use WASM initialization is included, although not separately isolated.
+One warm-up per version was excluded, followed by four alternating measured
+pairs in each mode. No other build/test workload ran during measurements.
+
+Latest retained-run medians (ms):
+phase                       live old   live new   replay old   replay new
+process spawn               178.28     161.83     184.33       176.75
+dependency resolution       502.38     502.44     476.10       485.49
+package materialization     599.94     485.30     567.43       497.20
+whole fresh npm install     1318.90    1176.73    1268.27      1184.41
+
+Live: updated version 10.8% faster. Replay: updated version 6.6% faster.
+Replay records all 76 registry manifests and 77 tarballs from the first warm-up
+and fulfills subsequent requests with identical bodies/status/headers. Unknown
+registry URLs fail rather than falling back to the live network. Browser request
+timings confirm fulfilled requests have no DNS/connect/requestStart timings.
+The pako CDN module and local bundle loading are still measured separately and
+not replayed; this is a controlled registry comparison, not a CPU-only benchmark.
+
+Earlier independent phase repeats also favored the update: live medians
+1303.73 -> 1192.72 and 1275.34 -> 1214.40; first replay 1269.69 -> 1190.73.
+Request durations varied substantially in live runs. This supports network/run
+variation as a plausible contributor to the original discrepancy; it does not
+prove which requests caused the original slowdown. No consistent first-use or
+process-startup regression was found. Materialization is faster in every repeat.
+Individual download/extraction spans overlap: their summed times must not be
+added to wall time. Phase medians also need not sum to the median whole install.
+
+Both retained profiling tests passed (20 successful installs, including warm-ups).
+Raw phase spans and browser request timings: install-phase-results.json.
+Reproduce with NODEPOD_FAST_BASELINE set to the built previous checkout:
+pnpm exec playwright test --config playwright.perf.config.ts tests/performance/install-phase-profile.spec.ts
+
+Validation
+Full unit suite: 1,645 passed, 5 skipped. Type check and library/declaration
+build passed. Five performance browser checks and seven runtime-reliability
+checks passed. The comparison itself passed all eight baseline/candidate runs.
+Fresh hash bootstrapping, zlib/crypto, parsing, packing/eviction, worker binary
+sync, Vite/Tailwind builds, HMR state preservation, fetch bodies, process kill,
+preview downloads and host-route isolation are covered.
+Fast pako/hashes/lexer use WebAssembly; validate the supported browser/SIMD
+matrix when adopting this beyond the tested Node/Chromium environments.
+
+Reproduce
+Build both checkouts with their own frozen-lockfile dependency installations.
+node tests/performance/run-fast-packages-comparison.mjs <baseline-checkout>
+Set NODEPOD_FAST_BASELINE=<baseline-checkout>, then run:
+pnpm exec playwright test --config playwright.perf.config.ts tests/performance/fast-packages-vite-comparison.spec.ts
+Serve from the candidate checkout; avoid reusing another worktree's server.
+Raw samples retained in fast-packages-native-results.json and
+fast-packages-vite-results.json alongside this report.

@@ -1,4 +1,4 @@
-// Pure-JS synchronous digests for the crypto polyfill (Web Crypto has no sync API).
+// Synchronous digests for the crypto polyfill (Web Crypto has no sync API).
 
 import { sha384 as nobleSha384, sha512 as nobleSha512 } from "@noble/hashes/sha512";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha256";
