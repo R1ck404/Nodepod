@@ -45,6 +45,29 @@ function frameWith(frame: StoreFrame, key: object, value: unknown): StoreFrame {
 }
 
 const NativePromise = Promise;
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+let timerFrame: StoreFrame | undefined;
+let timerPrevious: StoreFrame | undefined;
+let timerRestorePending = false;
+
+function restoreTimerFrame(): void {
+  timerRestorePending = false;
+  if (currentFrame === timerFrame && timerPrevious) currentFrame = liveFrame(timerPrevious);
+  timerFrame = undefined;
+  timerPrevious = undefined;
+}
+
+function deferTimerRestore(previous: StoreFrame): void {
+  timerFrame = currentFrame;
+  if (timerRestorePending) return;
+  timerPrevious = previous;
+  timerRestorePending = true;
+  // Native await resumptions bypass then(). Keep the timer's frame through
+  // its microtask checkpoint, including further awaits, before restoring it.
+  // Coalesce restoration into one untracked checkpoint that does not keep Node alive.
+  const timer = nativeSetTimeout(restoreTimerFrame, 0);
+  (timer as unknown as { unref?: () => void }).unref?.();
+}
 
 // consumers bridging native async functions across an ABI need the intrinsic
 // constructor. installAsyncContext() replaces globalThis.Promise below, but
@@ -214,16 +237,17 @@ class ContextPromise<T = unknown> extends NativePromise<T> {
 }
 
 function patchTimerContext(): void {
-  const wrapTimer = <F extends (...args: any[]) => void>(fn: F): F => {
+  const wrapTimer = <F extends (...args: any[]) => void>(fn: F, handoff = false): F => {
     const frame = captureFrame();
     return ((...args: unknown[]) => {
-      // Sync restore for the same reason as wrapCallback.
       const prev = currentFrame;
       currentFrame = liveFrame(frame);
       try {
         fn(...args);
       } finally {
-        currentFrame = liveFrame(prev);
+        if (handoff && frame.size > 0 && (currentFrame === frame || enteredFrom.get(currentFrame) === frame)) {
+          deferTimerRestore(prev);
+        } else currentFrame = liveFrame(prev);
       }
     }) as F;
   };
@@ -247,7 +271,7 @@ function patchTimerContext(): void {
     const origSetTimeout = globalThis.setTimeout.bind(globalThis);
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
       const wrapped =
-        typeof handler === "function" ? wrapTimer(handler as (...a: unknown[]) => void) : handler;
+        typeof handler === "function" ? wrapTimer(handler as (...a: unknown[]) => void, true) : handler;
       return origSetTimeout(wrapped, timeout as number, ...args);
     }) as typeof setTimeout;
     (globalThis.setTimeout as any).__nodepodAsyncCtx = true;
@@ -256,7 +280,7 @@ function patchTimerContext(): void {
   if (typeof globalThis.setImmediate === "function" && !ownTimer(globalThis.setImmediate)) {
     const origSetImmediate = globalThis.setImmediate.bind(globalThis);
     globalThis.setImmediate = ((handler: (...args: unknown[]) => void, ...args: unknown[]) => {
-      return origSetImmediate(wrapTimer(handler), ...args);
+      return origSetImmediate(wrapTimer(handler, true), ...args);
     }) as typeof setImmediate;
     (globalThis.setImmediate as any).__nodepodAsyncCtx = true;
   }

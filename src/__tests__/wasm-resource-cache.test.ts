@@ -8,7 +8,7 @@ import {
   reclaimWasmCache,
   wasmCacheStats,
 } from "../helpers/wasm-cache";
-import { installWasmMemoryClamp, readWasmMemoryImports } from "../helpers/wasm-memory-clamp";
+import { installWasmMemoryClamp, readWasmMemoryImports, rememberWasmMemoryRequirements } from "../helpers/wasm-memory-clamp";
 import { wasmContentHash } from "../persistence/wasm-module-cache";
 import { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
@@ -38,6 +38,8 @@ function wasm(memories: Array<[string, number]> = [], padding = 0): Uint8Array<A
   bytes.set(custom, header.length);
   return bytes;
 }
+
+const supportsMultiMemory = WebAssembly.validate(wasm([["a", 2], ["b", 5]]));
 
 afterEach(() => {
   disposeWasmCache();
@@ -191,7 +193,24 @@ describe("WASM resources", () => {
     expect(memory.buffer.byteLength).toBe(2 * 65536);
   });
 
-  it("sizes several imported memories independently", () => {
+  it("prepares parsed multi-memory requirements independently of host support", () => {
+    const requirements = readWasmMemoryImports(wasm([["a", 2], ["b", 5]]));
+    expect(requirements?.map(memory => memory.minPages)).toEqual([2, 5]);
+    installWasmMemoryClamp();
+    for (const shared of [false, true]) {
+      // Exercise the metadata handoff and import preparation using a module
+      // every host can link. Actual multi-memory linking is checked separately.
+      const module = new NativeModule(wasm());
+      rememberWasmMemoryRequirements(module, requirements);
+      const a = new WebAssembly.Memory({ initial: 4096, maximum: 65536, shared: true });
+      const b = shared ? a : new WebAssembly.Memory({ initial: 4096, maximum: 65536, shared: true });
+      new WebAssembly.Instance(module, { env: { a, b } });
+      expect(a.buffer.byteLength).toBe((shared ? 5 : 2) * 65536);
+      expect(b.buffer.byteLength).toBe(5 * 65536);
+    }
+  });
+
+  it.skipIf(!supportsMultiMemory)("sizes several imported memories independently", () => {
     const bytes = wasm([["a", 2], ["b", 5]]);
     expect(readWasmMemoryImports(bytes)?.map((m) => m.minPages)).toEqual([2, 5]);
     installWasmMemoryClamp();
@@ -203,7 +222,7 @@ describe("WASM resources", () => {
     expect(b.buffer.byteLength).toBe(5 * 65536);
   });
 
-  it("meets all requirements when one memory is imported under several names", () => {
+  it.skipIf(!supportsMultiMemory)("meets all requirements when one memory is imported under several names", () => {
     installWasmMemoryClamp();
     const module = new WebAssembly.Module(wasm([["a", 2], ["b", 5]]));
     const memory = new WebAssembly.Memory({ initial: 4096, maximum: 65536, shared: true });

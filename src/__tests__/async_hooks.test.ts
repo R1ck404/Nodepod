@@ -159,4 +159,23 @@ describe("AsyncLocalStorage", () => {
     );
     expect(results).toEqual(["1:b1", "2:b2", "3:b3"]);
   });
+
+  it("keeps overdue timer continuations isolated through multiple awaits", async () => {
+    const a = new AsyncLocalStorage<number>();
+    const b = new AsyncLocalStorage<string>();
+    for (let round = 0; round < 10; round++) {
+      const pending = [1, 2, 3].map(n =>
+        a.run(n, () => b.run(`b${n}`, async () => {
+          await new Promise<void>(resolve => setTimeout(resolve, 4 - n));
+          for (let step = 0; step < 10; step++) await Promise.resolve();
+          return `${a.getStore()}:${b.getStore()}`;
+        })),
+      );
+      // Make every timer due before the host can run any callback. Different
+      // hosts then dispatch them in different orders; context must not depend on it.
+      const deadline = Date.now() + 6;
+      while (Date.now() < deadline) {}
+      expect(await Promise.all(pending)).toEqual(["1:b1", "2:b2", "3:b3"]);
+    }
+  });
 });

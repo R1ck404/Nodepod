@@ -332,3 +332,23 @@ pages, no broken internal links and 2,752 verified API source links. Website
 tests pass on desktop and mobile: 16 passed, two existing mobile skips for
 terminal cases already covered on desktop. No dependency versions or lockfiles
 were changed.
+
+## Node 20 CI compatibility
+
+The first CI run exposed an async-context race when timer dispatch order differed
+from local Node 24, plus two tests requiring native WASM multi-memory support.
+The same three failures were reproduced locally under Node 20 before fixing them.
+
+Timer frames now survive their native-await microtask checkpoint before a
+coalesced, untracked restoration. The checkpoint is unref'd on Node, and empty
+frames do not schedule it. The concurrency assertions remain unchanged; a new
+regression forces all timers overdue and verifies ten further awaits per run.
+
+Actual multi-memory linking tests use WebAssembly.validate to detect host
+support, without Node-version rules. Parsing, imported-memory sizing and aliased
+memory preparation have separate coverage that runs on every host.
+
+After this correction, both full local suites pass: Node 20 has 1,633 passing
+tests and seven skips; Node 24 has 1,635 passing tests and five skips. Four of
+those skips are Windows bash checks; the two additional Node 20 skips are native
+multi-memory integration cases. Type checking and the publish build also pass.
