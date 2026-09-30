@@ -1,6 +1,69 @@
 import { describe, it, expect } from "vitest";
 
-import { Buffer } from "../polyfills/buffer";
+import bufferModule, { Buffer, Blob, File, isAscii, isUtf8 } from "../polyfills/buffer";
+import { isAscii as nativeIsAscii, isUtf8 as nativeIsUtf8 } from "node:buffer";
+
+describe("node:buffer encoding validation", () => {
+  it("matches Node at UTF-8 boundaries and on malformed sequences", () => {
+    const sequences = [
+      [], [0], [0x7f], [0xc2, 0x80], [0xdf, 0xbf],
+      [0xe0, 0xa0, 0x80], [0xed, 0x9f, 0xbf], [0xef, 0xbf, 0xbf],
+      [0xf0, 0x90, 0x80, 0x80], [0xf4, 0x8f, 0xbf, 0xbf],
+      [0x80], [0xc0, 0x80], [0xc1, 0xbf], [0xc2], [0xc2, 0x41],
+      [0xe0, 0x9f, 0xbf], [0xed, 0xa0, 0x80], [0xe1, 0x80],
+      [0xf0, 0x8f, 0xbf, 0xbf], [0xf4, 0x90, 0x80, 0x80],
+      [0xf5, 0x80, 0x80, 0x80], [0xff], [0xf0, 0x90, 0x80, 0x41],
+    ];
+    for (const sequence of sequences) {
+      const bytes = new Uint8Array([0xff, ...sequence, 0xff]).subarray(1, sequence.length + 1);
+      expect(isUtf8(bytes)).toBe(nativeIsUtf8(bytes));
+      expect(isAscii(bytes)).toBe(nativeIsAscii(bytes));
+    }
+    expect(bufferModule.isUtf8).toBe(isUtf8);
+    expect(bufferModule.isAscii).toBe(isAscii);
+  });
+
+  it("reads raw buffer/typed-array bytes and respects view boundaries", () => {
+    for (const input of [new ArrayBuffer(8), new SharedArrayBuffer(8), new Uint16Array([0xc280]), Buffer.from("valid 🙂")]) {
+      // Node accepts SharedArrayBuffer although its declarations omit it.
+      expect(isUtf8(input)).toBe(nativeIsUtf8(input as Parameters<typeof nativeIsUtf8>[0]));
+      expect(isAscii(input)).toBe(nativeIsAscii(input as Parameters<typeof nativeIsAscii>[0]));
+    }
+  });
+
+  it("matches Node errors and detached-view behavior", () => {
+    for (const fn of [isUtf8, isAscii]) {
+      for (const value of [[], {}, "text", null, new DataView(new ArrayBuffer(2))]) {
+        expect(() => fn(value as any)).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+      }
+      const buffer = new ArrayBuffer(2);
+      const view = new Uint8Array(buffer);
+      structuredClone(buffer, { transfer: [buffer] });
+      expect(() => fn(buffer)).toThrow(expect.objectContaining({ code: "ERR_INVALID_STATE" }));
+      expect(fn(view)).toBe(true);
+    }
+  });
+});
+
+describe("node:buffer web constructors", () => {
+  it("supports subclasses and immutable blob data through the module export", async () => {
+    class Upload extends (bufferModule.Blob as typeof globalThis.Blob) {}
+    const input = Buffer.from("upload");
+    const upload = new Upload([input]);
+    input.fill(0);
+    expect(await upload.text()).toBe("upload");
+    expect(upload.stream()).toBeInstanceOf(ReadableStream);
+    expect(upload).toBeInstanceOf(Blob);
+  });
+
+  it("provides the native file shape for FormData consumers", async () => {
+    const upload = new File(["contents"], "upload.txt", { lastModified: 123 });
+    expect(bufferModule.File).toBe(File);
+    expect(upload.name).toBe("upload.txt");
+    expect(upload.lastModified).toBe(123);
+    expect(await upload.text()).toBe("contents");
+  });
+});
 
 describe("Buffer", () => {
   describe("Buffer.from(string)", () => {

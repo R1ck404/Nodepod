@@ -123,7 +123,7 @@ export function createNodeHost(opts: NodeHostOptions = {}): RuntimeHost {
         }
         return null;
       }
-      const resolved = resolveDefaultWorkerPath();
+      const resolved = opts.workerPath ?? resolveDefaultWorkerPath();
       if (resolved) {
         workerPath = resolved;
         cachedProcessSource = null;

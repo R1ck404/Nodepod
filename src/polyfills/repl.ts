@@ -2,6 +2,9 @@
 
 
 import { EventEmitter } from "./events";
+import { builtinModules } from "./module";
+
+export const _builtinLibs = builtinModules.filter(name => !name.startsWith("node:") && !name.startsWith("_"));
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -126,6 +129,7 @@ export function start(
 /* ------------------------------------------------------------------ */
 
 export default {
+  _builtinLibs,
   start,
   REPLServer,
   Recoverable,

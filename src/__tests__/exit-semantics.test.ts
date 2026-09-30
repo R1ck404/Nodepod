@@ -8,6 +8,7 @@
 // swapped that out for a libuv-parity drain-promise model; these guard it.
 
 import { describe, it, expect } from "vitest";
+import { spawnSync as nativeSpawnSync } from "node:child_process";
 import { MemoryVolume } from "../memory-volume";
 import {
   executeNodeBinary,
@@ -37,6 +38,32 @@ function setup(files: Record<string, string>, opts: { cwd?: string; env?: Record
 const SLOP_MS = 300;
 
 describe("exit semantics - libuv-parity", () => {
+  describe("explicit exit is not an application promise rejection", () => {
+    const cases = [
+      ["fulfilled reaction", `Promise.resolve().then(() => { console.log('ok'); process.exit(0); }).catch(() => { console.error('BAD catch'); process.exit(1); }).finally(() => console.log('BAD finally'));`],
+      ["native async reaction", `(async () => {})().then(() => { console.log('ok'); process.exit(7); }).catch(() => console.error('BAD catch')).finally(() => console.log('BAD finally'));`],
+      ["async body exit", `(async () => { console.log('ok'); process.exit(5); })().catch(() => console.error('BAD catch')).finally(() => console.log('BAD finally'));`],
+      ["exit without downstream handler", `(async () => {})().then(() => { console.log('ok'); process.exit(6); });`],
+      ["promise executor", `new Promise(() => { console.log('ok'); process.exit(3); }).catch(() => console.error('BAD catch'));`],
+      ["rejection reaction", `Promise.reject(Error('expected')).catch(() => { console.log('handled'); process.exit(4); }).catch(() => console.error('BAD catch'));`],
+      ["async context", `new (require('async_hooks').AsyncLocalStorage)().run('store', () => Promise.resolve().then(() => { console.log('ok'); process.exit(0); }).catch(() => console.error('BAD catch')).finally(() => console.log('BAD finally')));`],
+      ["genuine failure", `Promise.resolve().then(() => { throw Error('real failure'); }).catch(e => { console.error(e.message); process.exit(2); });`],
+      ["similar user error", `Promise.reject(Error('Process exited with code 0')).catch(e => console.log('handled ' + e.message));`],
+      ["ordinary finally and combinators", `Promise.allSettled([Promise.resolve(1), Promise.reject(Error('real'))]).then(r => console.log(r[0].value, r[1].reason.message)).finally(() => console.log('cleanup')).then(() => console.log('done'));`],
+    ];
+    it.each(cases)("%s matches native Node", async (_name, source) => {
+      const native = nativeSpawnSync(process.execPath, ["-e", source], { encoding: "utf8" });
+      const { ctx } = setup({ "/promise-exit.cjs": source });
+      const actual = await executeNodeBinary("/promise-exit.cjs", [], ctx);
+      expect(actual).toEqual({ stdout: native.stdout, stderr: native.stderr, exitCode: native.status });
+    });
+    it("does not expose exit during synchronous top-level await unwrapping", async () => {
+      const source = `await Promise.resolve().then(() => { console.log('ok'); process.exit(8); }).catch(() => console.error('BAD catch')).finally(() => console.log('BAD finally'));`;
+      const native = nativeSpawnSync(process.execPath, ["--input-type=module", "-e", source], { encoding: "utf8" });
+      const { ctx } = setup({ "/promise-exit.mjs": source });
+      expect(await executeNodeBinary("/promise-exit.mjs", [], ctx)).toEqual({ stdout: native.stdout, stderr: native.stderr, exitCode: native.status });
+    });
+  });
   describe("shell command composition", () => {
     it("creates a virtual file with a heredoc and runs it through node", async () => {
       const { vol } = setup({}, { cwd: "/workspace" });

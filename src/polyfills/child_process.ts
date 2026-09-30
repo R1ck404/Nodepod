@@ -6,6 +6,7 @@ import type { ShellResult, ShellContext } from "../shell/shell-types";
 import { EventEmitter } from "./events";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
+import { serializeIpcMessage, type IpcSerialization } from "../helpers/ipc-serialization";
 import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
 import { getWorkerTransformCache } from "../threading/worker-transform-cache";
@@ -233,9 +234,12 @@ export type ForkChildCallback = (
   opts: {
     cwd: string;
     env: Record<string, string>;
+    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
     onIPC?: (data: unknown) => void;
+    onDisconnect?: () => void;
     onExit?: (exitCode: number) => void;
   },
 ) => {
@@ -254,11 +258,20 @@ export function setForkChildCallback(fn: ForkChildCallback): void {
 // IPC plumbing for when this worker IS a forked child
 let _ipcSendFn: ((data: unknown) => void) | null = null;
 let _ipcReceiveHandler: ((data: unknown) => void) | null = null;
+let _ipcDisconnectSend: (() => void) | null = null;
+let _ipcDisconnectHandler: (() => void) | null = null;
+let _pendingIPCDisconnect = false;
 // messages that arrive before the handler is wired (parent sends before child's ENB sets up the handler)
 let _ipcQueue: unknown[] = [];
 
-export function setIPCSend(fn: (data: unknown) => void): void {
-  _ipcSendFn = fn;
+export function setIPCSend(fn: (data: unknown) => void, serialization: IpcSerialization = "json", onDisconnect?: () => void): void {
+  _ipcSendFn = (message) => fn(serializeIpcMessage(message, serialization));
+  _ipcDisconnectSend = onDisconnect ?? null;
+}
+
+export function handleIPCDisconnect(): void {
+  if (_ipcDisconnectHandler) _ipcDisconnectHandler();
+  else _pendingIPCDisconnect = true;
 }
 
 export function setIPCReceiveHandler(fn: (data: unknown) => void): void {
@@ -1340,6 +1353,7 @@ export async function executeNodeBinary(
   ctx: ShellContext,
   opts?: {
     isFork?: boolean;
+    execArgv?: string[];
     workerThreadsOverride?: {
       isMainThread: boolean;
       parentPort: unknown;
@@ -1516,11 +1530,12 @@ export async function executeNodeBinary(
   }) as (c?: number) => never;
 
   proc.argv = ["node", resolved, ...args];
+  proc.execArgv = opts?.execArgv?.slice() ?? [];
 
   // wire IPC for forked children
   if (_ipcSendFn) {
     proc.send = ((msg: unknown, _cb?: (e: Error | null) => void): boolean => {
-      if (_ipcSendFn) {
+      if (_ipcSendFn && proc.connected) {
         _ipcSendFn(msg);
         if (typeof _cb === "function") _cb(null);
         return true;
@@ -1529,15 +1544,29 @@ export async function executeNodeBinary(
     }) as any;
     proc.connected = true;
     proc.disconnect = (() => {
+      if (!proc.connected) return;
       proc.connected = false;
+      _ipcDisconnectSend?.();
     }) as () => void;
 
     // incoming IPC from parent → emit on process (also replays queued messages).
     // a worker thread's parent messages belong to its parentPort, whose
     // receiver the worker entry already installed: keep that one.
     if (!opts?.workerThreadsOverride) {
+      const pendingMessages: unknown[] = [];
+      const flushMessages = () => {
+        if (proc.listenerCount("message") === 0) return;
+        for (const message of pendingMessages.splice(0)) proc.emit("message", message);
+      };
+      // The transport can deliver a parent's first message before the child
+      // has evaluated its entry module. Installing the internal receiver is
+      // not enough: preserve it until user code subscribes, as Node does.
+      proc.on("newListener", (event: unknown) => {
+        if (event === "message") queueMicrotask(flushMessages);
+      });
       setIPCReceiveHandler((data: unknown) => {
-        proc.emit("message", data);
+        pendingMessages.push(data);
+        flushMessages();
       });
     }
   }
@@ -1598,11 +1627,22 @@ export async function executeNodeBinary(
       }
     });
     const origDisconnect = proc.disconnect;
-    proc.disconnect = (() => {
-      origDisconnect?.call(proc);
+    const closeChannel = (notifyParent: boolean) => {
+      if (!proc.connected) return;
+      if (notifyParent) origDisconnect?.call(proc);
+      else proc.connected = false;
       ipcHandle?.close();
       ipcHandle = null;
+      queueMicrotask(() => proc.emit("disconnect"));
+    };
+    proc.disconnect = (() => {
+      closeChannel(true);
     }) as () => void;
+    _ipcDisconnectHandler = () => closeChannel(false);
+    if (_pendingIPCDisconnect) {
+      _pendingIPCDisconnect = false;
+      queueMicrotask(_ipcDisconnectHandler);
+    }
   }
 
   let scriptError: Error | null = null;
@@ -2304,17 +2344,6 @@ function isBinaryAvailable(name: string): string | null {
   return null;
 }
 
-// throw an error matching real Node.js execSync behaviour for failed commands
-function throwCommandNotFound(cmd: string): never {
-  const err: any = new Error(
-    `Command failed: ${cmd}\n/bin/sh: 1: ${cmd.split(/\s+/)[0]}: not found\n`,
-  );
-  err.status = 127;
-  err.stderr = Buffer.from(`/bin/sh: 1: ${cmd.split(/\s+/)[0]}: not found\n`);
-  err.stdout = Buffer.from("");
-  throw err;
-}
-
 function _findGitDir(cwd: string): { gitDir: string; workDir: string } | null {
   if (!_vol) return null;
   let dir = cwd;
@@ -2410,7 +2439,7 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | 
     const binName = whichMatch[1];
     const binPath = isBinaryAvailable(binName);
     if (binPath) return syncOk(binPath + "\n");
-    throwCommandNotFound(cmd);
+    return syncFail(`/bin/sh: 1: ${binName}: not found\n`, 127);
   }
 
   // <binary> --version / -v
@@ -2425,7 +2454,7 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | 
       binName === "bun"
     )
       return null; // handled above
-    if (!isBinaryAvailable(binName)) throwCommandNotFound(cmd);
+    if (!isBinaryAvailable(binName)) return syncFail(`/bin/sh: 1: ${binName}: not found\n`, 127);
     // known binary but no version handler -- fall through to async
   }
 
@@ -2979,7 +3008,14 @@ export function fork(
     cfg = opts ?? {};
   } else if (argsOrOpts) cfg = argsOrOpts;
 
+  const serialization = (cfg.serialization ?? "json") as IpcSerialization;
+  if (serialization !== "json" && serialization !== "advanced") {
+    throw new TypeError("serialization must be 'json' or 'advanced'");
+  }
+
   const cwd = (cfg.cwd as string) || getShellCwd();
+  const execArgv = (cfg.execArgv as string[] | undefined) ??
+    (globalThis as any).process?.execArgv ?? [];
   const env = (cfg.env as Record<string, string>) ||
     (_shell?.getEnv() ?? {});
 
@@ -2990,6 +3026,7 @@ export function fork(
   const child = new ShellProcess();
   child.connected = true;
   child.spawnargs = ["node", resolved, ...args];
+  child.spawnargs.splice(1, 0, ...execArgv);
   child.spawnfile = "node";
 
   if (!_forkChildFn) {
@@ -3006,6 +3043,8 @@ export function fork(
   const handle = _forkChildFn(resolved, args, {
     cwd,
     env,
+    serialization,
+    execArgv: execArgv.slice(),
     onStdout: (data: string) => {
       child.stdout?.emit("data", data);
       // also route through parent's stdout sink (fork inherits stdio by default)
@@ -3020,6 +3059,11 @@ export function fork(
     onIPC: (data: unknown) => {
       child.emit("message", data);
     },
+    onDisconnect: () => {
+      if (!child.connected) return;
+      child.connected = false;
+      child.emit("disconnect");
+    },
     onExit: (exitCode: number) => {
       childHandle.close();
       child.exitCode = exitCode;
@@ -3030,9 +3074,10 @@ export function fork(
   });
 
   // parent→child IPC
-  child.send = (msg: unknown, _cb?: (e: Error | null) => void): boolean => {
+  child.send = (msg: unknown, cb?: (e: Error | null) => void): boolean => {
     if (!child.connected) return false;
-    handle.sendIPC(msg);
+    handle.sendIPC(serializeIpcMessage(msg, serialization));
+    if (typeof cb === "function") queueMicrotask(() => cb(null));
     return true;
   };
 

@@ -121,3 +121,47 @@ describe("worker_threads children", () => {
     expect(exits).toEqual([0]);
   });
 });
+
+describe("fork IPC lifecycle", () => {
+  it("closes IPC when the parent finishes without killing the child's own work", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const owner = manager.spawn({ command: "node", args: ["parent.js"], cwd: "/", env: {} });
+    const ownerWorker = FakeWorker.instances.at(-1)!;
+    const exits: number[] = [];
+    owner.on("exit", code => exits.push(code));
+    owner.emit("fork-request", { type: "fork-request", requestId: 1, modulePath: "/child.js", args: [], cwd: "/", env: {} });
+    const childWorker = FakeWorker.instances.at(-1)!;
+    childWorker.send({ type: "ready", pid: 2 });
+    ownerWorker.send({ type: "exit", exitCode: 0 });
+    expect(childWorker.messages).toContainEqual({ type: "ipc-disconnect" });
+    expect(childWorker.messages.some(message => message.type === "signal")).toBe(false);
+    expect(exits).toEqual([]);
+    childWorker.send({ type: "exit", exitCode: 0 });
+    expect(exits).toEqual([0]);
+  });
+
+  it("relays explicit disconnects in both directions", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const owner = manager.spawn({ command: "node", args: ["parent.js"], cwd: "/", env: {} });
+    const ownerWorker = FakeWorker.instances.at(-1)!;
+    owner.emit("fork-request", { type: "fork-request", requestId: 5, modulePath: "/child.js", args: [], cwd: "/", env: {} });
+    const childWorker = FakeWorker.instances.at(-1)!;
+    childWorker.send({ type: "ready", pid: 2 });
+    ownerWorker.send({ type: "ipc-disconnect", targetRequestId: 5 });
+    expect(childWorker.messages).toContainEqual({ type: "ipc-disconnect" });
+    childWorker.send({ type: "ipc-disconnect" });
+    expect(ownerWorker.messages).toContainEqual({ type: "ipc-disconnect", targetRequestId: 5 });
+  });
+
+  it("delivers EOF after exec when the child only becomes ready after its parent exits", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const owner = manager.spawn({ command: "node", args: ["parent.js"], cwd: "/", env: {} });
+    const ownerWorker = FakeWorker.instances.at(-1)!;
+    owner.emit("fork-request", { type: "fork-request", requestId: 6, modulePath: "/child.js", args: [], cwd: "/", env: {} });
+    const childWorker = FakeWorker.instances.at(-1)!;
+    ownerWorker.send({ type: "exit", exitCode: 0 });
+    expect(childWorker.messages.some(message => message.type === "ipc-disconnect")).toBe(false);
+    childWorker.send({ type: "ready", pid: 2 });
+    expect(childWorker.messages.slice(-2).map(message => message.type)).toEqual(["exec", "ipc-disconnect"]);
+  });
+});

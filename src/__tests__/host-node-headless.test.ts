@@ -169,6 +169,123 @@ describe("node headless host", () => {
     await pod.teardown();
   }, 60_000);
 
+  it("preserves compiled WASM memory requirements through workerData and return messages", async () => {
+    setRuntimeHost(createNodeHost({ workerPath }));
+    // env.memory: shared, 32-page minimum, 65536-page maximum.
+    const bytes = [0,97,115,109,1,0,0,0,2,18,1,3,101,110,118,6,109,101,109,111,114,121,2,3,32,128,128,4];
+    const receiver = `
+      const {parentPort,workerData}=require('worker_threads');
+      const memory=new WebAssembly.Memory({initial:4096,maximum:65536,shared:true});
+      new WebAssembly.Instance(workerData.module,{env:{memory}});
+      parentPort.postMessage({capacity:memory.buffer.byteLength,module:workerData.module});
+    `;
+    const pod = await Nodepod.boot({
+      workdir: "/app", packageStore: "memory", enableSnapshotCache: false,
+      files: { "/app/main.js": `
+        const {Worker}=require('worker_threads');
+        const module=new WebAssembly.Module(new Uint8Array(${JSON.stringify(bytes)}));
+        const worker=new Worker(${JSON.stringify(receiver)},{eval:true,workerData:{module}});
+        worker.on('message',result=>{
+          const memory=new WebAssembly.Memory({initial:4096,maximum:65536,shared:true});
+          new WebAssembly.Instance(result.module,{env:{memory}});
+          console.log(JSON.stringify([result.capacity,memory.buffer.byteLength]));
+          worker.terminate();
+        });
+      ` },
+    });
+    try {
+      const result = await (await pod.spawn("node", ["main.js"], { cwd: "/app" })).completion;
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout.trim())).toEqual([2 * 1024 * 1024, 2 * 1024 * 1024]);
+    } finally {
+      await pod.teardown();
+    }
+  }, 60_000);
+
+  it("round-trips fork IPC in JSON and advanced modes and forwards execArgv conditions", async () => {
+    setRuntimeHost(createNodeHost({ workerPath }));
+    const pod = await Nodepod.boot({
+      workdir: "/app", packageStore: "memory", enableSnapshotCache: false,
+      files: {
+        "/app/node_modules/condition-probe/package.json": JSON.stringify({ exports: { custom: "./custom.js", default: "./default.js" } }),
+        "/app/node_modules/condition-probe/custom.js": "module.exports='custom';",
+        "/app/node_modules/condition-probe/default.js": "module.exports='default';",
+        "/app/child.js": `
+          process.on('message', message=>{
+            process.send({message, callback:()=>{}, condition:require('condition-probe'), execArgv:process.execArgv});
+          });
+        `,
+        "/app/advanced.js": `process.on('message',message=>process.send(message));`,
+        "/app/main.js": `
+          const {fork}=require('child_process');
+          const json=fork('./child.js',[],{execArgv:['--conditions=custom']});
+          json.on('message', result=>{
+            console.log('json',JSON.stringify(result)); json.kill();
+            const advanced=fork('./advanced.js',[],{serialization:'advanced'});
+            advanced.on('message', result=>{
+              console.log('advanced',result.self===result,result.map.get('answer')===42n,result.date instanceof Date);
+              advanced.kill();
+            });
+            const rich={map:new Map([['answer',42n]]),date:new Date(123)};rich.self=rich;
+            advanced.send(rich);
+          });
+          json.send({callback:()=>{},date:new Date(123),absent:undefined,list:[undefined,NaN]});
+        `,
+      },
+    });
+    try {
+      const process = await pod.spawn("node", ["main.js"], { cwd: "/app" });
+      const chunks: string[] = [];
+      process.on("output", chunk=>chunks.push(chunk));
+      process.on("error", chunk=>chunks.push(chunk));
+      let timer: ReturnType<typeof setTimeout>;
+      const result = await Promise.race([process.completion, new Promise<never>((_, reject)=>{timer=setTimeout(()=>reject(new Error(chunks.join(""))), 10_000);})]).finally(()=>clearTimeout(timer));
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      const lines = result.stdout.trim().split("\n");
+      expect(JSON.parse(lines[0].slice(5))).toEqual({
+        message: { date: "1970-01-01T00:00:00.123Z", list: [null, null] },
+        condition: "custom", execArgv: ["--conditions=custom"],
+      });
+      expect(lines[1]).toBe("advanced true true true");
+    } finally {
+      await pod.teardown();
+    }
+  }, 60_000);
+
+  it("disconnects idle fork IPC on parent exit and preserves the child's subsequent work", async () => {
+    setRuntimeHost(createNodeHost({ workerPath }));
+    const pod = await Nodepod.boot({
+      workdir: "/app", packageStore: "memory", enableSnapshotCache: false,
+      files: {
+        "/app/parent.js": `
+          const child=require('child_process').fork('./child.js');
+          child.on('message',()=>{ child.unref(); console.log('parent done'); });
+        `,
+        "/app/child.js": `
+          process.on('message',()=>{});
+          process.on('disconnect',()=>{
+            console.log('disconnected',process.connected);
+            setTimeout(()=>console.log('child work survived'),20);
+          });
+          process.send('ready');
+        `,
+      },
+    });
+    try {
+      const child = await pod.spawn("node", ["parent.js"], { cwd: "/app" });
+      const chunks: string[] = [];
+      child.on("output", chunk=>chunks.push(chunk));
+      let timer: ReturnType<typeof setTimeout>;
+      const result = await Promise.race([child.completion, new Promise<never>((_, reject)=>{timer=setTimeout(()=>reject(new Error(chunks.join(""))), 5000);})]).finally(()=>clearTimeout(timer));
+      expect(result.exitCode).toBe(0);
+      expect(chunks.join("")).toContain("parent done\n");
+      expect(chunks.join("")).toContain("disconnected false\n");
+      expect(chunks.join("")).toContain("child work survived\n");
+    } finally { await pod.teardown(); }
+  }, 15_000);
+
   it("keeps active-server URLs byte-for-byte unchanged in spawn output", async () => {
     setRuntimeHost(
       createNodeHost({

@@ -94,6 +94,7 @@ interface PackState {
   // a round then costs the main thread only the copies it hands over, so
   // rounds also run right after an install instead of waiting for quiet
   deflate: ((bytes: Uint8Array) => Promise<Uint8Array>) | null;
+  packWasm: boolean;
   // package bytes written since the last round started
   packageBytes: number;
   afterWritesTimer: ReturnType<typeof setTimeout> | null;
@@ -1624,7 +1625,11 @@ export class MemoryVolume {
    * PackedChunk). Main thread only: rounds run after the volume has been
    * quiet for a while and yield between slices; reads stay synchronous.
    */
-  enableContentPacking(opts: { deflate?: (bytes: Uint8Array) => Promise<Uint8Array> } = {}): void {
+  enableContentPacking(opts: {
+    deflate?: (bytes: Uint8Array) => Promise<Uint8Array>;
+    /** Compress dormant WASM binaries too; a later read must inflate them. */
+    packWasm?: boolean;
+  } = {}): void {
     if (this._packState || this._missHandler || this._disposed) return;
     this._packState = {
       timer: null,
@@ -1634,6 +1639,7 @@ export class MemoryVolume {
       generation: 0,
       lastRead: new WeakMap(),
       deflate: opts.deflate ?? null,
+      packWasm: opts.packWasm ?? false,
       packageBytes: 0,
       afterWritesTimer: null,
       lastReadAt: 0,
@@ -1754,7 +1760,10 @@ export class MemoryVolume {
     for (const member of members) {
       const ref = member.packed;
       if (!ref || ref.chunk !== chunk) continue;
-      member.content = bytes.slice(ref.offset, ref.offset + ref.length);
+      // Every member is becoming resident, so share the inflated slab rather
+      // than allocate/copy one ArrayBuffer per file. A later packing round
+      // compacts it if only a few members remain resident.
+      member.content = bytes.subarray(ref.offset, ref.offset + ref.length);
       member.packed = undefined;
     }
     this._inflatedChunks = this._inflatedChunks.filter((c) => c.chunk !== chunk);
@@ -1875,9 +1884,10 @@ export class MemoryVolume {
         const bytes = node.inode ? node.inode.content : node.content;
         if (!bytes) continue;
         if (bytes.byteLength !== bytes.buffer.byteLength) views.push(node);
-        // package.json: read by every resolver. wasm: a tool's engine,
-        // loaded whole at its startup, and it only halves
-        if (name === 'package.json' || name.endsWith('.wasm') || bytes.byteLength < PACK_MIN_FILE_BYTES) continue;
+        // Manifests are read by every resolver. Other formats, including
+        // dormant WASM binaries, use the same read-generation policy.
+        if (name === "package.json" || bytes.byteLength < PACK_MIN_FILE_BYTES) continue;
+        if (name.endsWith(".wasm") && !state.packWasm) continue;
         if (node.inode && !this._packable(node.inode, state)) continue;
         candidates.push([node, COLD_PACKAGE_FILE.test(name) ? 1 : 0]);
       }
@@ -1920,13 +1930,7 @@ export class MemoryVolume {
       }
       for (const g of groups) if (g.inodes.length > 0) await flush(g);
       await Promise.all(offThread);
-      // what stays unpacked gets buffers of its own
-      for (const node of views) {
-        if (node.kind !== 'file') continue;
-        const holder = node.inode ?? node;
-        const bytes = holder.content;
-        if (bytes && bytes.byteLength !== bytes.buffer.byteLength) holder.content = new Uint8Array(bytes);
-      }
+      this._compactResidentViews(views);
       completed = true;
     } finally {
       // an aborted round still lets its handed-over groups land (or bail)
@@ -1943,6 +1947,51 @@ export class MemoryVolume {
       if (this._packState === state && state.lastActivity > started && !state.timer) {
         this._schedulePackCheck(PACK_QUIET_MS);
       }
+    }
+  }
+
+  // Drop mostly-dead snapshot buffers without returning to one allocation
+  // per small file. Dense slabs stay shared; sparse ones are repacked into
+  // bounded, fully occupied slabs. Hardlink aliases are counted once.
+  private _compactResidentViews(nodes: VolumeNode[]): void {
+    type Holder = VolumeFileInode | VolumeNode;
+    const seen = new Set<Holder>();
+    const buffers = new Map<ArrayBufferLike, { holders: Holder[]; bytes: number }>();
+    for (const node of nodes) {
+      const holder = node.inode ?? node;
+      const content = holder.content;
+      if (!content || seen.has(holder) || content.byteLength === content.buffer.byteLength) continue;
+      seen.add(holder);
+      let group = buffers.get(content.buffer);
+      if (!group) buffers.set(content.buffer, group = { holders: [], bytes: 0 });
+      group.holders.push(holder);
+      group.bytes += content.byteLength;
+    }
+    for (const [buffer, group] of buffers) {
+      if (group.bytes >= buffer.byteLength * 0.75) continue;
+      let batch: Holder[] = [];
+      let size = 0;
+      const flush = () => {
+        if (batch.length === 0) return;
+        const slab = new Uint8Array(size);
+        let offset = 0;
+        for (const holder of batch) {
+          const content = holder.content!;
+          slab.set(content, offset);
+          holder.content = slab.subarray(offset, offset + content.byteLength);
+          offset += content.byteLength;
+        }
+        batch = [];
+        size = 0;
+      };
+      for (const holder of group.holders) {
+        const length = holder.content!.byteLength;
+        if (size > 0 && size + length > PACK_CHUNK_BYTES) flush();
+        batch.push(holder);
+        size += length;
+        if (size >= PACK_CHUNK_BYTES) flush();
+      }
+      flush();
     }
   }
 
@@ -1967,6 +2016,8 @@ export class MemoryVolume {
       return;
     }
     if (this._packState !== state) return;
+    // The off-thread deflater can transfer joined.buffer, detaching it.
+    if (deflated.byteLength >= size) return;
     const chunk: PackedChunk = { bytes: deflated };
     const members: VolumeFileInode[] = [];
     for (let i = 0; i < group.length; i++) {
@@ -1988,7 +2039,9 @@ export class MemoryVolume {
       joined.set(inode.content!, offset);
       offset += inode.content!.byteLength;
     }
-    const chunk: PackedChunk = { bytes: pako.deflateRaw(joined, { level: 1 }) };
+    const bytes = pako.deflateRaw(joined, { level: 1 });
+    if (bytes.byteLength >= joined.byteLength) return;
+    const chunk: PackedChunk = { bytes };
     for (let i = 0; i < group.length; i++) {
       const inode = group[i];
       inode.packed = { chunk, offset: offsets[i], length: inode.content!.byteLength };
@@ -2013,6 +2066,7 @@ export class MemoryVolume {
       deflater.push(bytes.subarray(offset, end), end === bytes.byteLength);
     }
     if (deflater.err || !(deflater.result instanceof Uint8Array)) return true;
+    if (deflater.result.byteLength >= bytes.byteLength) return true;
     if (inode.content !== bytes || !this._packable(inode, state)) return true;
     inode.packed = { chunk: { bytes: deflater.result }, offset: 0, length: bytes.byteLength };
     inode.content = undefined;

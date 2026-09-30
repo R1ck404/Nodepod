@@ -16,7 +16,7 @@ import {
 } from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
-import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
+import type { FsReadStreamInstance, FsReadableState, FsWriteStreamInstance, FsWriteStreamOptions } from "../types/fs-streams";
 import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop";
 import { setImmediate as scheduleImmediate } from "./timers";
 import { settledPromise, settledResolve, settledReject } from "../helpers/sync-scope";
@@ -587,10 +587,10 @@ export interface FsBridge {
   ): import("./stream").Readable;
   createWriteStream(
     target: string,
-    opts?: { encoding?: string; flags?: string },
-  ): import("./stream").Writable;
+    opts?: FsWriteStreamOptions,
+  ): FsWriteStreamInstance;
   ReadStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Readable;
-  WriteStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Writable;
+  WriteStream: new (path: unknown, opts?: FsWriteStreamOptions) => FsWriteStreamInstance;
   cpSync(src: unknown, dest: unknown, opts?: CpOptions): void;
   cp(src: unknown, dest: unknown, optsOrCb?: unknown, cb?: (err: Error | null) => void): void;
   readvSync(fd: number, buffers: ArrayBufferView[], pos?: number | null): number;
@@ -716,6 +716,23 @@ function ownFdData(entry: OpenFile): void {
   if (entry.borrowed === undefined) return;
   if (entry.data === entry.borrowed) entry.data = new Uint8Array(entry.data);
   entry.borrowed = undefined;
+}
+
+// Keep logical length separate from spare backing capacity. Sequential small
+// writes otherwise allocate and copy the entire file on every append.
+function extendFdData(entry: OpenFile, length: number): void {
+  ownFdData(entry);
+  if (length <= entry.data.length) return;
+  const previous = entry.data;
+  const capacity = previous.buffer.byteLength - previous.byteOffset;
+  if (length <= capacity) {
+    entry.data = new Uint8Array(previous.buffer, previous.byteOffset, length);
+    entry.data.fill(0, previous.length);
+  } else {
+    const storage = new Uint8Array(Math.max(length, capacity * 2));
+    storage.set(previous);
+    entry.data = storage.subarray(0, length);
+  }
 }
 
 /** Key of the fs bridge's proxy helpers (a symbol, so user code never meets them). */
@@ -1354,16 +1371,12 @@ export function buildFileSystemBridge(
         len = length ?? bytes.length - off;
         pos = position;
       }
-      const writeAt = pos !== null && pos !== undefined ? pos : entry.cursor;
+      const append = entry.mode.includes("a");
+      const writeAt = append ? entry.data.length : pos !== null && pos !== undefined ? pos : entry.cursor;
       const endAt = writeAt + len;
-      if (endAt > entry.data.length) {
-        const expanded = new Uint8Array(endAt);
-        expanded.set(entry.data);
-        entry.data = expanded;
-      }
-      ownFdData(entry);
+      extendFdData(entry, endAt);
       copyBytes(entry.data, writeAt, bytes, off, len);
-      if (pos === null || pos === undefined) entry.cursor = endAt;
+      if (append || pos === null || pos === undefined) entry.cursor = endAt;
       return Promise.resolve({ bytesWritten: len, buffer: buf });
     }
 
@@ -1384,12 +1397,7 @@ export function buildFileSystemBridge(
       for (const buf of buffers) {
         const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
         const endAt = writePos + u8.length;
-        if (endAt > entry.data.length) {
-          const expanded = new Uint8Array(endAt);
-          expanded.set(entry.data);
-          entry.data = expanded;
-        }
-        ownFdData(entry);
+        extendFdData(entry, endAt);
         copyBytes(entry.data, writePos, u8, 0, u8.length);
         writePos += u8.length;
         totalWritten += u8.length;
@@ -1801,7 +1809,9 @@ export function buildFileSystemBridge(
 
     try {
       const raw = volume.readFileSync(wasmPath);
-      if (wasmPath.endsWith(".wasm")) precompileWasm(raw);
+      // Synchronous WASM loaders compile immediately after this read. Starting
+      // an asynchronous warm-up here retained another full binary and could
+      // compile it again before that loader's constructor reached the cache.
       return raw;
     } catch (err: any) {
       // .wasm under node_modules missing from the VFS (e.g. >15MB binary
@@ -1872,9 +1882,6 @@ export function buildFileSystemBridge(
         }
       } finally {
         bridge.closeSync(fd);
-      }
-      if (wp.endsWith(".wasm")) {
-        precompileWasm(bytes);
       }
     },
 
@@ -2188,19 +2195,14 @@ export function buildFileSystemBridge(
         len = len ?? bytes.length - off;
       }
 
-      const writeAt = pos !== null && pos !== undefined ? pos : entry.cursor;
+      const append = entry.mode.includes("a");
+      const writeAt = append ? entry.data.length : pos !== null && pos !== undefined ? pos : entry.cursor;
       const endAt = writeAt + len;
 
-      if (endAt > entry.data.length) {
-        const expanded = new Uint8Array(endAt);
-        expanded.set(entry.data);
-        entry.data = expanded;
-      }
-
-      ownFdData(entry);
+      extendFdData(entry, endAt);
       copyBytes(entry.data, writeAt, bytes, off, len);
 
-      if (pos === null || pos === undefined) entry.cursor = endAt;
+      if (append || pos === null || pos === undefined) entry.cursor = endAt;
       return len;
     },
 
@@ -3057,152 +3059,105 @@ export function buildFileSystemBridge(
       return FsReadStream as any;
     })(),
 
-    // function constructor, not class -- graceful-fs calls fs$WriteStream.apply(this, args)
+    // Function constructor: graceful-fs calls WriteStream.apply(this, args).
     WriteStream: (() => {
-      function FsWriteStream(this: FsWriteStreamInstance, pathArg: unknown, opts?: Record<string, unknown>) {
-        if (!(this instanceof FsWriteStream)) return new (FsWriteStream as unknown as new (p: unknown, o?: Record<string, unknown>) => FsWriteStreamInstance)(pathArg, opts);
-        const self: FsWriteStreamInstance = this;
-        self._parts = [];
-        self._closed = false;
-        self._objectMode = false;
-        self._highWaterMark = 16384;
-        self._autoDestroy = true;
-        self._corked = 0;
-        self._corkedWrites = [];
-        self._writableByteLength = 0;
-        self.writable = true;
-        self.writableEnded = false;
-        self.writableFinished = false;
-        self.writableNeedDrain = false;
-        self.destroyed = false;
-        self.closed = false;
-        self.errored = null;
-        self.writableObjectMode = false;
-        self.writableHighWaterMark = 16384;
-        self.writableCorked = 0;
-        self._writableState = {
-          get objectMode() { return self._objectMode; },
-          get highWaterMark() { return self._highWaterMark; },
-          get finished() { return self.writableFinished; },
-          set finished(v: boolean) { self.writableFinished = v; },
-          get ended() { return self.writableEnded; },
-          set ended(v: boolean) { self.writableEnded = v; },
-          get destroyed() { return self.destroyed; },
-          get errored() { return self.errored; },
-          get closed() { return self.closed; },
-          get corked() { return self._corked; },
-          get length() { return self._writableByteLength; },
-          get needDrain() { return self.writableNeedDrain; },
-          writing: false,
-          errorEmitted: false,
-          emitClose: true,
-          get autoDestroy() { return self._autoDestroy; },
-          defaultEncoding: "utf8",
-          finalCalled: false,
-          ending: false,
-          bufferedIndex: 0,
-        };
+      function FsWriteStream(this: FsWriteStreamInstance, pathArg: unknown, opts?: FsWriteStreamOptions) {
+        if (!(this instanceof FsWriteStream)) return new (FsWriteStream as unknown as FsBridge["WriteStream"])(pathArg, opts);
+        const self = this;
+        Writable.call(self, { ...opts, autoDestroy: opts?.autoClose !== false });
         self.path = abs(pathArg);
-        self.fd = (opts?.fd as number | null) ?? null;
-        self.flags = (opts?.flags as string) ?? "w";
-        self.mode = (opts?.mode as number) ?? 0o666;
+        self.fd = opts?.fd ?? null;
+        self.flags = opts?.flags ?? "w";
+        self.mode = opts?.mode ?? 0o666;
         self.autoClose = opts?.autoClose !== false;
         self.bytesWritten = 0;
-        self._chunks = [] as Uint8Array[];
-        self._enc = new TextEncoder();
-        queueMicrotask(() => self.open());
+        self.pos = opts?.start;
+        queueMicrotask(() => {
+          if (self.destroyed) return;
+          if (self.fd === null) self.open();
+          else self.emit("ready");
+        });
       }
       FsWriteStream.prototype = Object.create(Writable.prototype);
       FsWriteStream.prototype.constructor = FsWriteStream;
-
-      FsWriteStream.prototype.open = function () {
+      FsWriteStream.prototype.open = function (this: FsWriteStreamInstance) {
         try {
           this.fd = bridge.openSync(this.path, this.flags, this.mode);
           this.emit("open", this.fd);
           this.emit("ready");
         } catch (err) {
-          this.destroy(err);
+          this.destroy(err as Error);
         }
       };
-
-      FsWriteStream.prototype._write = function (
-        chunk: Uint8Array | string,
-        _encoding: string,
-        callback: (err?: Error | null) => void,
-      ) {
-        const bytes =
-          typeof chunk === "string" ? this._enc.encode(chunk) : chunk;
-        this._chunks.push(bytes);
-        this.bytesWritten += bytes.length;
-        callback(null);
+      FsWriteStream.prototype._write = function (this: FsWriteStreamInstance, chunk: Uint8Array | string, encoding: string, cb: (err?: Error | null) => void) {
+        if (this.fd === null) {
+          this.once("open", () => this._write(chunk, encoding, cb));
+          return;
+        }
+        let error: Error | null = null;
+        try {
+          const bytes = typeof chunk === "string" ? normalizeWriteData(chunk, encoding) : chunk;
+          const count = bridge.writeSync(this.fd, bytes as Buffer, 0, bytes.length, this.pos ?? null);
+          this.bytesWritten += count;
+          if (this.pos !== undefined) this.pos += count;
+        } catch (err) {
+          error = err as Error;
+        }
+        // User callbacks run after write() returns and outside the I/O catch.
+        // A callback exception must never trigger a second invocation.
+        deferCallback(() => cb(error));
       };
-
-      FsWriteStream.prototype.close = function (cb?: (err?: Error | null) => void) {
-        this._flushChunks();
-        if (this.fd !== null) {
-          try {
+      FsWriteStream.prototype._final = function (this: FsWriteStreamInstance, cb: (err?: Error | null) => void) {
+        if (this.fd === null) {
+          this.once("open", () => this._final(cb));
+          return;
+        }
+        let error: Error | null = null;
+        try {
+          if (this.autoClose) {
             bridge.closeSync(this.fd);
-          } catch {}
-          this.fd = null;
+            this.fd = null;
+          } else bridge.fsyncSync(this.fd);
+        } catch (err) {
+          error = err as Error;
         }
-        this.emit("finish");
-        this.emit("close");
-        if (cb) cb(null);
+        deferCallback(() => cb(error));
       };
-
-      FsWriteStream.prototype._flushChunks = function () {
-        if (!this._chunks || this._chunks.length === 0) return;
-        if (this.fd === null) return;
-        const totalLen = this._chunks.reduce((sum: number, c: Uint8Array) => sum + c.length, 0);
-        const merged = new Uint8Array(totalLen);
-        let pos = 0;
-        for (const c of this._chunks) {
-          merged.set(c, pos);
-          pos += c.length;
-        }
-        // write into the FD buffer so closeSync persists the same bytes
-        // (bypass writeFileSync — that would be wiped by closeSync's empty FD)
-        const isAppend = typeof this.flags === "string" && this.flags.includes("a");
-        const writePos = isAppend ? null : 0;
-        if (!isAppend) {
-          bridge.ftruncateSync(this.fd, 0);
-        }
-        bridge.writeSync(this.fd, merged as unknown as Buffer, 0, merged.length, writePos);
-        this._chunks = [];
-      };
-
-      FsWriteStream.prototype.end = function (chunkOrCb?: any, encOrCb?: any, cb?: any) {
-        if (typeof chunkOrCb === "function") {
-          cb = chunkOrCb;
-          chunkOrCb = undefined;
-        } else if (typeof encOrCb === "function") {
-          cb = encOrCb;
-          encOrCb = undefined;
-        }
-        if (chunkOrCb !== undefined) {
-          const bytes =
-            typeof chunkOrCb === "string"
-              ? this._enc.encode(chunkOrCb)
-              : chunkOrCb;
-          this._chunks.push(bytes);
-          this.bytesWritten += bytes.length;
-        }
-        this._flushChunks();
-        if (this.fd !== null && this.autoClose) {
-          try {
+      FsWriteStream.prototype._destroy = function (this: FsWriteStreamInstance, err: Error | null, cb: (err?: Error | null) => void) {
+        let error = err;
+        try {
+          if (this.fd !== null && this.autoClose) {
             bridge.closeSync(this.fd);
-          } catch {}
-          this.fd = null;
+            this.fd = null;
+          }
+        } catch (closeError) {
+          error ??= closeError as Error;
         }
-        this.emit("finish");
-        this.emit("close");
-        if (cb) cb();
-        return this;
+        cb(error);
       };
-
-      return FsWriteStream as any;
+      FsWriteStream.prototype.end = function (this: FsWriteStreamInstance, chunkOrCb?: any, encOrCb?: any, cb?: () => void) {
+        if (typeof chunkOrCb === "function") cb = chunkOrCb;
+        else {
+          if (typeof encOrCb === "function") cb = encOrCb;
+          if (chunkOrCb !== undefined) this.write(chunkOrCb, typeof encOrCb === "string" ? encOrCb : undefined);
+        }
+        // end() flushes all nested corks before finalizing the descriptor.
+        while (this._corked > 0) this.uncork();
+        return Writable.prototype.end.call(this, cb);
+      };
+      FsWriteStream.prototype.close = function (this: FsWriteStreamInstance, cb?: () => void) {
+        if (cb) {
+          if (this.closed) queueMicrotask(cb);
+          else this.once("close", cb);
+        }
+        // Explicit close also owns the descriptor when autoClose was disabled.
+        this.autoClose = true;
+        this._autoDestroy = true;
+        if (!this.writableEnded) this.end();
+        else if (this.writableFinished && !this.closed) this.destroy();
+      };
+      return FsWriteStream as unknown as FsBridge["WriteStream"];
     })(),
-
     createReadStream(
       target: unknown,
       opts?: { encoding?: string; start?: number; end?: number; highWaterMark?: number; flags?: string; mode?: number; autoClose?: boolean; fd?: number },
@@ -3210,97 +3165,8 @@ export function buildFileSystemBridge(
       return new (bridge.ReadStream as any)(target, opts);
     },
 
-    createWriteStream(
-      target: unknown,
-      opts?: { encoding?: string; flags?: string },
-    ): Writable {
-      const p = abs(target);
-      const isAppend = opts?.flags === "a";
-      const chunks: Uint8Array[] = [];
-      const enc = new TextEncoder();
-      let bytesWritten = 0;
-      let closed = false;
-
-      const stream: any = new Writable();
-      stream.path = p;
-      stream.fd = null;
-      stream.open = function () {
-        stream.fd = 43;
-        stream.emit("open", stream.fd);
-      };
-      Object.defineProperty(stream, "bytesWritten", {
-        get: () => bytesWritten,
-        enumerable: true,
-      });
-      queueMicrotask(() => stream.open());
-
-      const flushAndClose = function (cb?: (err?: Error | null) => void) {
-        if (closed) {
-          if (cb) cb(null);
-          return;
-        }
-        closed = true;
-        const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
-        const merged = new Uint8Array(totalLen);
-        let pos = 0;
-        for (const c of chunks) {
-          merged.set(c, pos);
-          pos += c.length;
-        }
-
-        try {
-          if (isAppend) {
-            volume.appendFileSync(p, merged);
-          } else {
-            volume.writeFileSync(p, merged);
-          }
-        } catch (e) {
-          if (cb) cb(e as Error);
-          return;
-        }
-
-        stream.emit("finish");
-        stream.emit("close");
-        if (cb) cb(null);
-      };
-
-      stream.write = function (
-        chunk: Uint8Array | string,
-        encOrCb?: string | ((err?: Error | null) => void),
-        cb?: (err?: Error | null) => void,
-      ): boolean {
-        const bytes = typeof chunk === "string" ? enc.encode(chunk) : chunk;
-        chunks.push(bytes);
-        bytesWritten += bytes.length;
-        const callback = typeof encOrCb === "function" ? encOrCb : cb;
-        if (callback) queueMicrotask(() => callback(null));
-        return true;
-      };
-
-      stream.end = function (
-        chunkOrCb?: Uint8Array | string | (() => void),
-        encOrCb?: string | (() => void),
-        cb?: () => void,
-      ): Writable {
-        if (typeof chunkOrCb === "function") {
-          cb = chunkOrCb;
-        } else if (chunkOrCb !== undefined) {
-          const bytes =
-            typeof chunkOrCb === "string" ? enc.encode(chunkOrCb) : chunkOrCb;
-          chunks.push(bytes);
-          bytesWritten += bytes.length;
-        }
-        if (typeof encOrCb === "function") cb = encOrCb;
-
-        flushAndClose(cb as any);
-        return stream;
-      };
-
-      stream.close = function (cb?: (err?: Error | null) => void) {
-        flushAndClose(cb);
-      };
-
-      return stream;
+    createWriteStream(target: unknown, opts?: FsWriteStreamOptions): FsWriteStreamInstance {
+      return new bridge.WriteStream(target, opts);
     },
     opendirSync(target: unknown, _opts?: unknown): Dir {
       const p = abs(target);

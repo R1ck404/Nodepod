@@ -41,15 +41,15 @@ import {
 const RESOLVER_CACHE_VERSION = 3;
 const MATERIALIZE_ATTEMPTS = 3;
 const MATERIALIZE_RETRY_DELAY_MS = 750;
-const SNAPSHOT_CACHE_VERSION = 4;
+const SNAPSHOT_CACHE_VERSION = 5;
 const TRANSFORMER_CACHE_VERSION = `esbuild-wasm@${PINNED_ESBUILD_WASM}:cjs-esnext-neutral-v1`;
 
 // Some package managers and bundlers derive their WASI package name at
 // runtime instead of declaring it in optionalDependencies. Keep this generic:
-// discover the standard wasm32-wasi package convention from the installed
+// discover standard WASI and wasm-bindgen package conventions from installed
 // package code rather than naming a particular tool or binding.
 const WASI_PACKAGE_REFERENCE_RE =
-  /["'`]((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+-wasm32-wasi)(?:\/[^"'`\\]*)?["'`]/gi;
+  /["'`]((?:@[a-z0-9._~-]+\/)?[a-z0-9._~-]+-(?:wasm32-wasi|wasm-nodejs|wasm-web))(?:\/[^"'`\\]*)?["'`]/gi;
 const WASI_SOURCE_EXTENSIONS = new Set([
   ".cjs",
   ".js",
@@ -58,7 +58,7 @@ const WASI_SOURCE_EXTENSIONS = new Set([
   ".mts",
   ".ts",
 ]);
-const WASI_CONVENTION_RE = /-wasm32-wasi/i;
+const WASI_CONVENTION_RE = /-wasm(?:32-wasi|-nodejs|-web)/i;
 // type declarations never load a binding at runtime
 const TYPE_DECLARATION_RE = /\.d\.[cm]?ts$/i;
 
@@ -67,7 +67,7 @@ const TYPE_DECLARATION_RE = /\.d\.[cm]?ts$/i;
 // instead of on every install and every companion pass.
 const wasiReferenceCache = new Map<string, string[]>();
 
-/** Return literal npm package references using the wasm32-wasi convention. */
+/** Return literal npm package references using standard WASM conventions. */
 export function findWasiPackageReferences(source: string): string[] {
   // literal search first: almost no file mentions the convention, and the
   // capturing regex costs far more than this on megabytes of source
@@ -79,23 +79,22 @@ export function findWasiPackageReferences(source: string): string[] {
   return [...references];
 }
 
-// "-wasm32-wasi" in raw bytes, ASCII case-insensitive like
-// WASI_CONVENTION_RE: finds the few files worth decoding without decoding
-// the rest. Anchored on "32-", the case-invariant middle.
+// Find the convention before decoding source; nonmatching files incur no
+// string copy, even for large bundles.
 export function bytesMentionWasiConvention(bytes: Uint8Array): boolean {
   const lower = (b: number): number => (b >= 0x41 && b <= 0x5a ? b + 32 : b);
-  for (let i = bytes.indexOf(0x33, 5); i !== -1 && i + 6 < bytes.length; i = bytes.indexOf(0x33, i + 1)) {
-    if (bytes[i + 1] !== 0x32 || bytes[i + 2] !== 0x2d) continue;
+  const matches = (at: number, text: string): boolean => {
+    if (at + text.length > bytes.length) return false;
+    for (let n = 0; n < text.length; n++) if (lower(bytes[at + n]) !== text.charCodeAt(n)) return false;
+    return true;
+  };
+  for (let i = bytes.indexOf(0x2d); i !== -1 && i + 4 < bytes.length; i = bytes.indexOf(0x2d, i + 1)) {
     if (
-      bytes[i - 5] === 0x2d &&
-      lower(bytes[i - 4]) === 0x77 && // w
-      lower(bytes[i - 3]) === 0x61 && // a
-      lower(bytes[i - 2]) === 0x73 && // s
-      lower(bytes[i - 1]) === 0x6d && // m
-      lower(bytes[i + 3]) === 0x77 && // w
-      lower(bytes[i + 4]) === 0x61 && // a
-      lower(bytes[i + 5]) === 0x73 && // s
-      lower(bytes[i + 6]) === 0x69 // i
+      lower(bytes[i + 1]) === 0x77 &&
+      lower(bytes[i + 2]) === 0x61 &&
+      lower(bytes[i + 3]) === 0x73 &&
+      lower(bytes[i + 4]) === 0x6d &&
+      (matches(i + 5, "32-wasi") || matches(i + 5, "-nodejs") || matches(i + 5, "-web"))
     ) {
       return true;
     }

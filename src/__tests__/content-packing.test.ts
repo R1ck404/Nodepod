@@ -133,14 +133,16 @@ describe("content packing", () => {
     expect(new TextDecoder().decode(handle.read())).toBe(source(2, 9000));
   });
 
-  it("leaves wasm binaries unpacked", async () => {
+  it("packs cold wasm bytes and keeps recently read engines hot", async () => {
     const vol = new MemoryVolume();
     vol.writeFileSync("/node_modules/engine/engine.wasm", source(5, 40000));
     vol.writeFileSync("/node_modules/engine/index.js", source(6, 4000));
-    vol.enableContentPacking();
+    vol.enableContentPacking({ packWasm: true });
     await vol.packContentNow();
-    expect(vol.getStats().packedFiles).toBe(1);
+    expect(vol.getStats().packedFiles).toBe(2);
     expect(vol.readFileSync("/node_modules/engine/engine.wasm", "utf8")).toBe(source(5, 40000));
+    await vol.packContentNow();
+    expect(vol.inspectNode("/node_modules/engine/engine.wasm")?.content).toBeDefined();
   });
 
   it("does nothing until enabled", async () => {
@@ -171,14 +173,53 @@ describe("content packing of mounted packs", () => {
     }
     const vol = new MemoryVolume();
     vol.mountBinarySnapshot({ manifest, data: data.buffer });
-    vol.enableContentPacking();
+    vol.enableContentPacking({ packWasm: true });
     await vol.packContentNow();
-    expect(vol.getStats().packedFiles).toBe(1);
+    expect(vol.getStats().packedFiles).toBe(2);
     for (const [path, bytes] of files) {
       const read = vol.peekFileSync(path);
       expect(read).toEqual(bytes);
-      if (!path.endsWith("index.js")) expect(read.buffer.byteLength).toBe(read.byteLength);
+      if (path.endsWith("package.json") || path.endsWith("tiny.js")) {
+        expect(read.buffer).not.toBe(data.buffer);
+        expect(read.buffer.byteLength).toBeLessThan(total);
+      }
     }
+  });
+
+  it("keeps dense resident slabs shared across rounds", async () => {
+    const vol = new MemoryVolume();
+    const data = new Uint8Array(4096);
+    data.set(new TextEncoder().encode("first"), 0);
+    data.set(new TextEncoder().encode("second"), 2048);
+    vol.mountBinarySnapshot({ data: data.buffer, manifest: [
+      { path: "/node_modules/p/a.js", offset: 0, length: 2048, isDirectory: false },
+      { path: "/node_modules/p/b.js", offset: 2048, length: 2048, isDirectory: false },
+    ] });
+    vol.enableContentPacking();
+    vol.readFileSync("/node_modules/p/a.js");
+    vol.readFileSync("/node_modules/p/b.js");
+    await vol.packContentNow();
+    expect(vol.peekFileSync("/node_modules/p/a.js").buffer).toBe(data.buffer);
+    expect(vol.peekFileSync("/node_modules/p/b.js").buffer).toBe(data.buffer);
+    vol.dispose();
+  });
+
+  it("does not retain a compressed representation larger than random input", async () => {
+    const vol = new MemoryVolume();
+    const random = new Uint8Array(8192);
+    let seed = 0x12345678;
+    for (let i = 0; i < random.length; i++) {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      random[i] = seed & 255;
+    }
+    vol.writeFileSync("/node_modules/p/image.bin", random);
+    vol.enableContentPacking();
+    await vol.packContentNow();
+    expect(vol.getStats().packedFiles).toBe(0);
+    expect(vol.readFileSync("/node_modules/p/image.bin")).toEqual(random);
+    vol.dispose();
   });
 });
 
@@ -223,6 +264,20 @@ describe("content packing with an off-thread deflater", () => {
     expect(vol.getStats().packedFiles).toBe(6);
     expect(vol.readFileSync("/app/node_modules/big/bundle.js", "utf8")).toBe(source(6, 600_000));
     expect(vol.readFileSync("/app/node_modules/lib/util.js", "utf8")).toBe(source(2, 40_000));
+  });
+
+  it("keeps compression savings when the worker transfers its input buffer", async () => {
+    const vol = new MemoryVolume();
+    vol.enableContentPacking({ deflate: async (bytes) => {
+      const received = structuredClone(bytes, { transfer: [bytes.buffer as ArrayBuffer] });
+      expect(bytes.byteLength).toBe(0);
+      return pako.deflateRaw(received);
+    } });
+    packages(vol);
+    await vol.packContentNow();
+    expect(vol.getStats().packedFiles).toBe(6);
+    expect(vol.readFileSync("/app/node_modules/lib/util.js", "utf8")).toBe(source(2, 40_000));
+    vol.dispose();
   });
 
   it("unpacks a read file's chunk neighbours, not rarely read files", async () => {

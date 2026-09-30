@@ -39,7 +39,7 @@ export interface PmDeps {
     filePath: string,
     args: string[],
     ctx: ShellContext,
-    opts?: { isFork?: boolean },
+    opts?: { isFork?: boolean; execArgv?: string[] },
   ) => Promise<ShellResult>;
   evalCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;
   printCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;

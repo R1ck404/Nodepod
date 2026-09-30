@@ -3,6 +3,23 @@ import { MemoryVolume } from "../memory-volume";
 import { VFSBridge } from "../threading/vfs-bridge";
 
 describe("MemoryVolume", () => {
+  it("stores hardlinked payloads once in full and chunked snapshots", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/first.bin", new Uint8Array(5 * 1024 * 1024).fill(7));
+    volume.writeFileSync("/other.bin", new Uint8Array(1024).fill(9));
+    volume.linkSync("/first.bin", "/alias.bin");
+    const bridge = new VFSBridge(volume);
+    const snapshot = bridge.createSnapshot();
+    expect(snapshot.data.byteLength).toBe(5 * 1024 * 1024 + 1024);
+    const chunks = bridge.createChunkedSnapshots();
+    expect(chunks.reduce((n, c) => n + c.data.byteLength, 0)).toBe(snapshot.data.byteLength);
+    const restored = new MemoryVolume();
+    for (const chunk of chunks) restored.mountBinarySnapshot(chunk);
+    expect(restored.statSync("/alias.bin").ino).toBe(restored.statSync("/first.bin").ino);
+    restored.writeFileSync("/alias.bin", "changed");
+    expect(restored.readFileSync("/first.bin", "utf8")).toBe("changed");
+    expect(restored.readFileSync("/other.bin")[0]).toBe(9);
+  });
   it("does not decode binary writes when no change subscriber exists", () => {
     const volume = new MemoryVolume();
     const decode = vi.spyOn(volume as any, "decodeText");

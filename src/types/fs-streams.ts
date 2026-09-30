@@ -1,6 +1,8 @@
 // Types for fs ReadStream/WriteStream. These are old-style function constructors
 // (not classes) because graceful-fs uses .apply(this, arguments) which breaks classes.
 
+import type { Writable } from "../polyfills/stream";
+
 /* ---- ReadableState ---- */
 
 export interface FsReadableState {
@@ -100,43 +102,30 @@ export interface FsReadStreamInstance {
 
 /* ---- FsWriteStream ---- */
 
-export interface FsWriteStreamInstance {
-  _parts: Uint8Array[];
-  _closed: boolean;
-  _objectMode: boolean;
-  _highWaterMark: number;
+export interface FsWriteStreamOptions {
+  encoding?: string;
+  flags?: string | number;
+  mode?: number;
+  start?: number;
+  highWaterMark?: number;
+  autoClose?: boolean;
+  fd?: number;
+  [key: string]: unknown;
+}
+
+export interface FsWriteStreamInstance extends Writable {
   _autoDestroy: boolean;
   _corked: number;
-  _corkedWrites: Array<{ chunk: unknown; encoding: string; cb: (err?: Error | null) => void }>;
-  _writableByteLength: number;
-
-  writable: boolean;
-  writableEnded: boolean;
-  writableFinished: boolean;
-  writableNeedDrain: boolean;
-  destroyed: boolean;
-  closed: boolean;
-  errored: Error | null;
-  writableObjectMode: boolean;
-  writableHighWaterMark: number;
-  writableCorked: number;
 
   _writableState: FsWritableState;
 
   path: string;
   fd: number | null;
-  flags: string;
+  flags: string | number;
   mode: number;
   autoClose: boolean;
   bytesWritten: number;
-  _chunks: Uint8Array[];
-  _enc: TextEncoder;
+  pos?: number;
 
   open(): void;
-  close(cb?: (err?: Error | null) => void): void;
-
-  destroy(err?: unknown): void;
-  emit(event: string, ...args: unknown[]): boolean;
-  end(chunk?: unknown, encoding?: string, cb?: () => void): void;
-  write(chunk: unknown, encoding?: string, cb?: (err?: Error | null) => void): boolean;
 }

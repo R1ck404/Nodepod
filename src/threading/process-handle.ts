@@ -3,6 +3,7 @@
 
 import { EventEmitter } from "../polyfills/events";
 import type { HostWorker } from "../host/types";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
@@ -82,7 +83,7 @@ export class ProcessHandle extends EventEmitter {
   }
 
   postMessage(msg: MainToWorkerMessage, transfer?: Transferable[]): void {
-    this.worker.postMessage(msg, transfer ?? []);
+    this.worker.postMessage(attachWasmMessageMetadata(msg), transfer ?? []);
   }
 
   init(initMsg: MainToWorker_Init, extraTransfer?: Transferable[]): void {
@@ -200,7 +201,7 @@ export class ProcessHandle extends EventEmitter {
   private _setupWorkerListeners(worker: HostWorker): void {
     worker.addEventListener("message", (ev) => {
       if (worker !== this.worker) return;
-      const msg = ev.data as WorkerToMainMessage;
+      const msg = receiveWasmMessageMetadata(ev.data) as WorkerToMainMessage;
       if (!msg || !msg.type) return;
 
       switch (msg.type) {
@@ -311,6 +312,10 @@ export class ProcessHandle extends EventEmitter {
 
         case "ipc-message":
           this.emit("ipc-message", msg);
+          break;
+
+        case "ipc-disconnect":
+          this.emit("ipc-disconnect", msg);
           break;
 
         case "spawn-sync":

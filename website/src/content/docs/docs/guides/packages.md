@@ -61,3 +61,21 @@ memory as usual. With it enabled:
 `nodepod.memoryStats().vfs` reports `pagedOutFiles`, `pagedOutBytes` and
 `residentPackBytes`. It also reports `pagedOutSyncMisses`, which counts
 synchronous reads that hit a paged-out file.
+
+For lower retained memory without paging files out to storage, Nodepod also
+compresses dormant package content in memory by default. Recently read files
+stay resident, and reads of packed files inflate them synchronously.
+
+You can include dormant WASM binaries in this compression:
+
+```ts
+const nodepod = await Nodepod.boot({
+  memory: { packPackageContent: true, packWasmContent: true },
+});
+```
+
+`packWasmContent` defaults to `false`. Enabling it saves the space occupied by
+the binary's stored bytes, but adds decompression time when that binary is
+loaded again. It does not shrink an instantiated WASM heap or its compiled
+code. Content packing requires lean spawn snapshots and cross-origin
+isolation; it is not used when package content eviction is enabled.

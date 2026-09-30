@@ -25,15 +25,14 @@ export class ProcessExitSentinel extends Error {
 }
 
 export function isExitSentinel(e: unknown): boolean {
-  if (e instanceof ProcessExitSentinel) return true;
-  if (
-    e &&
-    typeof e === "object" &&
-    (e as { [EXIT_SENTINEL_BRAND]?: true })[EXIT_SENTINEL_BRAND] === true
-  ) {
-    return true;
+  if (!e || typeof e !== "object") return false;
+  try {
+    // Rejection reasons may be proxies or have getters. Inspect the data
+    // brand without invoking application accessors or replacing their error.
+    return Object.getOwnPropertyDescriptor(e, EXIT_SENTINEL_BRAND)?.value === true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 // handle types, roughly lines up with libuv resource names plus a few node extras

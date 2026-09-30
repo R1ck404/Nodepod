@@ -1635,22 +1635,10 @@ function getLocationPatchScript(instanceId, serverPort) {
 
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('controllerchange', claimPath);
-    // A dedicated preview worker can be terminated by the browser even while
-    // its tab remains open. Its MessagePorts are disposable worker-global
-    // state, so recover through the bootstrap on the next request instead of
-    // leaving the running app stuck behind repeated synthetic 503 responses.
-    var reconnecting = false;
-    navigator.serviceWorker.addEventListener('message', function(event) {
-      if (
-        !PREFIX &&
-        !reconnecting &&
-        event.data &&
-        event.data.type === 'sw-needs-init'
-      ) {
-        reconnecting = true;
-        setTimeout(function() { location.reload(); }, 0);
-      }
-    });
+    // Browser suspension discards a worker's MessagePorts. The origin bridge
+    // reconnects them on sw-needs-init while proxyToVirtualServer waits for
+    // that handshake. Navigating here races that recovery and destroys live
+    // application state (including the first HMR update after an idle period).
   }
 
   // <a download> — Chrome issues anchor downloads with service workers

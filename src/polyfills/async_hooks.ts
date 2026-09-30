@@ -9,6 +9,8 @@
 // keeps the active frame until an async callback's returned promise settles so
 // the frame is still current when await registers its continuation handler.
 
+import { registerExitCleanup } from "../helpers/promise-exit";
+
 type StoreFrame = Map<object, unknown>;
 
 // Frames are never modified once they can be captured, so capturing one is a
@@ -25,6 +27,16 @@ function captureFrame(): StoreFrame {
 // run() scope that ends while that copy is current still restores what it
 // replaced, as if enterWith() had changed the scope's frame in place.
 const enteredFrom = new WeakMap<StoreFrame, StoreFrame>();
+const exitedFrames = new WeakMap<StoreFrame, StoreFrame>();
+
+function liveFrame(frame: StoreFrame): StoreFrame {
+  while (true) {
+    const entered = enteredFrom.get(frame);
+    const previous = exitedFrames.get(frame) ?? (entered && exitedFrames.get(entered));
+    if (!previous) return frame;
+    frame = previous;
+  }
+}
 
 function frameWith(frame: StoreFrame, key: object, value: unknown): StoreFrame {
   const next = new Map(frame);
@@ -48,11 +60,11 @@ export function getNativePromiseConstructor(): typeof Promise {
 // for every subsequent native-await resumption.
 function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
-  currentFrame = frame;
+  currentFrame = liveFrame(frame);
   try {
     return fn();
   } finally {
-    currentFrame = prev;
+    currentFrame = liveFrame(prev);
   }
 }
 
@@ -64,11 +76,17 @@ function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
 function runScoped<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
   currentFrame = frame;
+  let unregister = () => {};
   const finish = () => {
+    unregister();
     if (currentFrame === frame || enteredFrom.get(currentFrame) === frame) {
-      currentFrame = prev;
+      currentFrame = liveFrame(prev);
     }
   };
+  unregister = registerExitCleanup(() => {
+    exitedFrames.set(frame, prev);
+    finish();
+  });
   try {
     const result = fn();
     const maybePromise = result as unknown;
@@ -96,11 +114,11 @@ function wrapCallback<T extends (...args: any[]) => any>(
     // and would clobber the run's store. The run's frame is held by
     // runScoped instead, so restoring here hands control straight back to it.
     const prev = currentFrame;
-    currentFrame = frame;
+    currentFrame = liveFrame(frame);
     try {
       return cb(value);
     } finally {
-      currentFrame = prev;
+      currentFrame = liveFrame(prev);
     }
   } as T;
   return wrapped;
@@ -201,11 +219,11 @@ function patchTimerContext(): void {
     return ((...args: unknown[]) => {
       // Sync restore for the same reason as wrapCallback.
       const prev = currentFrame;
-      currentFrame = frame;
+      currentFrame = liveFrame(frame);
       try {
         fn(...args);
       } finally {
-        currentFrame = prev;
+        currentFrame = liveFrame(prev);
       }
     }) as F;
   };

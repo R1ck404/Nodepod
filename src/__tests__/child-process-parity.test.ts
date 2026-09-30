@@ -6,6 +6,7 @@ import {
   shellCommandFromArgv,
   spawn,
   spawnSync,
+  execSync,
   setSpawnChildCallback,
   setStreamingCallbacks,
   clearStreamingCallbacks,
@@ -40,6 +41,12 @@ describe("installPackageNames", () => {
 });
 
 describe("shellQuote / shellCommandFromArgv", () => {
+  it("returns failed capability probes from spawnSync while execSync still throws", () => {
+    const result = spawnSync("missing-capability-probe", ["--version"]);
+    expect(result.status).toBe(127);
+    expect(result.stderr.toString()).toContain("not found");
+    expect(() => execSync("missing-capability-probe --version")).toThrow("Command failed");
+  });
   it("quotes args with spaces and metacharacters", () => {
     expect(shellQuote("hello world")).toBe("'hello world'");
     expect(shellQuote("a;b")).toBe("'a;b'");

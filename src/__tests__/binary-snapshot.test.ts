@@ -26,6 +26,17 @@ function memoryCache(): IDBSnapshotCache & { store: Map<string, VFSBinarySnapsho
 }
 
 describe("createFilteredBinarySnapshot / restoreBinarySnapshot", () => {
+  it("deduplicates hardlinks after applying the path filter", () => {
+    const vol = new MemoryVolume();
+    vol.writeFileSync("/excluded", new Uint8Array(1024).fill(7));
+    vol.linkSync("/excluded", "/included/a");
+    vol.linkSync("/excluded", "/included/b");
+    const snapshot = createFilteredBinarySnapshot(vol, (path) => path.startsWith("/included"));
+    expect(snapshot.data.byteLength).toBe(1024);
+    const restored = MemoryVolume.fromBinarySnapshot(snapshot);
+    expect(restored.statSync("/included/a").ino).toBe(restored.statSync("/included/b").ino);
+    expect(restored.readFileSync("/included/b")[0]).toBe(7);
+  });
   it("round-trips filtered content without base64", () => {
     const vol = new MemoryVolume();
     vol.mkdirSync("/proj/node_modules/pkg", { recursive: true });

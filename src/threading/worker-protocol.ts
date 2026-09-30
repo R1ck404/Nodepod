@@ -76,6 +76,8 @@ export interface MainToWorker_Exec {
   isShell?: boolean;
   shellCommand?: string;
   isFork?: boolean;
+  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  execArgv?: string[];
   // If true, worker sends "shell-done" instead of "exit" and stays alive
   persistent?: boolean;
   isWorkerThread?: boolean;
@@ -188,6 +190,11 @@ export interface MainToWorker_IPC {
   targetRequestId?: number;
 }
 
+export interface IPCDisconnect {
+  type: "ipc-disconnect";
+  targetRequestId?: number;
+}
+
 export interface MainToWorker_WsUpgrade {
   type: "ws-upgrade";
   uid: string;
@@ -234,6 +241,7 @@ export type MainToWorkerMessage =
   | MainToWorker_HttpRequest
   | MainToWorker_HttpClientResponse
   | MainToWorker_IPC
+  | IPCDisconnect
   | MainToWorker_WsUpgrade
   | MainToWorker_WsData
   | MainToWorker_WsClose;
@@ -345,6 +353,8 @@ export interface WorkerToMain_ForkRequest {
   args: string[];
   cwd: string;
   env: Record<string, string>;
+  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  execArgv?: string[];
 }
 
 export interface WorkerToMain_WorkerThreadRequest {
@@ -516,6 +526,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_StdinRawStatus
   | WorkerToMain_HttpResponse
   | WorkerToMain_IPC
+  | IPCDisconnect
   | WorkerToMain_ShellDone
   | WorkerToMain_Error
   | WorkerToMain_SqlitePreload
