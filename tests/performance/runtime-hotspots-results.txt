@@ -1,0 +1,113 @@
+Nodepod runtime optimization results — 2026-09-30
+
+Branch: perf/runtime-hotspots
+Baseline: 85ac741
+Worktree: C:/Users/rickh/Documents/sandbox/Nodepod-perf
+
+Changes
+- Check trailing slashes directly, removing the expensive trailing-slash
+  alternative from the normalized-path regular expression.
+- Reuse equal nanosecond timestamp conversions in statSync. Date fields remain
+  separate objects and the returned metadata remains a snapshot.
+- Add MemoryVolume's binary-safe 'write' event. WorkerSandbox and IframeSandbox
+  use it instead of the legacy text 'change' event. Legacy subscribers retain
+  their text contract. Shared-backed iframe messages copy to ordinary bytes
+  because opaque iframes cannot share the parent's SharedArrayBuffer cluster.
+- Batch VFS watcher notifications into one MessageChannel-backed setImmediate
+  task instead of allocating/resetting one timeout per path. Closing a watcher
+  cancels pending notifications and unsubscribes it.
+- Remove completed setImmediate callbacks from active timer tracking rather
+  than retaining their callback closures until process teardown.
+
+Measurements
+Same-process baseline/optimized comparison, 100,000 nested filesystem lookups,
+25,000 files across 500 package directories; native Node/Vitest on Windows.
+
+First comparison (mean ms):
+                     baseline    optimized
+statSync             86.58       73.86       14.7% less time
+existsSync           46.58       45.99        1.3% less time
+kindSync             46.78       42.18        9.8% less time
+
+Reverse-order repeat (mean ms):
+statSync             87.98       80.37        8.6% less time
+existsSync           41.35       35.02       15.3% less time
+kindSync             52.47       50.05        4.6% less time
+
+The repeat overlapped a library build, so it is a sensitivity check rather than
+a controlled regression threshold. Small lookup improvements vary by run.
+
+1,000 overwrites of the same 64 KiB buffer with no-op listeners:
+legacy text notification: 278.98 ms; byte notification: 0.573 ms.
+Repeat: 291.98 ms versus 0.576 ms.
+This isolates UTF-8 decoding/notification overhead; it excludes worker message
+cloning, initial allocation and guest execution. It is not an end-to-end
+sandbox or Vite speedup. The original new-file write probe was a different case.
+
+A parsed-directory cache and an indexOf-based normalization variant regressed
+the measured workload and were removed. No tree-node cache was introduced.
+
+HMR investigation
+Vite 8.0.10 + plugin-react 5.0.4, 100 React components, five edits:
+Rendered updates take around 1 second in the embedded preview.
+Browser instrumentation traced this to React Refresh's 16 ms debounce timer:
+actual delays were 955–998 ms inside the embedded preview. Vite beforeUpdate
+arrived 2–18 ms after the host write; afterUpdate arrived 12–34 ms after it.
+The preview document reported hidden while its host reported visible. Direct
+preview Window timers requested for 16/50 ms took about 1,000 ms; dedicated
+worker timers took about 25-60 ms. The watcher scheduler alone cannot fix this.
+
+A package-specific worker-scheduler experiment reduced median HMR from
+1,020.19 ms to 42.69 ms, confirming the timer bottleneck. That experiment and
+its tests were removed: production code must not recognize or rewrite package
+runtime sources or endpoints.
+Application browser timers remain native.
+
+Root cause established in follow-up investigation:
+The collaborative browser installs own-property getters on the host document
+for visibilityState and hidden. visibilityState reports "visible", but calling
+the browser's native Document.prototype getter reports "hidden" on BOTH host
+and preview. A plain static iframe also reports hidden; 16 ms timers on host,
+preview and plain iframe all fired together after about 761 ms. This rules out
+Nodepod preview routing as the cause of the one-second scheduling interval.
+Calling preview_open(open:true, show:true) did not change native visibility.
+
+Retained native browser regression (tests/performance/hmr-timing.spec.ts):
+Host and preview native visibility: visible.
+Unmodified preview 16 ms timer: 16.455 ms.
+Five write-to-render HMR edits: 28.94, 31.98, 30.92, 25.36, 36.80 ms.
+React counter state stayed at 3 across all five edits. No runtime rewriting,
+worker timer bridge, visibility override or timer override was used.
+The exact same fixture in the collaborative browser reported native hidden
+for host and preview, while reported host visibility stayed visible. Its
+16 ms timer took 734.25 ms; five edits took 1004.32, 997.93, 998.96, 1000.19,
+1013.38 ms. This paired experiment isolates the browser-host environment.
+The remaining slow timing in the collaborative preview belongs to its browser
+host's hidden/background scheduler. It needs a browser-host visibility or
+background-throttling correction, which is outside this repository and the
+available preview tools. No Nodepod runtime workaround is retained.
+No general Vite startup/build speedup is established by these microbenchmarks.
+
+Validation
+Full unit suite: 1,644 passed, 5 skipped.
+Type check and library/type-declaration build passed.
+Browser checks: profiler smoke, issue-84 Vite build, Vite8/Tailwind build,
+actual worker binary/text/deletion synchronization, and native-visibility HMR
+timing with component-state preservation.
+Final pre-commit rerun: 1,644 unit tests passed (5 skipped); type check and
+library/declaration build passed. All five performance regression checks and
+seven runtime-reliability browser checks passed (12 browser tests total).
+The latter cover fetch/Response bodies, process termination, both hostname and
+virtual preview modes, downloads and host-route isolation. Tests ran against
+servers rooted in this worktree, not the original checkout's running server.
+
+Reproduce the retained benchmarks and regression tests
+pnpm install --frozen-lockfile
+pnpm exec vitest bench --run src/__tests__/bench/runtime-hotspots.bench.ts
+pnpm test
+pnpm run type-check
+pnpm run test:browser:perf
+pnpm exec playwright test --config playwright.perf.config.ts tests/performance/hmr-timing.spec.ts
+
+Raw comparison JSON and HMR timer traces are preserved locally under
+perf-bench/results (that directory is ignored by git).

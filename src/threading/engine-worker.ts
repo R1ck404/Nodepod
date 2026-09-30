@@ -28,7 +28,7 @@ const workerInterface = {
     consoleForwarder = cb;
   },
 
-  syncFile(filePath: string, content: string | null): void {
+  syncFile(filePath: string, content: string | Uint8Array | null): void {
     if (!volume) {
       return;
     }

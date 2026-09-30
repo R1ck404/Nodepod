@@ -4,6 +4,7 @@
 
 import { isExitSentinel } from "../helpers/event-loop";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import { setImmediate, clearImmediate } from "./timers";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;
@@ -29,8 +30,18 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
   // (truncate + write, or a batch synced from another thread in one task)
   // emit once. A write lands within a single task, so waiting for the next
   // task is enough; a fixed delay here was added straight onto HMR latency.
-  const pending = new Map<string, { event: string; timer: ReturnType<typeof setTimeout> }>();
-  const DEBOUNCE_MS = 0;
+  const pending = new Map<string, string>();
+  let scheduled: ReturnType<typeof setImmediate> | undefined;
+  const flush = () => {
+    scheduled = undefined;
+    const batch = Array.from(pending);
+    pending.clear();
+    for (const [path, event] of batch) {
+      if (event === 'change' || event === 'add' || event === 'addDir' || event === 'unlink') {
+        watcher.emit(event, path);
+      }
+    }
+  };
 
   const cleanup = vol.onGlobalChange((path: string, event: string) => {
     if (
@@ -41,30 +52,20 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
       return;
     }
 
-    const existing = pending.get(path);
-    if (existing) clearTimeout(existing.timer);
-
-    pending.set(path, {
-      event,
-      timer: setTimeout(() => {
-        pending.delete(path);
-        if (event === 'change') {
-          watcher.emit('change', path);
-        } else if (event === 'add') {
-          watcher.emit('add', path);
-        } else if (event === 'addDir') {
-          watcher.emit('addDir', path);
-        } else if (event === 'unlink') {
-          watcher.emit('unlink', path);
-        }
-      }, DEBOUNCE_MS),
-    });
+    pending.set(path, event);
+    // MessageChannel-backed check phase: one task for the whole batch,
+    // without the browser's background-tab timer clamp.
+    if (!scheduled) scheduled = setImmediate(flush);
   });
   const selfCleanup = () => {
     cleanup();
+    if (scheduled) clearImmediate(scheduled);
+    scheduled = undefined;
+    pending.clear();
     _vfsBridgeCleanups.delete(selfCleanup);
   };
   _vfsBridgeCleanups.add(selfCleanup);
+  watcher.once('close', selfCleanup);
 }
 
 // lazily init the listener map (handles Object.create() bypassing constructor)

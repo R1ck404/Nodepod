@@ -7,7 +7,7 @@ import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } fr
 interface WorkerEndpoint {
   init(snapshot: VolumeSnapshot, config: EngineConfig): void;
   setConsoleForwarder(cb: ((method: string, args: unknown[]) => void) | null): void;
-  syncFile(path: string, content: string | null): void;
+  syncFile(path: string, content: string | Uint8Array | null): void;
   execute(code: string, filename?: string): Promise<ExecutionOutcome>;
   runFile(filename: string): Promise<ExecutionOutcome>;
   clearCache(): void;
@@ -28,7 +28,7 @@ export class WorkerSandbox implements IScriptEngine {
   private vol: MemoryVolume;
   private cfg: EngineConfig;
   private ready: Promise<void>;
-  private onFileChange: ((path: string, content: string) => void) | null = null;
+  private onFileChange: ((path: string, content: Uint8Array) => void) | null = null;
   private onFileDelete: ((path: string) => void) | null = null;
 
   constructor(vol: MemoryVolume, cfg: EngineConfig = {}) {
@@ -53,10 +53,10 @@ export class WorkerSandbox implements IScriptEngine {
   }
 
   private attachVolumeSync(): void {
-    this.onFileChange = (path: string, content: string) => {
+    this.onFileChange = (path: string, content: Uint8Array) => {
       this.endpoint.syncFile(path, content);
     };
-    this.vol.on('change', this.onFileChange);
+    this.vol.on('write', this.onFileChange);
 
     this.onFileDelete = (path: string) => {
       this.endpoint.syncFile(path, null);
@@ -83,7 +83,7 @@ export class WorkerSandbox implements IScriptEngine {
   }
 
   terminate(): void {
-    if (this.onFileChange) this.vol.off('change', this.onFileChange);
+    if (this.onFileChange) this.vol.off('write', this.onFileChange);
     if (this.onFileDelete) this.vol.off('delete', this.onFileDelete);
     this.thread.terminate();
   }

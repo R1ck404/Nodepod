@@ -198,6 +198,7 @@ function makeTimeout(
 
 interface ImmediateEntry {
   handle: Handle;
+  timer: TimeoutLike;
   cb: (...args: unknown[]) => void;
   args: unknown[];
   cleared: boolean;
@@ -225,6 +226,8 @@ function _flushImmediates(): void {
   const batch = _immediateQueue.splice(0);
   for (const entry of batch) {
     if (entry.cleared) continue;
+    entry.timer._fired = true;
+    untrackTimer(entry.timer);
     entry.handle.close();
     try {
       const r: unknown = entry.cb(...entry.args);
@@ -251,8 +254,8 @@ function makeImmediate(
   args: unknown[],
 ): TimeoutLike {
   const handle = getRegistry().register("Immediate");
-  const entry: ImmediateEntry = { handle, cb, args, cleared: false };
   const self = {} as TimeoutLike;
+  const entry: ImmediateEntry = { handle, timer: self, cb, args, cleared: false };
   self._isInterval = false;
   self._fired = false;
   self._handle = handle;
