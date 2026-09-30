@@ -14,6 +14,7 @@ import { createImportMeta } from "./helpers/import-meta";
 import { LRUCache as _LRUCache } from "./memory-handler";
 import { bytesToBase64, bytesToHex, decodeShortAscii } from "./helpers/byte-encoding";
 import { inSyncScope, syncScopeDepth, setSyncPromiseClass } from "./helpers/sync-scope";
+import { guardExitCallback, guardExitRejection, installPromiseExitGuard } from "./helpers/promise-exit";
 import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
 import * as pathPolyfill from "./polyfills/path";
 import {
@@ -153,6 +154,7 @@ import {
 } from "./syntax-transforms";
 import {
   getCachedModule,
+  cloneCachedModule,
   precompileWasm,
   compileWasmInWorker,
   registerCompiledModule,
@@ -684,7 +686,7 @@ async function __wasmInstantiate(moduleOrBytes, imports) {
   return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $syncAwaitFn, $SyncPromise) {
 ${vars}return (${fnKeyword}() {
 ${code}
-}).call(this);
+}).call(${isEsmModule ? "this" : "$exports"});
 })`;
 }
 
@@ -1402,6 +1404,12 @@ function createSyncPromise(): typeof Promise {
       onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
       onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
     ): Promise<TResult1 | TResult2> {
+      // Native reactions are guarded at their intrinsic prototype. Only the
+      // synchronous unwrap path bypasses that boundary and needs its own guard.
+      if (syncScopeDepth() > 0) {
+        if (typeof onFulfilled === "function") onFulfilled = guardExitCallback(onFulfilled) as typeof onFulfilled;
+        onRejected = guardExitRejection(onRejected) as typeof onRejected;
+      }
       // Sync fast-path ONLY inside an explicit sync scope (syncAwait above):
       // it exists so require() machinery can unwrap synchronously. Everywhere
       // else, fall through to native microtask timing so user-visible .then
@@ -1687,22 +1695,30 @@ function toImportNamespace(loaded: unknown): Record<string, unknown> {
   return ns;
 }
 
-type DynamicLoader = ((specifier: string) => SyncThenable<unknown> | Promise<unknown>) & {
+type DynamicLoader = ((specifier: unknown) => SyncThenable<unknown> | Promise<unknown>) & {
   /** Module-scoped `Function` whose bodies route import() through this loader. */
   Function: FunctionConstructor;
 };
 
 function makeDynamicLoader(resolver: ResolverFn): DynamicLoader {
-  const load = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+  const load = (specifier: unknown): SyncThenable<unknown> | Promise<unknown> => {
+    let id: string;
     try {
-      return loadNow(specifier);
+      // import() uses ToString, unlike require(), which requires a string.
+      // Template coercion also rejects Symbols as the native operator does.
+      id = `${specifier}`;
+    } catch (err) {
+      return new SyncPromiseClass((_resolve, reject) => reject(err));
+    }
+    try {
+      return loadNow(id);
     } catch (err) {
       if (!(err instanceof AsyncModuleInitializationRequired)) throw err;
 
       // Dynamic imports can happen from async callbacks after the entry module
       // has already returned. Await and retry at this boundary so those late
       // imports cannot receive an uninitialized synchronous polyfill.
-      return err.ready.then(() => loadNow(specifier));
+      return err.ready.then(() => loadNow(id));
     }
   };
   const loadNow = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
@@ -2236,23 +2252,19 @@ function buildResolver(
     }
     if (id.startsWith("node:")) id = id.slice(5);
 
-    if (id.startsWith("file:///")) {
-      id = decodeURIComponent(id.slice(7));
-      if (/^[A-Za-z]:[\\/]/.test(id)) {
-        id = "/" + id.slice(2).replace(/\\/g, "/");
+    if (/^file:/i.test(id)) {
+      // path.join can collapse file:/// to file:/. Both are valid file URLs.
+      // Parse before decoding so encoded '?' and '#' remain filename bytes.
+      id = urlPolyfill.fileURLToPath(id);
+      if (/^\/?[A-Za-z]:[\\/]/.test(id)) {
+        id = "/" + id.replace(/^\/?[A-Za-z]:[\\/]/, "").replace(/\\/g, "/");
       }
-    } else if (id.startsWith("file://")) {
-      id = decodeURIComponent(id.slice(7));
-      if (/^[A-Za-z]:[\\/]/.test(id)) {
-        id = "/" + id.slice(2).replace(/\\/g, "/");
-      }
+    } else {
+      const qIdx = id.indexOf("?");
+      if (qIdx !== -1) id = id.slice(0, qIdx);
+      const hashIdx = id.indexOf("#");
+      if (hashIdx !== -1 && !id.startsWith("#")) id = id.slice(0, hashIdx);
     }
-
-    const qIdx = id.indexOf("?");
-    if (qIdx !== -1) id = id.slice(0, qIdx);
-
-    const hashIdx = id.indexOf("#");
-    if (hashIdx !== -1 && !id.startsWith("#")) id = id.slice(0, hashIdx);
 
     if (id.includes("\\")) id = id.replace(/\\/g, "/");
 
@@ -3411,6 +3423,10 @@ export class ScriptEngine {
     // before any napi-rs / emnapi package loads: host MessagePort.ref must
     // keep the event loop alive (emnapi WaitingRequestCounter).
     threadPoolPolyfill.installHostMessagePortKeepAlive();
+    perfPolyfill.installHostPerformanceExtensions();
+    // Importing the browser SDK must not patch the application's promises.
+    // Install the boundary only in a realm that actually executes Node code.
+    installPromiseExitGuard(asyncCtxPolyfill.getNativePromiseConstructor());
     this.vol = vol;
     this.proc = buildProcessEnv({
       cwd: opts.cwd || "/",
@@ -3657,9 +3673,18 @@ export class ScriptEngine {
         bytes: BufferSource,
       ) {
         const cached = getCachedModule(bytes);
-        if (cached) return cached;
+        if (cached) {
+          const clone = cloneCachedModule(cached);
+          if (clone) return clone;
+        }
         try {
-          return new OrigModule(bytes);
+          const compiled = new OrigModule(bytes);
+          registerCompiledModule(
+            new Uint8Array(bytes instanceof ArrayBuffer ? bytes : bytes.buffer,
+              bytes instanceof ArrayBuffer ? 0 : bytes.byteOffset, bytes.byteLength),
+            compiled,
+          );
+          return compiled;
         } catch (e: any) {
           if (
             e &&
@@ -3667,7 +3692,10 @@ export class ScriptEngine {
               e.message?.includes("buffer size is larger than"))
           ) {
             const cached2 = getCachedModule(bytes);
-            if (cached2) return cached2;
+            if (cached2) {
+              const clone = cloneCachedModule(cached2);
+              if (clone) return clone;
+            }
             const compilePromise = compileWasmInWorker(
               bytes instanceof ArrayBuffer
                 ? new Uint8Array(bytes)

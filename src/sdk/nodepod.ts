@@ -430,7 +430,10 @@ export class Nodepod {
     let deflater: OffThreadDeflater | null = null;
     if (handler.options.packPackageContent && sabEnabled && opts.spawnSnapshot !== "full") {
       deflater = createOffThreadDeflater();
-      volume.enableContentPacking(deflater ? { deflate: (bytes) => deflater!.deflate(bytes) } : {});
+      volume.enableContentPacking({
+        ...(deflater ? { deflate: (bytes: Uint8Array) => deflater!.deflate(bytes) } : {}),
+        packWasm: handler.options.packWasmContent,
+      });
       if (deflater) onFailure.push(() => deflater?.dispose());
     }
 

@@ -45,6 +45,18 @@ export default defineConfig({
     }),
   ],
   vite: {
+    // Bundle server dependencies so prerender entries execute with the same
+    // dependency graph used to build them.
+    plugins: [{
+      name: "bundle-server-dependencies",
+      apply: "build",
+      enforce: "post",
+      configEnvironment(environmentName) {
+        if (environmentName !== "client") {
+          return { resolve: { noExternal: true } };
+        }
+      },
+    }],
     optimizeDeps: {
       exclude: ["@r1ck404/nodepod"],
     },

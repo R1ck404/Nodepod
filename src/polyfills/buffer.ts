@@ -820,6 +820,83 @@ export const SlowBuffer = Buffer;
 export const kMaxLength = 2147483647;
 export const INSPECT_MAX_BYTES = 50;
 
+// These are also exposed by node:buffer. Keep the host constructors so blobs
+// retain their native stream/structured-clone behavior across runtime workers.
+export const Blob = globalThis.Blob;
+export const File = globalThis.File;
+
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength")!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteOffset")!.get!;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer")!.get!;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === "undefined" ? null
+  : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")!.get!;
+
+function validationBytes(input: unknown): Uint8Array {
+  if (ArrayBuffer.isView(input)) {
+    // Intrinsic getters accept all typed arrays, including cross-realm views,
+    // and reject DataView. Validate the bytes, not the numeric elements.
+    let length: number;
+    try { length = typedArrayByteLength.call(input); }
+    catch { throw invalidValidationInput(); }
+    // Native Node accepts an empty (including detached) typed array.
+    if (length === 0) return new Uint8Array(0);
+    return new Uint8Array(typedArrayBuffer.call(input), typedArrayByteOffset.call(input), length);
+  }
+  let validBuffer = false;
+  try { arrayBufferByteLength.call(input); validBuffer = true; } catch {}
+  if (!validBuffer && sharedArrayBufferByteLength) {
+    try { sharedArrayBufferByteLength.call(input); validBuffer = true; } catch {}
+  }
+  if (!validBuffer) throw invalidValidationInput();
+  try { return new Uint8Array(input as ArrayBuffer); }
+  catch {
+    throw Object.assign(new Error("Cannot validate on a detached buffer"), { code: "ERR_INVALID_STATE" });
+  }
+}
+
+function invalidValidationInput(): TypeError & { code: string } {
+  return Object.assign(new TypeError("The \"input\" argument must be an instance of ArrayBuffer, Buffer, or TypedArray"),
+    { code: "ERR_INVALID_ARG_TYPE" });
+}
+
+export function isAscii(input: ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean {
+  const bytes = validationBytes(input);
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
+  return true;
+}
+
+// Validate directly without allocating a decoded string. Reject overlong
+// encodings, UTF-16 surrogates and code points beyond U+10FFFF.
+export function isUtf8(input: ArrayBuffer | SharedArrayBuffer | ArrayBufferView): boolean {
+  const bytes = validationBytes(input);
+  for (let i = 0; i < bytes.length;) {
+    const lead = bytes[i++];
+    if (lead <= 0x7f) continue;
+    let remaining: number;
+    let min = 0x80;
+    let max = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) remaining = 1;
+    else if (lead >= 0xe0 && lead <= 0xef) {
+      remaining = 2;
+      if (lead === 0xe0) min = 0xa0;
+      if (lead === 0xed) max = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      remaining = 3;
+      if (lead === 0xf0) min = 0x90;
+      if (lead === 0xf4) max = 0x8f;
+    } else return false;
+    if (i + remaining > bytes.length || bytes[i] < min || bytes[i] > max) return false;
+    i++;
+    while (--remaining > 0) {
+      const byte = bytes[i++];
+      if (byte < 0x80 || byte > 0xbf) return false;
+    }
+  }
+  return true;
+}
+
 export const constants = {
   MAX_LENGTH: kMaxLength,
   MAX_STRING_LENGTH: 536870888,
@@ -850,6 +927,10 @@ const bufferModule: Record<string, unknown> = {
   SlowBuffer,
   kMaxLength,
   INSPECT_MAX_BYTES,
+  Blob,
+  File,
+  isAscii,
+  isUtf8,
   constants,
   transcode,
   resolveObjectURL,

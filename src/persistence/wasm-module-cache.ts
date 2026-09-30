@@ -5,6 +5,9 @@
 // environments) degrade to a no-op: every operation is best-effort and a
 // failure is just a cache miss.
 
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex } from "@noble/hashes/utils";
+
 const DB_NAME = "nodepod-wasm-modules";
 const STORE_NAME = "wasmModules";
 const DB_VERSION = 1;
@@ -23,48 +26,13 @@ export interface WasmModuleCache {
   close(): void;
 }
 
-// Fast synchronous content hash: dual-lane FNV-1a plus the byte length. Used
-// as the in-memory (L1) cache key where we cannot await crypto.subtle. A
-// module is looked up by it several times per load, so a large binary is
-// sampled (both ends in full, plus ~64k bytes spread over the rest: about a
-// millisecond for 16MB instead of a byte-by-byte pass); the persistent key is
-// still a SHA-256 of every byte (wasmContentHash).
-const FULL_HASH_LIMIT = 256 * 1024;
-const HASH_END_BYTES = 64 * 1024;
-const HASH_SAMPLES = 65536;
+// Sync constructors cannot await crypto.subtle. Hash every byte before
+// reusing executable code: a sampled key can miss changes to instructions.
 export function quickWasmHash(bytes: Uint8Array): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0xcbf29ce4;
-  const n = bytes.length;
-  if (n <= FULL_HASH_LIMIT) {
-    for (let i = 0; i < n; i++) {
-      const b = bytes[i];
-      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
-    }
-  } else {
-    const step = Math.max(1, Math.floor((n - 2 * HASH_END_BYTES) / HASH_SAMPLES));
-    for (let i = 0; i < HASH_END_BYTES; i++) {
-      const b = bytes[i];
-      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
-    }
-    for (let i = HASH_END_BYTES; i < n - HASH_END_BYTES; i += step) {
-      const b = bytes[i];
-      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
-    }
-    for (let i = n - HASH_END_BYTES; i < n; i++) {
-      const b = bytes[i];
-      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
-    }
-  }
-  return `${h1.toString(16)}-${h2.toString(16)}-${n.toString(16)}`;
+  return bytesToHex(sha256(bytes));
 }
 
-// Strong content hash for the persistent (IDB) key. Falls back to the quick
-// hash when crypto.subtle is unavailable (insecure contexts).
+// Persistent keys use the same digest even without crypto.subtle.
 export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
   try {
     const subtle = globalThis.crypto?.subtle;
@@ -73,7 +41,7 @@ export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
       // subtle rejects: then a copy)
       const buf =
         typeof SharedArrayBuffer !== "undefined" && bytes.buffer instanceof SharedArrayBuffer
-          ? ((bytes.buffer as SharedArrayBuffer).slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as unknown as ArrayBuffer)
+          ? new Uint8Array(bytes)
           : (bytes as Uint8Array<ArrayBuffer>);
       const digest = await subtle.digest("SHA-256", buf);
       return Array.from(new Uint8Array(digest))
@@ -83,7 +51,7 @@ export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
   } catch {
     /* fall through */
   }
-  return "fnv:" + quickWasmHash(bytes);
+  return quickWasmHash(bytes);
 }
 
 function openDB(): Promise<IDBDatabase | null> {

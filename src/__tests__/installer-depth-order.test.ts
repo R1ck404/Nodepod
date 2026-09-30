@@ -51,6 +51,13 @@ describe("dependency extraction ordering", () => {
 });
 
 describe("WASI companion discovery", () => {
+  it("discovers wasm-bindgen companions from arbitrary loader references", () => {
+    expect(findWasiPackageReferences(`
+      const variants = ['@scope/compiler-wasm-nodejs', '@scope/compiler-wasm-web'];
+      require('other-wasm32-wasi/loader.cjs');
+      const ordinary = 'file.wasm';
+    `)).toEqual(["@scope/compiler-wasm-nodejs", "@scope/compiler-wasm-web", "other-wasm32-wasi"]);
+  });
   it("finds scoped wasm32-wasi package references without package-specific names", () => {
     const source = [
       'const first = "@scope/native-wasm32-wasi";',

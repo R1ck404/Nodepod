@@ -33,6 +33,7 @@ export function collectBinarySnapshotParts(
 ): BinarySnapshotParts {
   const manifest: VFSBinarySnapshot["manifest"] = [];
   const chunks: Uint8Array[] = [];
+  const linkedContent = new Map<number, { offset: number; length: number }>();
   let totalSize = 0;
 
   const walk = (dir: string): void => {
@@ -77,17 +78,27 @@ export function collectBinarySnapshotParts(
           });
         }
       } else if (filter(fullPath)) {
-        let content: Uint8Array;
-        try {
-          // a bulk copy: packed package files stay packed
-          content = vol.peekFileSync(fullPath);
-        } catch {
-          continue;
+        const linked = stat.nlink > 1 ? linkedContent.get(stat.ino) : undefined;
+        const offset = linked?.offset ?? totalSize;
+        let length = linked?.length;
+        if (length === undefined) {
+          let content: Uint8Array;
+          try {
+            // A bulk copy: packed files stay packed. An alias reuses the
+            // payload already collected without inflating it again.
+            content = vol.peekFileSync(fullPath);
+          } catch {
+            continue;
+          }
+          length = content.byteLength;
+          if (stat.nlink > 1) linkedContent.set(stat.ino, { offset, length });
+          chunks.push(content);
+          totalSize += length;
         }
         manifest.push({
           path: fullPath,
-          offset: totalSize,
-          length: content.byteLength,
+          offset,
+          length,
           isDirectory: false,
           inode: stat.ino,
           mode: stat.mode,
@@ -96,8 +107,6 @@ export function collectBinarySnapshotParts(
           ctimeMs: stat.ctimeMs,
           nlink: stat.nlink,
         });
-        chunks.push(content);
-        totalSize += content.byteLength;
       }
     }
   };

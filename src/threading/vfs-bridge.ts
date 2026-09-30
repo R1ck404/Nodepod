@@ -62,6 +62,7 @@ export class VFSBridge {
   createSnapshot(opts?: { excludeDirNames?: string[] }): VFSBinarySnapshot {
     const manifest: VFSSnapshotEntry[] = [];
     const chunks: Uint8Array[] = [];
+    const linkedContent = new Map<number, { offset: number; length: number }>();
     let totalSize = 0;
     const exclude =
       opts?.excludeDirNames && opts.excludeDirNames.length > 0
@@ -78,14 +79,20 @@ export class VFSBridge {
           ...metadata,
         });
       } else if (content || metadata?.symlinkTarget !== undefined) {
+        const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+          ? linkedContent.get(metadata.inode)
+          : undefined;
         manifest.push({
           path,
-          offset: totalSize,
-          length: content?.byteLength ?? 0,
+          offset: linked?.offset ?? totalSize,
+          length: linked?.length ?? content?.byteLength ?? 0,
           isDirectory: false,
           ...metadata,
         });
-        if (content) {
+        if (content && !linked) {
+          if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+            linkedContent.set(metadata.inode, { offset: totalSize, length: content.byteLength });
+          }
           chunks.push(content);
           totalSize += content.byteLength;
         }
@@ -107,25 +114,13 @@ export class VFSBridge {
 
   // split into chunks for large transfers
   createChunkedSnapshots(): { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] {
-    const fullSnapshot = this.createSnapshot();
-    const totalSize = fullSnapshot.data.byteLength;
-
-    if (totalSize <= VFS_CHUNK_SIZE) {
-      return [{
-        chunkIndex: 0,
-        totalChunks: 1,
-        data: fullSnapshot.data,
-        manifest: fullSnapshot.manifest,
-      }];
-    }
-
+    // Build each output directly from the volume. Constructing one full
+    // snapshot first doubled the payload allocation at peak.
     const pending: Array<{ data: ArrayBuffer; manifest: VFSSnapshotEntry[] }> = [];
-    const fullData = new Uint8Array(fullSnapshot.data);
-
-    const metadata = fullSnapshot.manifest.filter(entry => entry.isDirectory || entry.symlinkTarget !== undefined);
-    let entries: VFSSnapshotEntry[] = [...metadata];
+    let entries: VFSSnapshotEntry[] = [];
     let dataParts: Uint8Array[] = [];
     let chunkBytes = 0;
+    const linkedContent = new Map<number, { entries: VFSSnapshotEntry[]; offset: number; length: number }>();
 
     const flush = (): void => {
       if (entries.length === 0) return;
@@ -142,17 +137,32 @@ export class VFSBridge {
       chunkBytes = 0;
     };
 
-    for (const entry of fullSnapshot.manifest) {
-      if (entry.isDirectory || entry.symlinkTarget !== undefined) continue;
-      if (chunkBytes > 0 && chunkBytes + entry.length > VFS_CHUNK_SIZE) flush();
-      const content = fullData.subarray(entry.offset, entry.offset + entry.length);
-      entries.push({ ...entry, offset: chunkBytes });
+    this._walkVolume("/", (path, isDirectory, content, metadata) => {
+      if (isDirectory || metadata?.symlinkTarget !== undefined) {
+        entries.push({ path, offset: 0, length: 0, isDirectory, ...metadata });
+        return;
+      }
+      if (!content) return;
+      const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+        ? linkedContent.get(metadata.inode)
+        : undefined;
+      if (linked) {
+        // Keep all aliases in the chunk owning their payload. That also
+        // preserves hardlinks when chunks are mounted one at a time.
+        linked.entries.push({ path, offset: linked.offset, length: linked.length, isDirectory: false, ...metadata });
+        return;
+      }
+      if (chunkBytes > 0 && chunkBytes + content.byteLength > VFS_CHUNK_SIZE) flush();
+      entries.push({ path, offset: chunkBytes, length: content.byteLength, isDirectory: false, ...metadata });
+      if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+        linkedContent.set(metadata.inode, { entries, offset: chunkBytes, length: content.byteLength });
+      }
       dataParts.push(content);
       chunkBytes += content.byteLength;
-
-    }
+    });
 
     flush();
+    if (pending.length === 0) pending.push({ data: new ArrayBuffer(0), manifest: [] });
     return pending.map((chunk, chunkIndex) => ({
       ...chunk,
       chunkIndex,

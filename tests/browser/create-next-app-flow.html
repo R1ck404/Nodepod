@@ -1,0 +1,142 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>create-next-app complete browser flow</title>
+<style>
+  body { margin: 16px; background: #111; color: #eee; font: 14px system-ui; }
+  iframe { width: 100%; height: 440px; background: white; border: 1px solid #555; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; }
+</style>
+<h1>Real npx create-next-app flow inside Nodepod</h1>
+<p id="status">Booting</p><iframe id="preview"></iframe><pre id="checks"></pre><pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from '/dist/index.mjs';
+  const state = window.__createNextFlow = { checks: {}, commands: [], log: [], errors: [], stage: 'boot', done: false };
+  const frame = document.querySelector('#preview');
+  const cwd = '/workspace/app';
+  const check = (name, value) => {
+    state.checks[name] = value;
+    document.querySelector('#checks').textContent = JSON.stringify(state.checks, null, 2);
+  };
+  const log = text => {
+    state.log.push(text);
+    document.querySelector('#log').textContent = state.log.join('').slice(-22000);
+  };
+  const wait = async (predicate, description, timeout = 180000) => {
+    const start = performance.now();
+    while (!await predicate()) {
+      if (performance.now() - start > timeout) throw Error(`Timed out: ${description}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  };
+  addEventListener('message', event => {
+    if (event.source !== frame.contentWindow || !event.data?.createNextFlow || event.data.stage !== state.stage) return;
+    if (event.data.error) state.errors.push(event.data.error);
+    else state.proof = event.data;
+  });
+  frame.addEventListener('load', () => state.loads = (state.loads || 0) + 1);
+  const counter = generation => `'use client';
+import { useState } from 'react';
+export default function FlowCounter() {
+  const [count, setCount] = useState(0);
+  return <section><h2>Flow generation ${generation}</h2><button id="flow-counter" onClick={() => setCount(count + 1)}>Flow count {count}</button></section>;
+}`;
+  let pod;
+  try {
+    pod = state.pod = await Nodepod.boot({ workdir: '/workspace', watermark: false, allowedFetchDomains: null, enableSnapshotCache: false,
+      onServerReady(port, url) { if (port === 3000) { state.url = url; frame.src = url; } },
+    });
+    const spawn = async (name, command, args, directory = cwd, env = {}) => {
+      document.querySelector('#status').textContent = name;
+      log(`\n$ ${command} ${args.join(' ')} [${directory}]\n`);
+      const process = await pod.spawn(command, args, { cwd: directory, env: { CI: '1', ...env } });
+      process.on('output', log); process.on('error', log);
+      state.process = process;
+      return process;
+    };
+    const run = async (name, command, args, directory = cwd, env = {}) => {
+      const process = await spawn(name, command, args, directory, env);
+      let result;
+      process.completion.then(value => result = value);
+      await wait(() => result, name, 300000);
+      state.commands.push({ name, command, args, cwd: directory, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr });
+      check(name, result.exitCode);
+      if (result.exitCode !== 0) throw Error(`${name}: exit ${result.exitCode}`);
+      return result;
+    };
+    const preview = async stage => {
+      state.stage = stage; state.proof = null;
+      await pod.setPreviewScript(`
+        const report = data => parent.postMessage({createNextFlow:true,stage:${JSON.stringify(stage)},...data},'*');
+        addEventListener('error',e=>report({error:String(e.message)}));
+        addEventListener('unhandledrejection',e=>report({error:String(e.reason)}));
+        addEventListener('message',e=>{if(e.data?.flowClick)document.querySelector('#flow-counter')?.click()});
+        setInterval(()=>report({text:document.body?.innerText,images:[...document.images].map(i=>({src:i.getAttribute('src'),loaded:i.complete&&i.naturalWidth>0})),font:getComputedStyle(document.body).fontFamily}),100);
+      `);
+    };
+    const scaffold = await run('scaffold + install', 'npx', ['create-next-app@latest', 'app', '--yes', '--use-npm', '--webpack', '--disable-git'], '/workspace');
+    if (/Unexpected error while generating route types/.test(scaffold.stdout + scaffold.stderr)) throw Error('Successful typegen reached its failure handler');
+    check('typegenCleanExit', true);
+    const pkg = JSON.parse(await pod.fs.readFile(cwd + '/package.json', 'utf8'));
+    check('generatedPackage', pkg);
+    check('installedNext', JSON.parse(await pod.fs.readFile(cwd + '/node_modules/next/package.json', 'utf8')).version);
+    state.generatedLayout = await pod.fs.readFile(cwd + '/app/layout.tsx', 'utf8');
+    state.generatedPage = await pod.fs.readFile(cwd + '/app/page.tsx', 'utf8');
+    try { state.generatedAgentInstructions = await pod.fs.readFile(cwd + '/AGENTS.md', 'utf8'); } catch {}
+    await run('npm scripts', 'npm', ['run']);
+    await run('ESLint', 'npm', ['run', 'lint']);
+    await run('TypeScript', 'npx', ['tsc', '--noEmit']);
+    await preview('development');
+    const dev = state.dev = await spawn('development', 'npm', ['run', 'dev', '--', '--webpack'], cwd, { NODE_ENV: 'development' });
+    await wait(() => /get started/i.test(state.proof?.text || ''), 'unmodified generated template render');
+    check('originalTemplate', state.proof);
+    if (!state.proof.images.some(image => image.loaded)) throw Error('Generated template images did not load');
+    await pod.fs.writeFile(cwd + '/app/flow-counter.tsx', counter(0));
+    const updated = 'import FlowCounter from "./flow-counter";\n' + state.generatedPage.replace(/(<main\b[^>]*>)/, '$1<FlowCounter />');
+    if (!updated.includes('<FlowCounter />')) throw Error('Could not insert counter into generated page');
+    await pod.fs.writeFile(cwd + '/app/page.tsx', updated);
+    await wait(() => state.proof?.text?.includes('Flow generation 0'), 'added client component');
+    frame.contentWindow.postMessage({ flowClick: true }, '*');
+    await wait(() => state.proof?.text?.includes('Flow count 1'), 'client hydration and click');
+    check('devClick', state.proof.text);
+    const loads = state.loads;
+    await pod.fs.writeFile(cwd + '/app/flow-counter.tsx', counter(1));
+    await wait(() => state.proof?.text?.includes('Flow generation 1'), 'Fast Refresh');
+    if (!state.proof.text.includes('Flow count 1') || state.loads !== loads) throw Error('Fast Refresh lost state or reloaded');
+    check('refreshPreservedState', true);
+    await pod.fs.writeFile(cwd + '/app/api/health/route.ts', 'export function GET() { return Response.json({ ok: true }); }');
+    const routes = async phase => {
+      for (const path of ['/', '/api/health']) {
+        let response;
+        if (phase === 'dev' && path === '/api/health') {
+          // A newly added route is discovered asynchronously by the dev watcher.
+          await wait(async () => {
+            response = await pod.request(3000, { path, headers: { host: 'localhost:3000' } });
+            return response.statusCode === 200;
+          }, 'new API route discovery', 30000);
+        } else response = await pod.request(3000, { path, headers: { host: 'localhost:3000' } });
+        const body = new TextDecoder().decode(response.body);
+        const correct = path === '/' ? body.includes('Flow generation 1') : JSON.parse(body).ok === true;
+        check(phase + path, { status: response.statusCode, bytes: response.body.length, correct });
+        if (response.statusCode !== 200 || !correct) throw Error(`${phase} ${path}: invalid response`);
+      }
+    };
+    await routes('dev');
+    dev.kill(); await dev.completion;
+    await run('edited ESLint', 'npm', ['run', 'lint']);
+    await run('production build', 'npm', ['run', 'build', '--', '--webpack'], cwd, { NODE_ENV: 'production' });
+    await preview('production');
+    state.production = await spawn('production start', 'npm', ['run', 'start'], cwd, { NODE_ENV: 'production' });
+    await wait(() => state.proof?.text?.includes('Flow generation 1'), 'production template render');
+    frame.contentWindow.postMessage({ flowClick: true }, '*');
+    await wait(() => state.proof?.text?.includes('Flow count 1'), 'production hydration and click');
+    check('productionClick', state.proof);
+    await routes('production');
+    if (state.errors.length) throw Error(state.errors.join('; '));
+    state.done = true;
+    document.querySelector('#status').textContent = 'PASS: actual create-next-app scaffold, install, lint, types, dev, refresh, build and production';
+  } catch (error) {
+    state.error = String(error); state.done = true;
+    document.querySelector('#status').textContent = 'FAIL: ' + error;
+    log('\n' + (error.stack || error) + '\n');
+  }
+</script>

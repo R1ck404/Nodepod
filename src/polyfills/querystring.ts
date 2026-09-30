@@ -23,7 +23,7 @@ export function parse(
   kvSep: string = '=',
   options?: { maxKeys?: number }
 ): ParsedQuery {
-  const output: ParsedQuery = {};
+  const output: ParsedQuery = Object.create(null);
   if (!input || typeof input !== 'string') return output;
 
   const ceiling = options?.maxKeys || 1000;
@@ -59,8 +59,21 @@ export function parse(
   return output;
 }
 
+// Node only serializes primitive values. In particular, an undefined own
+// property is an empty value, not an omitted key. Loader option round-trips
+// rely on the distinction between an absent option and an empty one.
+function stringifyPrimitive(value: unknown): string {
+  switch (typeof value) {
+    case "string": return value;
+    case "boolean": return value ? "true" : "false";
+    case "bigint": return String(value);
+    case "number": return Number.isFinite(value) ? String(value) : "";
+    default: return "";
+  }
+}
+
 export function stringify(
-  obj: Record<string, string | string[] | number | boolean | undefined>,
+  obj: Record<string, unknown>,
   pairSep: string = '&',
   kvSep: string = '='
 ): string {
@@ -69,15 +82,14 @@ export function stringify(
   const parts: string[] = [];
 
   for (const [key, val] of Object.entries(obj)) {
-    if (val === undefined) continue;
     const encodedKey = encodeURIComponent(key);
 
     if (Array.isArray(val)) {
       for (const item of val) {
-        parts.push(`${encodedKey}${kvSep}${encodeURIComponent(String(item))}`);
+        parts.push(`${encodedKey}${kvSep}${encodeURIComponent(stringifyPrimitive(item))}`);
       }
     } else {
-      parts.push(`${encodedKey}${kvSep}${encodeURIComponent(String(val))}`);
+      parts.push(`${encodedKey}${kvSep}${encodeURIComponent(stringifyPrimitive(val))}`);
     }
   }
 

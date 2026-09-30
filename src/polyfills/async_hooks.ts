@@ -9,6 +9,8 @@
 // keeps the active frame until an async callback's returned promise settles so
 // the frame is still current when await registers its continuation handler.
 
+import { registerExitCleanup } from "../helpers/promise-exit";
+
 type StoreFrame = Map<object, unknown>;
 
 // Frames are never modified once they can be captured, so capturing one is a
@@ -25,6 +27,16 @@ function captureFrame(): StoreFrame {
 // run() scope that ends while that copy is current still restores what it
 // replaced, as if enterWith() had changed the scope's frame in place.
 const enteredFrom = new WeakMap<StoreFrame, StoreFrame>();
+const exitedFrames = new WeakMap<StoreFrame, StoreFrame>();
+
+function liveFrame(frame: StoreFrame): StoreFrame {
+  while (true) {
+    const entered = enteredFrom.get(frame);
+    const previous = exitedFrames.get(frame) ?? (entered && exitedFrames.get(entered));
+    if (!previous) return frame;
+    frame = previous;
+  }
+}
 
 function frameWith(frame: StoreFrame, key: object, value: unknown): StoreFrame {
   const next = new Map(frame);
@@ -33,6 +45,29 @@ function frameWith(frame: StoreFrame, key: object, value: unknown): StoreFrame {
 }
 
 const NativePromise = Promise;
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+let timerFrame: StoreFrame | undefined;
+let timerPrevious: StoreFrame | undefined;
+let timerRestorePending = false;
+
+function restoreTimerFrame(): void {
+  timerRestorePending = false;
+  if (currentFrame === timerFrame && timerPrevious) currentFrame = liveFrame(timerPrevious);
+  timerFrame = undefined;
+  timerPrevious = undefined;
+}
+
+function deferTimerRestore(previous: StoreFrame): void {
+  timerFrame = currentFrame;
+  if (timerRestorePending) return;
+  timerPrevious = previous;
+  timerRestorePending = true;
+  // Native await resumptions bypass then(). Keep the timer's frame through
+  // its microtask checkpoint, including further awaits, before restoring it.
+  // Coalesce restoration into one untracked checkpoint that does not keep Node alive.
+  const timer = nativeSetTimeout(restoreTimerFrame, 0);
+  (timer as unknown as { unref?: () => void }).unref?.();
+}
 
 // consumers bridging native async functions across an ABI need the intrinsic
 // constructor. installAsyncContext() replaces globalThis.Promise below, but
@@ -48,11 +83,11 @@ export function getNativePromiseConstructor(): typeof Promise {
 // for every subsequent native-await resumption.
 function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
-  currentFrame = frame;
+  currentFrame = liveFrame(frame);
   try {
     return fn();
   } finally {
-    currentFrame = prev;
+    currentFrame = liveFrame(prev);
   }
 }
 
@@ -64,11 +99,17 @@ function runWithFrame<R>(frame: StoreFrame, fn: () => R): R {
 function runScoped<R>(frame: StoreFrame, fn: () => R): R {
   const prev = currentFrame;
   currentFrame = frame;
+  let unregister = () => {};
   const finish = () => {
+    unregister();
     if (currentFrame === frame || enteredFrom.get(currentFrame) === frame) {
-      currentFrame = prev;
+      currentFrame = liveFrame(prev);
     }
   };
+  unregister = registerExitCleanup(() => {
+    exitedFrames.set(frame, prev);
+    finish();
+  });
   try {
     const result = fn();
     const maybePromise = result as unknown;
@@ -96,11 +137,11 @@ function wrapCallback<T extends (...args: any[]) => any>(
     // and would clobber the run's store. The run's frame is held by
     // runScoped instead, so restoring here hands control straight back to it.
     const prev = currentFrame;
-    currentFrame = frame;
+    currentFrame = liveFrame(frame);
     try {
       return cb(value);
     } finally {
-      currentFrame = prev;
+      currentFrame = liveFrame(prev);
     }
   } as T;
   return wrapped;
@@ -196,16 +237,17 @@ class ContextPromise<T = unknown> extends NativePromise<T> {
 }
 
 function patchTimerContext(): void {
-  const wrapTimer = <F extends (...args: any[]) => void>(fn: F): F => {
+  const wrapTimer = <F extends (...args: any[]) => void>(fn: F, handoff = false): F => {
     const frame = captureFrame();
     return ((...args: unknown[]) => {
-      // Sync restore for the same reason as wrapCallback.
       const prev = currentFrame;
-      currentFrame = frame;
+      currentFrame = liveFrame(frame);
       try {
         fn(...args);
       } finally {
-        currentFrame = prev;
+        if (handoff && frame.size > 0 && (currentFrame === frame || enteredFrom.get(currentFrame) === frame)) {
+          deferTimerRestore(prev);
+        } else currentFrame = liveFrame(prev);
       }
     }) as F;
   };
@@ -229,7 +271,7 @@ function patchTimerContext(): void {
     const origSetTimeout = globalThis.setTimeout.bind(globalThis);
     globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
       const wrapped =
-        typeof handler === "function" ? wrapTimer(handler as (...a: unknown[]) => void) : handler;
+        typeof handler === "function" ? wrapTimer(handler as (...a: unknown[]) => void, true) : handler;
       return origSetTimeout(wrapped, timeout as number, ...args);
     }) as typeof setTimeout;
     (globalThis.setTimeout as any).__nodepodAsyncCtx = true;
@@ -238,7 +280,7 @@ function patchTimerContext(): void {
   if (typeof globalThis.setImmediate === "function" && !ownTimer(globalThis.setImmediate)) {
     const origSetImmediate = globalThis.setImmediate.bind(globalThis);
     globalThis.setImmediate = ((handler: (...args: unknown[]) => void, ...args: unknown[]) => {
-      return origSetImmediate(wrapTimer(handler), ...args);
+      return origSetImmediate(wrapTimer(handler, true), ...args);
     }) as typeof setImmediate;
     (globalThis.setImmediate as any).__nodepodAsyncCtx = true;
   }

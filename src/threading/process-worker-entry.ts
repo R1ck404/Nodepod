@@ -28,6 +28,7 @@ installWasmWorkLifetime();
 import { SyncChannelWorker } from "./sync-channel";
 import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client";
 import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
 import type {
   MainToWorkerMessage,
   MainToWorker_Init,
@@ -57,6 +58,7 @@ let _ipcMessageHandler: ((data: unknown) => void) | null = null;
 // shell/child_process module has finished loading and installed its receiver.
 // Node buffers this traffic; preserve it here and replay after initialization.
 let _earlyIpcMessages: unknown[] = [];
+let _earlyIpcDisconnect = false;
 let _cols = 80;
 let _rows = 24;
 
@@ -64,6 +66,7 @@ const _spawnCallbacks = new Map<number, (result: any) => void>();
 const _childOutputCallbacks = new Map<number, (stream: string, data: string) => void>();
 const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
+const _ipcDisconnectCallbacks = new Map<number, () => void>();
 let _nextRequestId = 1;
 let _nextHttpClientId = 1;
 const MAX_CHILD_CAPTURE_CHARS = 4 * 1024 * 1024;
@@ -144,7 +147,7 @@ function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
   // vfs changes batched so far go first: the main thread sees everything in
   // the order it happened here
   if (_vfsBatch.length > 0) flushVfsBatch();
-  (self as unknown as Worker).postMessage(msg, transfer ?? []);
+  (self as unknown as Worker).postMessage(attachWasmMessageMetadata(msg), transfer ?? []);
 }
 
 // vfs-write/vfs-delete ops collected during a notification burst (see
@@ -214,7 +217,7 @@ function postStdinRawStatus(isRaw: boolean): void {
 
 self.addEventListener("message", (ev: MessageEvent) => {
   if (!ev?.data?.type) return;
-  const msg = ev.data as MainToWorkerMessage;
+  const msg = receiveWasmMessageMetadata(ev.data) as MainToWorkerMessage;
 
   switch (msg.type) {
     case "probe":
@@ -310,6 +313,15 @@ self.addEventListener("message", (ev: MessageEvent) => {
         // we're the forked child — emit on the process object
         handleIPCMessage(ipcMsg.data);
       }
+      break;
+    }
+    case "ipc-disconnect": {
+      if (msg.targetRequestId !== undefined) {
+        _ipcCallbacks.delete(msg.targetRequestId);
+        _ipcDisconnectCallbacks.get(msg.targetRequestId)?.();
+        _ipcDisconnectCallbacks.delete(msg.targetRequestId);
+      } else if (_shellMod) _shellMod.handleIPCDisconnect();
+      else _earlyIpcDisconnect = true;
       break;
     }
     case "http-request":
@@ -597,10 +609,14 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     const shell = await ensureShell();
 
     // enable IPC for forks — process.send() goes out as postMessage to main
-    if (msg.isFork) {
+    if (msg.isFork && !msg.isWorkerThread) {
       shell.setIPCSend((data: unknown) => {
         post({ type: "ipc-message", data });
-      });
+      }, msg.serialization, () => post({ type: "ipc-disconnect" }));
+      if (_earlyIpcDisconnect) {
+        _earlyIpcDisconnect = false;
+        shell.handleIPCDisconnect();
+      }
     }
 
     let workerThreadsOverride: {
@@ -708,6 +724,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
 
     const result = await shell.executeNodeBinary(filePath, args, ctx, {
       isFork: !!msg.isFork,
+      execArgv: msg.execArgv,
       workerThreadsOverride,
     });
 
@@ -1048,9 +1065,12 @@ export function forkChild(
   opts: {
     cwd: string;
     env: Record<string, string>;
+    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
     onIPC?: (data: unknown) => void;
+    onDisconnect?: () => void;
     onExit?: (exitCode: number) => void;
   },
 ): { sendIPC: (data: unknown) => void; disconnect: () => void; kill: (signal?: string) => boolean; requestId: number } {
@@ -1059,10 +1079,12 @@ export function forkChild(
   if (opts.onIPC) {
     _ipcCallbacks.set(requestId, opts.onIPC);
   }
+  if (opts.onDisconnect) _ipcDisconnectCallbacks.set(requestId, opts.onDisconnect);
 
   _spawnCallbacks.set(requestId, (result: any) => {
     if (result.error) {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
       opts.onStderr?.(`Fork error: ${result.error}\n`);
       opts.onExit?.(1);
       return;
@@ -1078,6 +1100,7 @@ export function forkChild(
 
     _childExitCallbacks.set(requestId, (exitCode: number) => {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
       opts.onExit?.(exitCode);
     });
   });
@@ -1089,6 +1112,8 @@ export function forkChild(
     args,
     cwd: opts.cwd,
     env: opts.env,
+    serialization: opts.serialization,
+    execArgv: opts.execArgv,
   });
 
   return {
@@ -1102,6 +1127,8 @@ export function forkChild(
     },
     disconnect: () => {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
+      post({ type: "ipc-disconnect", targetRequestId: requestId });
     },
     kill: (signal = "SIGTERM") => {
       post({ type: "child-signal", requestId, signal });

@@ -1,0 +1,38 @@
+<!doctype html><meta charset="utf-8"><title>Real CLI compatibility checks</title>
+<style>body{background:#111;color:#eee;font:14px system-ui;margin:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>
+<h1>Real CLI checks inside browser Nodepod</h1><p id="status">running</p><pre id="results"></pre>
+<script type="module">
+import {Nodepod} from '/dist/index.mjs';
+const state=window.__cliCompatibility={results:{},done:false};
+const pod=state.pod=await Nodepod.boot({workdir:'/cli',watermark:false,allowedFetchDomains:null,enableSnapshotCache:false,files:{
+  '/cli/package.json':JSON.stringify({name:'cli-check',version:'1.0.0',scripts:{probe:'node -e "console.log(\'scripts-ok\')"'}}),
+  '/cli/format.js':'const value={answer:42};console.log(value)\n',
+}});
+const cases=[
+  ['shell pipeline','sh',['-c','printf "alpha\\nbeta\\n" | grep beta'],r=>r.stdout==='beta\n'],
+  ['shell file operations','sh',['-c','mkdir -p nested && cp format.js nested/copy.js && cat nested/copy.js'],r=>r.stdout.includes('answer:42')],
+  ['npm script','npm',['run','probe'],r=>r.stdout.includes('scripts-ok')],
+  ['pnpm script','pnpm',['run','probe'],r=>r.stdout.includes('scripts-ok')],
+  ['yarn script','yarn',['run','probe'],r=>r.stdout.includes('scripts-ok')],
+  ['npm pkg','npm',['pkg','get','name'],r=>r.stdout.includes('cli-check')],
+  ['npx package binary','npx',['semver@latest','1.2.3','--range','^1.0.0'],r=>r.stdout.trim().endsWith('\n1.2.3')||r.stdout.trim()==='1.2.3'],
+  ['npm exec binary','npm',['exec','--','semver','2.3.4','--range','^2.0.0'],r=>r.stdout.trim()==='2.3.4'],
+  ['pnpm exec binary','pnpm',['exec','semver','3.4.5','--range','^3.0.0'],r=>r.stdout.trim()==='3.4.5'],
+  ['Prettier write','npx',['prettier@latest','--write','format.js'],r=>r.stdout.includes('format.js')],
+  ['Prettier check','npx',['prettier','--check','format.js'],r=>r.stdout.includes('All matched files')],
+  ['npm pack','npm',['pack','--ignore-scripts'],r=>r.stdout.includes('cli-check-1.0.0.tgz')],
+];
+for(const [name,command,args,accept] of cases){
+  document.querySelector('#status').textContent=name;
+  try{
+    const process=await pod.spawn(command,args,{cwd:'/cli'});
+    const result=await Promise.race([process.completion,new Promise((_,reject)=>setTimeout(()=>{process.kill();reject(Error('timeout'))},60000))]);
+    state.results[name]={command,args,...result,pass:result.exitCode===0&&accept(result)};
+  }catch(error){state.results[name]={command,args,error:String(error),pass:false}}
+  document.querySelector('#results').textContent=JSON.stringify(state.results,null,2);
+}
+state.formatted=await pod.fs.readFile('/cli/format.js','utf8');
+state.packFiles=await pod.fs.readdir('/cli');
+state.done=true;
+document.querySelector('#status').textContent=Object.values(state.results).every(r=>r.pass)?'PASS: all CLI checks':'FAIL: inspect results';
+</script>

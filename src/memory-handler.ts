@@ -137,6 +137,12 @@ export interface MemoryHandlerOptions {
    * while. Needs lean spawn snapshots (SharedArrayBuffer). Default: true.
    */
   packPackageContent?: boolean;
+  /**
+   * Include dormant WASM binaries in package compression. Reduces retained
+   * binary bytes, but loading a compressed engine adds decompression time.
+   * Requires packPackageContent. Default: false.
+   */
+  packWasmContent?: boolean;
 }
 
 const DEFAULTS: Required<MemoryHandlerOptions> = {
@@ -154,6 +160,7 @@ const DEFAULTS: Required<MemoryHandlerOptions> = {
   evictPackageContent: false,
   residentContentBudgetMB: 128,
   packPackageContent: true,
+  packWasmContent: false,
 };
 
 /* ---- MemoryHandler ---- */

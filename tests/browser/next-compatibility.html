@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Next.js runtime compatibility</title>
+<style>
+  body { margin: 16px; background: #111; color: #eee; font: 14px system-ui; }
+  iframe { width: 100%; height: 340px; background: white; border: 1px solid #555; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+</style>
+<h1>Next.js build, refresh and production verification</h1>
+<p id="status">Starting…</p><iframe id="preview"></iframe><pre id="checks"></pre><pre id="log"></pre>
+<script type="module">
+  const params = new URLSearchParams(location.search);
+  const version = params.get('version') || '14.2.35';
+  const major = Number(version.split('.')[0]);
+  const output = params.get('output');
+  const webpack = major >= 16 && !params.has('turbo') ? ['--webpack'] : [];
+  const { Nodepod } = await import('/dist/index.mjs');
+  const frame = document.querySelector('#preview');
+  const state = window.__nextCompatibility = { version, output, checks: {}, log: [], proof: null, loads: 0, errors: [], done: false };
+  const log = text => {
+    state.log.push(text);
+    document.querySelector('#log').textContent = state.log.join('').slice(-12000);
+  };
+  const check = (name, value) => {
+    state.checks[name] = value;
+    document.querySelector('#checks').textContent = JSON.stringify(state.checks, null, 2);
+  };
+  const wait = async (predicate, description, timeout = 120000) => {
+    const start = performance.now();
+    while (!predicate()) {
+      if (performance.now() - start > timeout) throw Error(`Timed out: ${description}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  };
+  addEventListener('message', event => {
+    if (event.source !== frame.contentWindow || !event.data?.nextCompatibility || event.data.stage !== state.stage) return;
+    if (event.data.error) state.errors.push(event.data.error);
+    else state.proof = event.data;
+  });
+  frame.addEventListener('load', () => state.loads++);
+  const page = generation => `'use client';import{useState}from'react';export default function Home(){const[n,setN]=useState(0);return <main><h1>Refresh generation ${generation}</h1><button id="counter" onClick={()=>setN(n+1)}>Count is {n}</button></main>}`;
+  let pod;
+  try {
+    pod = state.pod = await Nodepod.boot({
+      workdir: '/app', watermark: false, allowedFetchDomains: null,
+      files: {
+        '/app/package.json': JSON.stringify({name:'next-compatibility',version:'1.0.0',dependencies:{next:version,react:major<15?'18.3.1':'19.2.8','react-dom':major<15?'18.3.1':'19.2.8'}}),
+        '/app/next.config.mjs': `export default ${JSON.stringify(output ? {output} : {})}`,
+        '/app/app/layout.js': 'export default function Layout({children}){return <html lang="en"><body>{children}</body></html>}',
+        '/app/app/page.js': page(0),
+        '/app/app/about/page.js': 'export default function About(){return <h1>Second route</h1>}',
+        '/app/app/api/health/route.js': 'export function GET(){return Response.json({ok:true})}',
+      },
+      onServerReady(port, url) { if (port === 3000) frame.src = url; },
+    });
+    const preview = async stage => {
+      state.stage = stage;
+      await pod.setPreviewScript(`
+      const report = data => parent.postMessage({nextCompatibility:true,stage:${JSON.stringify(stage)},...data},'*');
+      addEventListener('error',e=>report({error:String(e.message)}));
+      addEventListener('unhandledrejection',e=>report({error:String(e.reason)}));
+      addEventListener('message',e=>{if(e.data?.nextCompatibilityClick)document.querySelector('#counter')?.click()});
+      setInterval(()=>report({text:document.body?.innerText}),100);
+      `);
+    };
+    await preview('development');
+    const spawn = async (command, args, env) => {
+      const process = await pod.spawn(command, args, {cwd:'/app',env});
+      process.on('output',log); process.on('error',log);
+      return process;
+    };
+    const install = await (await spawn('npm',['install'])).completion;
+    if (install.exitCode) throw Error(`Install failed: ${install.exitCode}`);
+    document.querySelector('#status').textContent = `Next ${version}: development and refresh`;
+    const cli = 'node_modules/next/dist/bin/next';
+    const dev = await spawn('node',[cli,'dev',...webpack],{NODE_ENV:'development'});
+    await wait(()=>state.proof?.text?.includes('Refresh generation 0'), 'dev render');
+    frame.contentWindow.postMessage({nextCompatibilityClick:true},'*');
+    await wait(()=>state.proof?.text?.includes('Count is 1'), 'dev hydration and click');
+    check('devClick',state.proof.text);
+    const loads = state.loads;
+    await pod.fs.writeFile('/app/app/page.js',page(1));
+    await wait(()=>state.proof?.text?.includes('Refresh generation 1'), 'refresh update');
+    if (!state.proof.text.includes('Count is 1') || state.loads !== loads) throw Error('Refresh reset state or reloaded');
+    check('refreshPreservedState',true);
+    for (const route of ['/', '/about', '/api/health']) {
+      const response = await pod.request(3000,{path:route,headers:{host:'localhost:3000'}});
+      check(`dev${route}`,response.statusCode);
+      if (response.statusCode !== 200) throw Error(`Development ${route}: ${response.statusCode}`);
+      const body = new TextDecoder().decode(response.body);
+      if (route === '/api/health' ? JSON.parse(body).ok !== true : !body.includes(route === '/' ? 'Refresh generation 1' : 'Second route')) throw Error(`Development ${route}: incorrect response body`);
+    }
+    dev.kill(); await dev.completion;
+    document.querySelector('#status').textContent = `Next ${version}: production build`;
+    const buildProcess = await spawn('node',[cli,'build',...webpack],{NODE_ENV:'production'});
+    let buildResult;
+    buildProcess.completion.then(result=>buildResult=result);
+    await wait(()=>buildResult, 'build exit');
+    check('buildExitCode',buildResult.exitCode);
+    if (buildResult.exitCode) throw Error(`Build failed: ${buildResult.exitCode}`);
+    if (output === 'standalone') {
+      await pod.fs.writeFile('/app/copy-static.cjs',"require('fs').cpSync('.next/static','.next/standalone/.next/static',{recursive:true});");
+      const copy = await (await spawn('node',['copy-static.cjs'])).completion;
+      if (copy.exitCode) throw Error('Could not prepare standalone assets');
+    }
+    state.proof = null;
+    await preview('production');
+    const production = await spawn('node', output === 'standalone' ? ['.next/standalone/server.js'] : [cli,'start'], {NODE_ENV:'production',PORT:'3000',HOSTNAME:'0.0.0.0'});
+    state.production = production;
+    await wait(()=>state.proof?.text?.includes('Refresh generation 1'), 'production render');
+    frame.contentWindow.postMessage({nextCompatibilityClick:true},'*');
+    await wait(()=>state.proof?.text?.includes('Count is 1'), 'production hydration and click');
+    check('productionClick',state.proof.text);
+    for (const path of ['/','/about','/api/health']) {
+      const response = await pod.request(3000,{path,headers:{host:'localhost:3000'}});
+      check(path,response.statusCode);
+      if (response.statusCode !== 200) throw Error(`${path}: HTTP ${response.statusCode}`);
+      const body = new TextDecoder().decode(response.body);
+      if (path === '/api/health' ? JSON.parse(body).ok !== true : !body.includes(path === '/' ? 'Refresh generation 1' : 'Second route')) throw Error(`Production ${path}: incorrect response body`);
+    }
+    if (state.errors.length) throw Error(`Client errors: ${state.errors.join('; ')}`);
+    state.done = true;
+    document.querySelector('#status').textContent = `PASS: Next ${version}, refresh preserved state, build exited, production rendered and hydrated`;
+  } catch (error) {
+    state.error = String(error); state.done = true;
+    document.querySelector('#status').textContent = `FAIL: ${error}`;
+    log(`\n${error.stack || error}\n`);
+  }
+</script>

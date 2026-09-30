@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { ScriptEngine } from "../script-engine";
 import { MemoryVolume } from "../memory-volume";
+import { Module as NativeModule } from "node:module";
 
 function createEngine(files?: Record<string, string>) {
   const vol = new MemoryVolume();
@@ -16,6 +17,58 @@ function createEngine(files?: Record<string, string>) {
 }
 
 describe("ScriptEngine", () => {
+  it("coerces dynamic import specifiers once, accepts URL objects and rejects coercion failures asynchronously", async () => {
+    const source = `module.exports = (async () => {
+      const { pathToFileURL } = require('node:url');
+      let conversions = 0;
+      const url = pathToFileURL('/project/value.cjs');
+      const a = await import(url);
+      const b = await import({ toString() { conversions++; return url.href; } });
+      const c = await import(Symbol('invalid')).catch(error => error instanceof TypeError);
+      const d = await import({ toString() { throw new Error('coercion'); } }).catch(error => error.message);
+      let requireRejected = false;
+      try { require(url); } catch { requireRejected = true; }
+      return [a.default, b.default, conversions, c, d, requireRejected];
+    })();`;
+    const { engine } = createEngine({ "/project/value.cjs": "module.exports = 42;", "/project/import.cjs": source });
+    expect(await (await engine.runFileTLA("/project/import.cjs")).exports).toEqual([42, 42, 1, true, "coercion", true]);
+    expect(await engine.execute(source, "/project/direct-import.cjs").exports).toEqual([42, 42, 1, true, "coercion", true]);
+  });
+
+  it("binds CommonJS top-level this to the initial exports object in all loaders", async () => {
+    const code = `'use strict';
+      const initial = exports;
+      this.marker = 'exports receiver';
+      module.exports = {
+        bound: this === initial,
+        arrowBound: (() => this)() === initial,
+        browserEvents: typeof this.addEventListener,
+        marker: initial.marker,
+      };`;
+    const native = new NativeModule("/project/receiver.cjs");
+    (native as any)._compile(code, "/project/receiver.cjs");
+    expect(native.exports).toEqual({ bound: true, arrowBound: true, browserEvents: "undefined", marker: "exports receiver" });
+    const { engine } = createEngine({
+      "/project/receiver.cjs": code,
+      "/project/receiver.js": code,
+    });
+    expect(engine.execute(code, "/project/direct.cjs").exports).toEqual(native.exports);
+    expect((await engine.runFileTLA("/project/receiver.cjs")).exports).toEqual(native.exports);
+    expect(engine.execute("module.exports = require(\"./receiver.js\");", "/project/entry.cjs").exports).toEqual(native.exports);
+  });
+
+  it("loads single-slash file URLs and preserves encoded filename punctuation", async () => {
+    const { engine } = createEngine({
+      "/project/a#b.js": "module.exports = 41;",
+      "/project/a?b.js": "module.exports = 42;",
+      "/project/entry.cjs": `module.exports = (async () => [
+        (await import('file:/project/a%23b.js')).default,
+        (await import('file:///project/a%3Fb.js')).default
+      ])();`,
+    });
+    const result = await engine.runFileTLA("/project/entry.cjs");
+    expect(await result.exports).toEqual([41, 42]);
+  });
   describe("execute()", () => {
     it("runs basic JS and returns exports", () => {
       const { engine } = createEngine();

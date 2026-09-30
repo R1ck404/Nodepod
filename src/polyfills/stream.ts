@@ -35,6 +35,41 @@ function flushEncodedTail(stream: any): void {
   if (rest) stream.emit("data", rest);
 }
 
+function endReadable(stream: any): void {
+  if (!stream._terminated || stream._queue.length || stream._endFired) return;
+  stream._endFired = true;
+  queueMicrotask(() => {
+    if (stream._queue.length) { stream._endFired = false; return; }
+    if (stream.destroyed || stream._endEmitted) return;
+    stream.readableEnded = true;
+    stream.readable = false;
+    stream._endEmitted = true;
+    flushEncodedTail(stream);
+    stream.emit("end");
+    if (stream._autoDestroy && !(stream.writable && !stream.writableFinished)) stream.destroy();
+  });
+}
+
+function notifyReadable(stream: any): void {
+  if (stream._readableNotificationScheduled || !stream.listenerCount("readable")) return;
+  stream._readableNotificationScheduled = true;
+  queueMicrotask(() => {
+    stream._readableNotificationScheduled = false;
+    if (!stream.destroyed && !stream._endEmitted && (stream._queue.length || stream._terminated)) {
+      stream.emit("readable");
+    }
+  });
+}
+
+function listenReadable(stream: any): void {
+  stream.pause();
+  notifyReadable(stream);
+  // Lazy producers must be started even when no data listener enables flow.
+  queueMicrotask(() => {
+    if (!stream.destroyed && !stream._terminated && !stream._reading) stream.read(0);
+  });
+}
+
 // Readable
 
 export interface Readable extends EventEmitter {
@@ -63,7 +98,7 @@ export interface Readable extends EventEmitter {
   resume(): this;
   pause(): this;
   isPaused(): boolean;
-  pipe(target: any): any;
+  pipe(target: any, options?: { end?: boolean }): any;
   unpipe(target?: any): this;
   setEncoding(enc: string): this;
   close(cb?: (err?: Error | null) => void): void;
@@ -193,7 +228,7 @@ Readable.prototype.on = function on(
     this.resume();
   }
   if (evt === "readable") {
-    this.readableFlowing = false;
+    listenReadable(this);
   }
   // fire late 'end' listeners async (matches Node.js behavior)
   if (evt === "end" && this._endEmitted) {
@@ -245,12 +280,18 @@ Readable.prototype.once = function once(
     this.resume();
     return this;
   }
+  if (evt === "readable") {
+    EventEmitter.prototype.once.call(this, evt as string, fn);
+    listenReadable(this);
+    return this;
+  }
   return EventEmitter.prototype.once.call(this, evt as string, fn);
 };
 
 Readable.prototype.push = function push(chunk: any): boolean {
   if (chunk === null) {
     this._terminated = true;
+    notifyReadable(this);
     // Match Node: EOF is signaled but buffered data remains readable until drained.
     if (this._queue.length === 0) {
       this.readableEnded = true;
@@ -286,6 +327,7 @@ Readable.prototype.push = function push(chunk: any): boolean {
   if (this._active) {
     this._drain();
   }
+  notifyReadable(this);
   return this._queue.length < this._highWaterMark;
 };
 
@@ -350,10 +392,11 @@ Readable.prototype.read = function read(amount?: number): any {
     this._reading = false;
   }
 
-  if (this._queue.length === 0) return null;
+  if (this._queue.length === 0) { endReadable(this); return null; }
 
   if (this._objectMode) {
     const item = this._queue.shift();
+    endReadable(this);
     return item;
   }
 
@@ -364,11 +407,14 @@ Readable.prototype.read = function read(amount?: number): any {
     // one buffered Buffer: hand it over as is, like node (no concat copy)
     if (this._queue.length === 1 && Buffer.isBuffer(this._queue[0])) {
       this._readableByteLength = 0;
-      return this._queue.shift();
+      const item = this._queue.shift();
+      endReadable(this);
+      return item;
     }
     const combined = Buffer.concat(this._queue as Uint8Array[]);
     this._readableByteLength = 0;
     this._queue.length = 0;
+    endReadable(this);
     return combined;
   }
 
@@ -387,6 +433,7 @@ Readable.prototype.read = function read(amount?: number): any {
       needed = 0;
     }
   }
+  endReadable(this);
   return pieces.length > 0 ? Buffer.concat(pieces) : null;
 };
 
@@ -416,7 +463,7 @@ Readable.prototype.isPaused = function isPaused(): boolean {
   return !this._active;
 };
 
-Readable.prototype.pipe = function pipe(target: any): any {
+Readable.prototype.pipe = function pipe(target: any, options?: { end?: boolean }): any {
   const self = this;
   const onData = function onData(chunk: unknown) {
     const needDrain = !target.write(chunk);
@@ -426,7 +473,7 @@ Readable.prototype.pipe = function pipe(target: any): any {
     }
   };
   const onEnd = function onEnd() {
-    target.end();
+    if (options?.end !== false) target.end();
   };
   self.on("data", onData);
   self.on("end", onEnd);
@@ -1422,6 +1469,50 @@ export const Transform = function Transform(this: any, opts?: any) {
 
 Object.setPrototypeOf(Transform.prototype, Duplex.prototype);
 
+Transform.prototype.destroy = function destroy(fault?: Error): any {
+  if (this.destroyed) return this;
+  this._writeClosed = true;
+  this.writable = false;
+  this.writableNeedDrain = false;
+  this._transformDestroyError = fault ?? Object.assign(
+    new Error("Cannot call write after a stream was destroyed"),
+    { code: "ERR_STREAM_DESTROYED" },
+  );
+  // Release buffered chunks immediately. Only completion callbacks and their
+  // accounting remain until the active transform calls back, as in Node.
+  this._transformCancelledWrites = (this._transformWrites ?? []).map(
+    (entry: TransformWrite) => ({ callback: entry.callback, size: entry.size }),
+  );
+  this._transformWrites = [];
+  this._transformEnd = undefined;
+  Readable.prototype.destroy.call(this, fault);
+  if (!this._transformBusy) queueMicrotask(() => finishDestroyedTransform(this));
+  return this;
+};
+
+interface TransformWrite {
+  stored: unknown;
+  encoding: string;
+  callback?: (err?: Error | null) => void;
+  size: number;
+}
+
+function finishDestroyedTransform(stream: any): void {
+  const writes: Array<Pick<TransformWrite, "callback" | "size">> = stream._transformCancelledWrites ?? [];
+  stream._transformCancelledWrites = undefined;
+  for (const entry of writes) {
+    stream._writableByteLen -= entry.size;
+    entry.callback?.(stream._transformDestroyError);
+  }
+  const end = stream._transformEndCallback;
+  stream._transformEndCallback = undefined;
+  const endError = stream.errored ?? Object.assign(
+    new Error("Cannot call end after a stream was destroyed"),
+    { code: "ERR_STREAM_DESTROYED" },
+  );
+  end?.(endError);
+}
+
 Transform.prototype._transform = function _transform(
   chunk: any,
   _encoding: string,
@@ -1465,6 +1556,7 @@ Transform.prototype.write = function write(
   encOrCb?: string | ((err?: Error | null) => void),
   cb?: (err?: Error | null) => void,
 ): boolean {
+  if (this._writeClosed || this.destroyed) return false;
   const stored =
     !this._writeObjectMode && !this._objectMode && typeof chunk === "string"
       ? Buffer.from(chunk)
@@ -1472,23 +1564,60 @@ Transform.prototype.write = function write(
   const encoding = typeof encOrCb === "string" ? encOrCb : "utf8";
   const callback = typeof encOrCb === "function" ? encOrCb : cb;
 
-  this._transform(stored, encoding, (err: Error | null | undefined, output: any) => {
-    if (err) {
-      if (callback) callback(err);
-      return;
-    }
-    if (output !== undefined && output !== null) this.push(output);
-    if (callback) callback(null);
-  });
-  return true;
+  const size = this._writeObjectMode ? 1 : bufferByteLength(stored);
+  this._writableByteLen += size;
+  (this._transformWrites ??= []).push({ stored, encoding, callback, size });
+  drainTransform(this);
+  const belowHWM = this._writableByteLen < this._writeHighWaterMark;
+  if (!belowHWM) this.writableNeedDrain = true;
+  return belowHWM;
 };
+
+function drainTransform(stream: any): void {
+  if (stream._transformDraining || stream._transformBusy || stream.destroyed) return;
+  stream._transformDraining = true;
+  while (!stream._transformBusy && stream._transformWrites?.length && !stream.destroyed) {
+    const entry = stream._transformWrites.shift();
+    stream._transformBusy = true;
+    let called = false;
+    stream._transform(entry.stored, entry.encoding, (err: Error | null | undefined, output: any) => {
+      if (called) return;
+      called = true;
+      stream._transformBusy = false;
+      stream._writableByteLen -= entry.size;
+      if (stream.destroyed) {
+        entry.callback?.(err ?? null);
+        finishDestroyedTransform(stream);
+        return;
+      }
+      if (err) {
+        if (entry.callback) entry.callback(err);
+        stream.destroy(err);
+        return;
+      }
+      if (output !== undefined && output !== null) stream.push(output);
+      if (entry.callback) entry.callback(null);
+      if (stream.writableNeedDrain && stream._writableByteLen < stream._writeHighWaterMark) {
+        stream.writableNeedDrain = false;
+        stream.emit("drain");
+      }
+      if (!stream._transformDraining) drainTransform(stream);
+    });
+  }
+  stream._transformDraining = false;
+  if (!stream._transformBusy && !stream._transformWrites?.length && stream._transformEnd) {
+    const finish = stream._transformEnd;
+    stream._transformEnd = undefined;
+    finish();
+  }
+}
 
 Transform.prototype.end = function end(
   chunkOrCb?: any,
   encOrCb?: any,
   cb?: () => void,
 ): any {
-  // Write trailing chunk before flush so buffer-until-flush codecs see all data
+  if (this._writeClosed) return this;
   let endCb = cb;
   if (chunkOrCb !== undefined && typeof chunkOrCb !== "function") {
     const encoding = typeof encOrCb === "string" ? encOrCb : undefined;
@@ -1503,14 +1632,17 @@ Transform.prototype.end = function end(
     endCb = encOrCb;
   }
 
-  // flush eagerly so data reaches the pipe destination before _final's microtask
-  if (!this._flushed) {
-    this._flushed = true;
-    this._flush((_err: Error | null | undefined, output: any) => {
-      if (output !== undefined && output !== null) this.push(output);
-    });
-  }
-  return Duplex.prototype.end.call(this, endCb || chunkOrCb);
+  this._writeClosed = true;
+  this.writable = false;
+  this.writableEnded = true;
+  this._transformEndCallback = endCb || chunkOrCb;
+  this._transformEnd = () => {
+    const callback = this._transformEndCallback;
+    this._transformEndCallback = undefined;
+    Duplex.prototype.end.call(this, callback);
+  };
+  drainTransform(this);
+  return this;
 };
 
 // Stream (base class)

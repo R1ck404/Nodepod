@@ -1,11 +1,10 @@
-// napi-rs WASI loaders create their shared (threads) memory with a large
-// fixed initial size: rolldown's asks for 16384 pages, 1 GiB committed in
-// every process that loads it, although its module only declares 998 pages
-// (62 MiB) and grows on demand. Here such memories start small and are grown
+// Some WASI loaders request a large initial shared memory even when their
+// module declares a much smaller minimum and can grow on demand. Here such
+// memories start small and are grown
 // to the importing module's declared minimum when it is instantiated, which
 // is all the module needs to link. A module whose minimum can't be read
-// (compiled from a stream, or received from another thread) gets the size
-// the loader asked for, so nothing links against a smaller memory than before.
+// (without available source metadata) gets the size the loader asked for.
+// Cached modules retain the limits parsed before their source was transferred.
 //
 // Only memories that may grow are clamped (a fixed-size heap is sized on
 // purpose), and a clamped memory whose buffer is touched, or which is grown,
@@ -15,7 +14,7 @@
 const WASM_PAGE = 65536;
 // only large up-front reservations are worth deferring
 const CLAMP_FROM_PAGES = 1024;
-const PLACEHOLDER_PAGES = 64;
+const PLACEHOLDER_PAGES = 0;
 const MAX_PAGES = 65536;
 
 interface ClampedInfo {
@@ -24,8 +23,27 @@ interface ClampedInfo {
 }
 
 const clamped = new WeakMap<WebAssembly.Memory, ClampedInfo>();
-const moduleMinPages = new WeakMap<WebAssembly.Module, number>();
+export interface WasmMemoryImport {
+  module: string;
+  name: string;
+  minPages: number;
+}
+
+const moduleMemoryImports = new WeakMap<WebAssembly.Module, WasmMemoryImport[] | null>();
 let installed = false;
+
+/** Keep sizing information when a module comes from streaming, IDB or a worker. */
+export function rememberWasmMemoryRequirements(
+  module: WebAssembly.Module,
+  imports: WasmMemoryImport[] | null,
+): void {
+  moduleMemoryImports.set(module, imports);
+}
+
+/** Metadata is weakly held; querying it never retains the module's source. */
+export function wasmMemoryRequirements(module: WebAssembly.Module): WasmMemoryImport[] | null | undefined {
+  return moduleMemoryImports.get(module);
+}
 
 // unsigned LEB128 of any length (u64 limits included); precise up to 2^53
 function readLeb(bytes: Uint8Array, state: { p: number }): number {
@@ -48,26 +66,31 @@ function skipValType(bytes: Uint8Array, state: { p: number }): void {
   if (t === 0x63 || t === 0x64) readLeb(bytes, state);
 }
 
-/** Minimum pages of the module's imported memory, or null if none/unknown. */
-export function importedMemoryMinPages(source: ArrayBuffer | ArrayBufferView): number | null {
+/** Imported memory limits, identified by namespace/name; null means unknown. */
+export function readWasmMemoryImports(source: ArrayBuffer | ArrayBufferView): WasmMemoryImport[] | null {
   let bytes: Uint8Array;
   if (source instanceof Uint8Array) bytes = source;
   else if (ArrayBuffer.isView(source)) bytes = new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
   else bytes = new Uint8Array(source as ArrayBuffer);
   if (bytes.length < 8 || bytes[0] !== 0 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) return null;
   const st = { p: 8 };
+  const memories: WasmMemoryImport[] = [];
+  const decoder = new TextDecoder();
   try {
     while (st.p < bytes.length) {
       const id = bytes[st.p++];
       const size = readLeb(bytes, st);
       const end = st.p + size;
+      if (end > bytes.length) return null;
       if (id === 2) {
         const count = readLeb(bytes, st);
         for (let i = 0; i < count; i++) {
           // module and field names (read the length first: it advances p)
           const moduleNameLength = readLeb(bytes, st);
+          const moduleName = decoder.decode(bytes.subarray(st.p, st.p + moduleNameLength));
           st.p += moduleNameLength;
           const fieldNameLength = readLeb(bytes, st);
+          const fieldName = decoder.decode(bytes.subarray(st.p, st.p + fieldNameLength));
           st.p += fieldNameLength;
           const kind = bytes[st.p++];
           if (kind === 0) {
@@ -78,9 +101,14 @@ export function importedMemoryMinPages(source: ArrayBuffer | ArrayBufferView): n
             readLeb(bytes, st);
             if (flags & 1) readLeb(bytes, st);
           } else if (kind === 2) {
-            st.p++; // limits flags
+            const flags = readLeb(bytes, st);
+            // Memory64/custom page sizes need different sizing semantics.
+            // Preserve the loader's allocation for unsupported limits.
+            if (flags & ~3) return null;
             const min = readLeb(bytes, st);
-            return min <= MAX_PAGES ? min : null;
+            if (min > MAX_PAGES) return null;
+            if (flags & 1) readLeb(bytes, st);
+            memories.push({ module: moduleName, name: fieldName, minPages: min });
           } else if (kind === 3) {
             skipValType(bytes, st);
             st.p++; // mutability
@@ -92,16 +120,21 @@ export function importedMemoryMinPages(source: ArrayBuffer | ArrayBufferView): n
           }
           if (st.p > end) return null;
         }
-        return null;
+        return memories;
       }
       // imports precede every section that could matter; stop at code
-      if (id > 2 && id !== 0) return null;
+      if (id > 2 && id !== 0) return memories;
       st.p = end;
     }
   } catch {
     /* malformed: unknown */
   }
-  return null;
+  return memories;
+}
+
+/** Minimum pages of the first imported memory, or null if none/unknown. */
+export function importedMemoryMinPages(source: ArrayBuffer | ArrayBufferView): number | null {
+  return readWasmMemoryImports(source)?.[0]?.minPages ?? null;
 }
 
 let nativeBuffer: (this: WebAssembly.Memory) => ArrayBuffer = function (this: WebAssembly.Memory) {
@@ -127,14 +160,29 @@ function unclamp(memory: WebAssembly.Memory, pages: number): void {
   if (current < target) nativeGrow.call(memory, target - current);
 }
 
-function fixImports(minPages: number | null, imports: unknown): void {
+function fixImports(requirements: WasmMemoryImport[] | null, imports: unknown): void {
   if (!imports || typeof imports !== "object") return;
+  if (requirements !== null) {
+    // A module can import several memories, and can import the same object
+    // more than once. Meet the largest requirement for each actual memory.
+    const sizes = new Map<WebAssembly.Memory, number>();
+    for (const requirement of requirements) {
+      const ns = (imports as Record<string, unknown>)[requirement.module];
+      if (!ns || typeof ns !== "object") continue;
+      const value = (ns as Record<string, unknown>)[requirement.name];
+      if (value instanceof WebAssembly.Memory && clamped.has(value)) {
+        sizes.set(value, Math.max(sizes.get(value) ?? 0, requirement.minPages));
+      }
+    }
+    for (const [memory, pages] of sizes) unclamp(memory, pages);
+    return;
+  }
   for (const ns of Object.values(imports as Record<string, unknown>)) {
     if (!ns || typeof ns !== "object") continue;
     for (const value of Object.values(ns as Record<string, unknown>)) {
       if (!(value instanceof WebAssembly.Memory)) continue;
       const info = clamped.get(value);
-      if (info) unclamp(value, minPages ?? info.requestedPages);
+      if (info) unclamp(value, info.requestedPages);
     }
   }
 }
@@ -201,14 +249,9 @@ export function installWasmMemoryClamp(): void {
   Memory.prototype = NativeMemory.prototype;
   W.Memory = Memory;
 
-  const record = (module: WebAssembly.Module, bytes: BufferSource): void => {
-    const min = importedMemoryMinPages(bytes);
-    if (min !== null) moduleMinPages.set(module, min);
-  };
-
   const Module = function Module(this: unknown, bytes: BufferSource) {
     const module = new NativeModule(bytes);
-    record(module, bytes);
+    rememberWasmMemoryRequirements(module, readWasmMemoryImports(bytes));
     return module;
   } as unknown as typeof WebAssembly.Module;
   Module.prototype = NativeModule.prototype;
@@ -219,7 +262,7 @@ export function installWasmMemoryClamp(): void {
 
   W.compile = async (bytes: BufferSource) => {
     const module = await nativeCompile(bytes);
-    record(module, bytes);
+    rememberWasmMemoryRequirements(module, readWasmMemoryImports(bytes));
     return module;
   };
 
@@ -228,7 +271,7 @@ export function installWasmMemoryClamp(): void {
     module: WebAssembly.Module,
     imports?: WebAssembly.Imports,
   ) {
-    fixImports(moduleMinPages.get(module) ?? null, imports);
+    fixImports(moduleMemoryImports.get(module) ?? null, imports);
     return new NativeInstance(module, imports);
   } as unknown as typeof WebAssembly.Instance;
   Instance.prototype = NativeInstance.prototype;
@@ -237,9 +280,9 @@ export function installWasmMemoryClamp(): void {
   W.instantiate = (source: BufferSource | WebAssembly.Module, imports?: WebAssembly.Imports) => {
     try {
       if (source instanceof NativeModule) {
-        fixImports(moduleMinPages.get(source) ?? null, imports);
+        fixImports(moduleMemoryImports.get(source) ?? null, imports);
       } else {
-        fixImports(importedMemoryMinPages(source as BufferSource), imports);
+        fixImports(readWasmMemoryImports(source as BufferSource), imports);
       }
     } catch (err) {
       // e.g. growing past the memory's maximum: reject like instantiate would

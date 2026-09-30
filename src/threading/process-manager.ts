@@ -1168,6 +1168,7 @@ export class ProcessManager extends EventEmitter {
 
     handle.on("fork-request", (msg: WorkerToMain_ForkRequest) => {
       try {
+        let ipcDisconnected = handle.workerExited;
         const childHandle = this.spawn({
           command: "node",
           args: [msg.modulePath, ...msg.args],
@@ -1198,7 +1199,13 @@ export class ProcessManager extends EventEmitter {
             env: childEnv(msg.env),
             isShell: false,
             isFork: true,
+            serialization: msg.serialization,
+            execArgv: msg.execArgv,
           });
+          // Keep EOF after exec, including a child still probing/initializing
+          // when its owner finishes. A fallback worker cannot inherit messages
+          // sent to the worker it replaced before initialization.
+          if (ipcDisconnected || handle.workerExited) childHandle.postMessage({ type: "ipc-disconnect" });
         };
 
         if (childHandle.state === "running") {
@@ -1255,6 +1262,22 @@ export class ProcessManager extends EventEmitter {
         };
         handle.on("ipc-message", relayIpcToChild);
 
+        const disconnectChild = () => {
+          ipcDisconnected = true;
+          if (childHandle.state === "running") childHandle.postMessage({ type: "ipc-disconnect" });
+        };
+        const relayDisconnect = (message: { targetRequestId?: number }) => {
+          if (message.targetRequestId === msg.requestId) disconnectChild();
+        };
+        const notifyParentDisconnect = () => {
+          if (!handle.workerExited) handle.postMessage({ type: "ipc-disconnect", targetRequestId: msg.requestId });
+        };
+        // A native fork's IPC pipe closes when its parent exits, including
+        // unref'd worker pools. Preserve the child's own timers and other work.
+        handle.on("worker-done", disconnectChild);
+        handle.on("ipc-disconnect", relayDisconnect);
+        childHandle.on("ipc-disconnect", notifyParentDisconnect);
+
         const relayStdinToChild = (
           stdinMsg: { requestId: number; data: string; end?: boolean },
         ) => {
@@ -1273,6 +1296,9 @@ export class ProcessManager extends EventEmitter {
 
         childHandle.on("exit", (exitCode: number) => {
           handle.removeListener("ipc-message", relayIpcToChild);
+          handle.removeListener("worker-done", disconnectChild);
+          handle.removeListener("ipc-disconnect", relayDisconnect);
+          childHandle.removeListener("ipc-disconnect", notifyParentDisconnect);
           handle.removeListener("child-stdin", relayStdinToChild);
           handle.removeListener("child-signal", relayChildSignal);
           if (!handle.workerExited) {

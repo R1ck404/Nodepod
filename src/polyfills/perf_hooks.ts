@@ -15,6 +15,17 @@ function noopMarkResourceTiming(..._args: unknown[]): void {
   // undici calls this after fetch; browsers lack the node extension.
 }
 
+export function installHostPerformanceExtensions(): void {
+  const host = globalThis.performance as Performance & { markResourceTiming?: MarkResourceTimingFn };
+  if (host && typeof host.markResourceTiming !== "function") {
+    Object.defineProperty(host, "markResourceTiming", {
+      value: noopMarkResourceTiming,
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
 type PerfHooksPerformance = Performance & { markResourceTiming: MarkResourceTimingFn };
 
 function createPerformance(): PerfHooksPerformance {
@@ -33,8 +44,16 @@ function createPerformance(): PerfHooksPerformance {
     markResourceTiming: noopMarkResourceTiming,
   } as unknown as PerfHooksPerformance;
   if (base) {
-    Object.assign(perf, base);
-    perf.markResourceTiming = noopMarkResourceTiming;
+    // Performance methods live on the prototype and require their native
+    // receiver. Object.assign loses them and silently turns now() into wall
+    // clock time while discarding marks and measures.
+    for (const name of ["now", "mark", "measure", "getEntries", "getEntriesByName",
+      "getEntriesByType", "clearMarks", "clearMeasures", "clearResourceTimings"] as const) {
+      (perf as any)[name] = base[name].bind(base);
+    }
+    Object.defineProperty(perf, "timeOrigin", { value: base.timeOrigin, configurable: true });
+    const markResourceTiming = (base as Partial<PerfHooksPerformance>).markResourceTiming;
+    perf.markResourceTiming = markResourceTiming?.bind(base) ?? noopMarkResourceTiming;
   }
   return perf;
 }
