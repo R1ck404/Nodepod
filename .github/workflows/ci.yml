@@ -41,6 +41,15 @@ jobs:
       - name: Browser preview regression
         run: pnpm run test:browser:preview
 
+      - name: Upload failed browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodepod-browser-test-results
+          path: test-results
+          if-no-files-found: ignore
+          retention-days: 14
+
   documentation:
     runs-on: ubuntu-latest
     steps:
