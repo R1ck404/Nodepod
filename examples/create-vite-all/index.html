@@ -257,6 +257,10 @@
           ms: { ...t, total: performance.now() - started },
           tail: ui.tail(),
         };
+      } finally {
+        // Automated compatibility runs can release each checked app before
+        // starting the next batch. Interactive cards keep their previews live.
+        if (params.get("teardown") === "1" && pod) await pod.teardown();
       }
     }
 

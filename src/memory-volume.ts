@@ -121,7 +121,7 @@ function yieldForBackgroundWork(): Promise<void> {
 
 // an absolute path needs normalizing if it has an empty, "." or ".."
 // segment, or a trailing slash
-const NEEDS_NORMALIZING = /\/\/|\/\.\.?(?:\/|$)|.\/$/;
+const NEEDS_NORMALIZING = /\/\/|\/\.\.?(?:\/|$)/;
 
 // a file an install put in node_modules; not a tool's cache there
 // (node_modules/.vite, .cache), which the tool is still busy reading
@@ -314,8 +314,9 @@ export interface VolumeMissHandler {
 }
 
 type FileChangeHandler = (filePath: string, content: string) => void;
+type FileWriteHandler = (filePath: string, content: Uint8Array) => void;
 type FileDeleteHandler = (filePath: string) => void;
-type VolumeEventHandler = FileChangeHandler | FileDeleteHandler;
+type VolumeEventHandler = FileChangeHandler | FileWriteHandler | FileDeleteHandler;
 
 export interface FileStat {
   isFile(): boolean;
@@ -734,6 +735,8 @@ export class MemoryVolume {
 
   // ---- Event subscription ----
 
+  // 'write' carries bytes without decoding; 'change' retains its legacy text contract.
+  on(event: 'write', handler: FileWriteHandler): this;
   on(event: 'change', handler: FileChangeHandler): this;
   on(event: 'delete', handler: FileDeleteHandler): this;
   on(event: string, handler: VolumeEventHandler): this {
@@ -744,6 +747,7 @@ export class MemoryVolume {
     return this;
   }
 
+  off(event: 'write', handler: FileWriteHandler): this;
   off(event: 'change', handler: FileChangeHandler): this;
   off(event: 'delete', handler: FileDeleteHandler): this;
   off(event: string, handler: VolumeEventHandler): this {
@@ -872,6 +876,7 @@ export class MemoryVolume {
   }
 
   private broadcast(event: 'change', path: string, content: string): void;
+  private broadcast(event: 'write', path: string, content: Uint8Array): void;
   private broadcast(event: 'delete', path: string): void;
   private broadcast(event: string, ...args: unknown[]): void {
     const handlers = this.subscribers.get(event);
@@ -1386,11 +1391,11 @@ export class MemoryVolume {
     if (this._disposed) throw new Error('[Nodepod] Filesystem has been disposed');
     // nearly every path arrives normalized already
     if (p.charCodeAt(0) === 47) {
-      if (!NEEDS_NORMALIZING.test(p)) return p;
+      if ((p.length === 1 || p.charCodeAt(p.length - 1) !== 47) && !NEEDS_NORMALIZING.test(p)) return p;
     } else {
       // a clean relative path (watcher events carry them) is just rooted
       const rooted = '/' + p;
-      if (!NEEDS_NORMALIZING.test(rooted)) return rooted;
+      if ((rooted.length === 1 || rooted.charCodeAt(rooted.length - 1) !== 47) && !NEEDS_NORMALIZING.test(rooted)) return rooted;
     }
     const key = p;
     if (this._handler) {
@@ -1614,6 +1619,7 @@ export class MemoryVolume {
       if (changeHandlers && changeHandlers.size > 0) {
         this.broadcast('change', norm, typeof data === 'string' ? data : this.decodeText(bytes));
       }
+      if (this.subscribers.get('write')?.size) this.broadcast('write', norm, bytes);
       this.notifyGlobalListeners(norm, existed ? 'change' : 'add');
     }
   }
@@ -2923,6 +2929,11 @@ export class MemoryVolume {
     const ts = inode?.mtime ?? node.modified;
     const uid = inode?.uid ?? node.uid ?? MOCK_IDS.UID;
     const gid = inode?.gid ?? node.gid ?? MOCK_IDS.GID;
+    const atimeMs = inode?.atime ?? node.atime ?? ts;
+    const ctimeMs = inode?.ctime ?? ts;
+    // These timestamps commonly match. BigInts are immutable, so reuse the
+    // conversion while keeping each Date independent and each stat a snapshot.
+    const mtimeNs = BigInt(ts) * 1000000n;
 
     const result: FileStat = {
       isFile: node.kind === 'file' ? STAT_TRUE : STAT_FALSE,
@@ -2935,12 +2946,12 @@ export class MemoryVolume {
       size: fileSize,
       mode: node.kind === 'directory' ? (node.mode ?? 0o755) : (inode?.mode ?? 0o644),
       mtime: new Date(ts),
-      atime: new Date(inode?.atime ?? node.atime ?? ts),
-      ctime: new Date(inode?.ctime ?? ts),
+      atime: new Date(atimeMs),
+      ctime: new Date(ctimeMs),
       birthtime: new Date(ts),
       mtimeMs: ts,
-      atimeMs: inode?.atime ?? node.atime ?? ts,
-      ctimeMs: inode?.ctime ?? ts,
+      atimeMs,
+      ctimeMs,
       birthtimeMs: ts,
       nlink: inode?.nlink ?? 1,
       uid,
@@ -2950,10 +2961,10 @@ export class MemoryVolume {
       rdev: 0,
       blksize: MOCK_FS.BLOCK_SIZE,
       blocks: Math.ceil(fileSize / MOCK_FS.BLOCK_CALC_SIZE),
-      atimeNs: BigInt(inode?.atime ?? node.atime ?? ts) * 1000000n,
-      mtimeNs: BigInt(ts) * 1000000n,
-      ctimeNs: BigInt(inode?.ctime ?? ts) * 1000000n,
-      birthtimeNs: BigInt(ts) * 1000000n,
+      atimeNs: atimeMs === ts ? mtimeNs : BigInt(atimeMs) * 1000000n,
+      mtimeNs,
+      ctimeNs: ctimeMs === ts ? mtimeNs : BigInt(ctimeMs) * 1000000n,
+      birthtimeNs: mtimeNs,
     };
 
     if (this._handler) this._handler.statCache.set(norm, result);

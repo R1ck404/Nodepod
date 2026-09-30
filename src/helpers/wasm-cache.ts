@@ -13,6 +13,7 @@ import { untrackedWasm } from "./event-loop";
 import { readWasmMemoryImports, rememberWasmMemoryRequirements, wasmMemoryRequirements } from "./wasm-memory-clamp";
 import {
   getWasmModuleCache,
+  isHashingWasmContent,
   quickWasmHash,
   wasmContentHash,
 } from "../persistence/wasm-module-cache";
@@ -80,6 +81,7 @@ export function registerCompiledModule(
   module: WebAssembly.Module,
 ): void {
   rememberWasmMemoryRequirements(module, readWasmMemoryImports(bytes));
+  if (isHashingWasmContent()) return;
   const key = quickWasmHash(bytes);
   moduleCache.set(key, {
     promise: Promise.resolve(module),
@@ -92,6 +94,7 @@ export function registerCompiledModule(
 
 // Warm asynchronous reads whose callers can use a background compilation.
 export function precompileWasm(bytes: Uint8Array | ArrayBuffer): void {
+  if (isHashingWasmContent()) return;
   if (typeof WebAssembly === "undefined") return;
   if (actualByteLength(bytes) < PRECOMPILE_THRESHOLD) return;
 
@@ -134,6 +137,7 @@ export function precompileWasm(bytes: Uint8Array | ArrayBuffer): void {
 }
 
 export function getCachedModule(bytes: BufferSource): WebAssembly.Module | null {
+  if (isHashingWasmContent()) return null;
   // hashing is a single pass over the buffer; only paid on wasm construction
   const key = quickWasmHash(toUint8(bytes));
   const entry = moduleCache.get(key);

@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   setInterval,
+  setImmediate,
   disposeAllTimers,
 } from "../polyfills/timers";
 
@@ -9,6 +10,14 @@ function sleep(ms: number): Promise<void> {
 }
 
 describe("disposeAllTimers", () => {
+  it("does not retain completed immediates until process teardown", async () => {
+    const immediate = setImmediate(() => {});
+    await new Promise<void>((resolve) => setImmediate(() => resolve()));
+    const close = vi.spyOn(immediate._handle, "close");
+    expect(immediate._fired).toBe(true);
+    disposeAllTimers();
+    expect(close).not.toHaveBeenCalled();
+  });
   it("stops tracked intervals on teardown", async () => {
     let ticks = 0;
     setInterval(() => {

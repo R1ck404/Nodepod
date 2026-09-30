@@ -10,8 +10,8 @@ export const PINNED_WA_SQLITE = '1.0.0';
 // fast-esbuild-wasm is all JavaScript: it ships no esbuild.wasm. jsdelivr
 // serves the package's files as published (esm.sh rebundles them, and answers
 // 404 for a few minutes after a release).
-const PINNED_FAST_ESBUILD = '0.28.4'; // (initialize({ serviceInWorker, smallInput }) since 0.28.4)
-const PINNED_FAST_BROTLI = '3.0.2';
+const PINNED_FAST_ESBUILD = '0.28.5'; // (initialize({ serviceInWorker, smallInput }) since 0.28.4)
+const PINNED_FAST_BROTLI = '3.0.3';
 const FAST_ESBUILD_BASE = `https://cdn.jsdelivr.net/npm/@r1ck404/fast-esbuild-wasm@${PINNED_FAST_ESBUILD}`;
 export const ESBUILD_HAS_BINARY = false;
 

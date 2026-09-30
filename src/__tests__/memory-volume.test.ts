@@ -3,6 +3,62 @@ import { MemoryVolume } from "../memory-volume";
 import { VFSBridge } from "../threading/vfs-bridge";
 
 describe("MemoryVolume", () => {
+  it("sends binary-safe write events without decoding and supports unsubscribing", () => {
+    const volume = new MemoryVolume();
+    const decode = vi.spyOn(volume as any, "decodeText");
+    const writes = vi.fn();
+    volume.on("write", writes);
+    const bytes = new Uint8Array([0, 255, 128, 65]);
+    volume.writeFileSync("/binary", bytes);
+    volume.writeFileSync("/text", "héllo");
+    expect(writes.mock.calls).toEqual([
+      ["/binary", bytes], ["/text", new TextEncoder().encode("héllo")],
+    ]);
+    expect(decode).not.toHaveBeenCalled();
+    volume.off("write", writes);
+    volume.writeFileSync("/binary", bytes);
+    expect(writes).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps legacy text events alongside binary-safe write events", () => {
+    const volume = new MemoryVolume();
+    const text = vi.fn();
+    const binary = vi.fn();
+    volume.on("change", text).on("write", binary);
+    const bytes = new Uint8Array([65, 66, 67]);
+    volume.writeFileSync("/binary", bytes);
+    expect(text).toHaveBeenCalledWith("/binary", "ABC");
+    expect(binary).toHaveBeenCalledWith("/binary", bytes);
+  });
+
+  it("normalizes trailing slashes, dot segments, root and hidden names", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/project/.cache/file.js", "value");
+    for (const path of ["/project/.cache/file.js/", "project//.cache/./file.js", "/project/other/../.cache/file.js"]) {
+      expect(volume.readFileSync(path, "utf8")).toBe("value");
+    }
+    expect(volume.statSync("/").isDirectory()).toBe(true);
+    expect(volume.statSync("").isDirectory()).toBe(true);
+    expect(volume.statSync("/project/.").isDirectory()).toBe(true);
+    expect(volume.statSync("/project/.cache/..").isDirectory()).toBe(true);
+  });
+
+  it("keeps stat timestamps independent and snapshots differing inode times", () => {
+    const volume = new MemoryVolume();
+    volume.writeFileSync("/file", "value");
+    volume.utimesSync("/file", 10, 20);
+    const stat = volume.statSync("/file");
+    expect(stat.atimeNs).toBe(10000000000n);
+    expect(stat.mtimeNs).toBe(20000000000n);
+    expect(stat.ctimeNs).toBe(BigInt(stat.ctimeMs) * 1000000n);
+    expect(stat.birthtimeNs).toBe(stat.mtimeNs);
+    stat.mtime.setTime(0);
+    expect(stat.birthtime.getTime()).toBe(20000);
+    expect(stat.mtimeMs).toBe(20000);
+    volume.utimesSync("/file", 30, 40);
+    expect(stat.atimeMs).toBe(10000);
+    expect(stat.mtimeNs).toBe(20000000000n);
+  });
   it("stores hardlinked payloads once in full and chunked snapshots", () => {
     const volume = new MemoryVolume();
     volume.writeFileSync("/first.bin", new Uint8Array(5 * 1024 * 1024).fill(7));

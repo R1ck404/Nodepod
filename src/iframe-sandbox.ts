@@ -13,7 +13,7 @@ interface CrossOriginMessage {
   result?: ExecutionOutcome;
   error?: string;
   path?: string;
-  content?: string | null;
+  content?: string | Uint8Array | null;
   consoleMethod?: string;
   consoleArgs?: unknown[];
 }
@@ -26,7 +26,7 @@ export class IframeSandbox implements IScriptEngine {
   private ready: Promise<void>;
   private pendingCalls = new Map<string, { resolve: (r: ExecutionOutcome) => void; reject: (e: Error) => void }>();
   private nextId = 0;
-  private onFileChange: ((p: string, c: string) => void) | null = null;
+  private onFileChange: ((p: string, c: Uint8Array) => void) | null = null;
   private onFileDelete: ((p: string) => void) | null = null;
   private onMessage: ((e: MessageEvent) => void) | null = null;
 
@@ -94,9 +94,14 @@ export class IframeSandbox implements IScriptEngine {
 
   private attachVolumeSync(): void {
     this.onFileChange = (path, content) => {
-      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content } as CrossOriginMessage, '*');
+      // An opaque sandbox cannot share the parent's SharedArrayBuffer agent
+      // cluster. Copy only shared-backed views; normal bytes clone directly.
+      const bytes = typeof SharedArrayBuffer !== 'undefined' && content.buffer instanceof SharedArrayBuffer
+        ? new Uint8Array(content)
+        : content;
+      this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content: bytes } as CrossOriginMessage, '*');
     };
-    this.vol.on('change', this.onFileChange);
+    this.vol.on('write', this.onFileChange);
 
     this.onFileDelete = (path) => {
       this.frame.contentWindow?.postMessage({ type: 'syncFile', path, content: null } as CrossOriginMessage, '*');
@@ -135,7 +140,7 @@ export class IframeSandbox implements IScriptEngine {
   getVolume(): MemoryVolume { return this.vol; }
 
   terminate(): void {
-    if (this.onFileChange) this.vol.off('change', this.onFileChange);
+    if (this.onFileChange) this.vol.off('write', this.onFileChange);
     if (this.onFileDelete) this.vol.off('delete', this.onFileDelete);
     if (this.onMessage) window.removeEventListener('message', this.onMessage);
     this.frame.remove();

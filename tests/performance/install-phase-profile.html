@@ -1,0 +1,15 @@
+<!doctype html><meta charset="utf-8"><div id="status">starting</div><script type="module">
+import {makeProject} from '/tests/performance/fast-packages-project.mjs';
+const {Nodepod}=await import(/* @vite-ignore */ new URLSearchParams(location.search).get('dist')+'/index.mjs');
+let pod;
+try {
+ const files=Object.fromEntries(Object.entries(makeProject({components:100,viteVersion:'8.0.10',pluginReact:'5.0.4'})).map(([path,content])=>['/app/'+path,content]));
+ pod=await Nodepod.boot({files,workdir:'/app',watermark:false,profiler:{enabled:true,level:'detailed',maxSpans:100000,includeUrls:true}});
+ const {report}=await pod.profiler.profile('fresh-install',async()=>{
+ const proc=await pod.spawn('npm',['install'],{cwd:'/app'});let output='';proc.on('output',s=>output+=s);proc.on('error',s=>output+=s);
+ const result=await proc.completion;if(result.exitCode)throw new Error(output);
+ });
+ window.__bench={ok:true,report:JSON.parse(report.export('json'))};
+} catch(e){window.__bench={ok:false,error:String(e.stack||e)}}
+finally{if(pod)await pod.teardown();document.querySelector('#status').textContent=window.__bench.ok?'DONE':'FAIL'}
+</script>
