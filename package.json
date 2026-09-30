@@ -1,6 +1,6 @@
 {
   "name": "@r1ck404/nodepod",
-  "version": "1.11.1",
+  "version": "1.11.2",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
