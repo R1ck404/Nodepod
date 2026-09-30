@@ -42,6 +42,7 @@ test("create-next-app scaffolds, refreshes and serves a hydrated webpack product
     expect(result.checks[command], command).toBe(0);
   }
   expect(result.checks.typegenCleanExit).toBe(true);
+  expect(result.checks.initialHydrationComplete).toBe(true);
   expect(result.checks.refreshPreservedState).toBe(true);
   for (const route of ["dev/", "dev/api/health", "production/", "production/api/health"]) {
     expect(result.checks[route], route).toMatchObject({ status: 200, correct: true });

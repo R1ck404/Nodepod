@@ -29,7 +29,9 @@
     }
   };
   addEventListener('message', event => {
-    if (event.source !== frame.contentWindow || !event.data?.createNextFlow || event.data.stage !== state.stage) return;
+    if (event.source !== frame.contentWindow || !event.data?.createNextFlow) return;
+    if (event.data.hydrated) { state.hydrated = true; return; }
+    if (event.data.stage !== state.stage) return;
     if (event.data.error) state.errors.push(event.data.error);
     else state.proof = event.data;
   });
@@ -85,11 +87,25 @@ export default function FlowCounter() {
     await run('npm scripts', 'npm', ['run']);
     await run('ESLint', 'npm', ['run', 'lint']);
     await run('TypeScript', 'npx', ['tsc', '--noEmit']);
+    // Visible server HTML can arrive before its client tree hydrates. A null
+    // client component in the page signals the commit without changing its DOM;
+    // do not start editing the page while the initial hydration is still running.
+    await pod.fs.writeFile(cwd + '/app/flow-hydration-probe.tsx', `'use client';
+import { useEffect } from 'react';
+export default function FlowHydrationProbe() {
+  useEffect(() => { parent.postMessage({ createNextFlow: true, hydrated: true }, '*'); }, []);
+  return null;
+}`);
+    const instrumentedPage = 'import FlowHydrationProbe from "./flow-hydration-probe";\n' + state.generatedPage.replace(/(<main\b[^>]*>)/, '$1<FlowHydrationProbe />');
+    if (!instrumentedPage.includes('<FlowHydrationProbe />')) throw Error('Could not instrument template hydration');
+    await pod.fs.writeFile(cwd + '/app/page.tsx', instrumentedPage);
     await preview('development');
     const dev = state.dev = await spawn('development', 'npm', ['run', 'dev', '--', '--webpack'], cwd, { NODE_ENV: 'development' });
-    await wait(() => /get started/i.test(state.proof?.text || ''), 'unmodified generated template render');
+    await wait(() => /get started/i.test(state.proof?.text || ''), 'generated template render');
     check('originalTemplate', state.proof);
     if (!state.proof.images.some(image => image.loaded)) throw Error('Generated template images did not load');
+    await wait(() => state.hydrated, 'initial template hydration');
+    check('initialHydrationComplete', true);
     await pod.fs.writeFile(cwd + '/app/flow-counter.tsx', counter(0));
     const updated = 'import FlowCounter from "./flow-counter";\n' + state.generatedPage.replace(/(<main\b[^>]*>)/, '$1<FlowCounter />');
     if (!updated.includes('<FlowCounter />')) throw Error('Could not insert counter into generated page');
