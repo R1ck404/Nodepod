@@ -103,7 +103,8 @@ export default function FlowHydrationProbe() {
     const dev = state.dev = await spawn('development', 'npm', ['run', 'dev', '--', '--webpack'], cwd, { NODE_ENV: 'development' });
     await wait(() => /get started/i.test(state.proof?.text || ''), 'generated template render');
     check('originalTemplate', state.proof);
-    if (!state.proof.images.some(image => image.loaded)) throw Error('Generated template images did not load');
+    // the text renders before its images finish loading; give them time on a slow runner
+    await wait(() => state.proof.images.some(image => image.loaded), 'generated template images', 30000);
     await wait(() => state.hydrated, 'initial template hydration');
     check('initialHydrationComplete', true);
     await pod.fs.writeFile(cwd + '/app/flow-counter.tsx', counter(0));
