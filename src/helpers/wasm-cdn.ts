@@ -3,8 +3,8 @@
 // here is asynchronous and best-effort — the old synchronous XHR fallback
 // that could block a thread for a full 15MB download is gone.
 
-import type { MemoryVolume } from "../memory-volume";
-import { precompileWasm, registerCompiledModule, PRECOMPILE_THRESHOLD } from "./wasm-cache";
+import type { MemoryVolume } from "../memory-volume.js";
+import { precompileWasm, registerCompiledModule, PRECOMPILE_THRESHOLD } from "./wasm-cache.js";
 
 const WASM_DEBUG_SUFFIX = ".debug.wasm";
 

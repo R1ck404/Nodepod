@@ -1,9 +1,9 @@
 // Async facade over MemoryVolume. Returns Promises even though the
 // underlying VFS is synchronous -- keeps the public API consistent.
 
-import type { MemoryVolume } from "../memory-volume";
-import type { StatResult } from "./types";
-import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler";
+import type { MemoryVolume } from "../memory-volume.js";
+import type { StatResult } from "./types.js";
+import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler.js";
 
 export class NodepodFS {
   constructor(

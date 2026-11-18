@@ -10,7 +10,7 @@
 // so byte ranges handed out for one version never read another version's
 // bytes. Older entries are simply ignored and age out.
 
-import type { VFSBinarySnapshot, VFSSnapshotEntry } from '../threading/worker-protocol';
+import type { VFSBinarySnapshot, VFSSnapshotEntry } from '../threading/worker-protocol.js';
 
 const DB_NAME = 'nodepod-snapshots';
 const STORE_NAME = 'snapshots';

@@ -1,4 +1,4 @@
-import type { TransformBatchFile } from "./offload-types";
+import type { TransformBatchFile } from "./offload-types.js";
 
 export const TRANSFORM_BATCH_MAX_FILES = 64;
 export const TRANSFORM_BATCH_MAX_SOURCE_BYTES = 1024 * 1024;

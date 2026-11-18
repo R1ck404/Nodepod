@@ -9,12 +9,12 @@ import type {
   PipelineNode,
   CommandNode,
   BuiltinFn,
-} from "./shell-types";
-import type { MemoryVolume } from "../memory-volume";
-import { parse, expandGlob } from "./shell-parser";
-import { builtins } from "./shell-builtins";
-import type { ShellOptions, ResolvedShellOptions } from "./shell-options";
-import { resolveShellOptions, ShellLimitError } from "./shell-options";
+} from "./shell-types.js";
+import type { MemoryVolume } from "../memory-volume.js";
+import { parse, expandGlob } from "./shell-parser.js";
+import { builtins } from "./shell-builtins.js";
+import type { ShellOptions, ResolvedShellOptions } from "./shell-options.js";
+import { resolveShellOptions, ShellLimitError } from "./shell-options.js";
 import {
   parseBash,
   type BashList,
@@ -28,17 +28,17 @@ import {
   type BashArithmeticCommand,
   type BashSelectCommand,
   type BashCoprocCommand,
-} from "./bash-parser";
-import { expandHereDocument, expandWords, expandWord } from "./bash-expansion";
-import type { BashExpansionContext } from "./bash-expansion";
-import type { ShellResult as StreamShellResult } from "./shell-types";
+} from "./bash-parser.js";
+import { expandHereDocument, expandWords, expandWord } from "./bash-expansion.js";
+import type { BashExpansionContext } from "./bash-expansion.js";
+import type { ShellResult as StreamShellResult } from "./shell-types.js";
 import {
   isStreamableCommand,
   runStreamCommand,
   canonicalVirtualCommandName,
-} from "./shell-stream-commands";
-import { ShellCancellation, ShellPipe, streamToString } from "./shell-stream";
-import { yieldToEventLoop } from "./shell-helpers";
+} from "./shell-stream-commands.js";
+import { ShellCancellation, ShellPipe, streamToString } from "./shell-stream.js";
+import { yieldToEventLoop } from "./shell-helpers.js";
 
 type ShellControl = { kind: "break" | "continue" | "return"; code?: number; stdout?: string; stderr?: string };
 

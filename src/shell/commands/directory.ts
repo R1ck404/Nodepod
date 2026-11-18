@@ -1,4 +1,4 @@
-import type { BuiltinFn } from "../shell-types";
+import type { BuiltinFn } from "../shell-types.js";
 import {
   ok,
   fail,
@@ -13,8 +13,8 @@ import {
   CYAN,
   BOLD_BLUE,
   yieldToEventLoop,
-} from "../shell-helpers";
-import { LS_BLOCK_SIZE } from "../../constants/config";
+} from "../shell-helpers.js";
+import { LS_BLOCK_SIZE } from "../../constants/config.js";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */

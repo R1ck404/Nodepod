@@ -13,29 +13,29 @@
  * ```
  */
 
-import { setRuntimeHost } from "./host/runtime-host";
-import { createNodeHost } from "./host/node/node-host";
+import { setRuntimeHost } from "./host/runtime-host.js";
+import { createNodeHost } from "./host/node/node-host.js";
 
 setRuntimeHost(createNodeHost());
 
-export { setRuntimeHost, getRuntimeHost, resetRuntimeHost } from "./host";
-export { createNodeHost } from "./host/node/node-host";
-export type { NodeHostOptions } from "./host/node/node-host";
-export { createLocalHttpIngress } from "./host/node/local-http-ingress";
-export { openFsSnapshotCache } from "./host/node/fs-snapshot-cache";
-export { createFsWorkspaceStore } from "./host/node/fs-workspace-store";
+export { setRuntimeHost, getRuntimeHost, resetRuntimeHost } from "./host/index.js";
+export { createNodeHost } from "./host/node/node-host.js";
+export type { NodeHostOptions } from "./host/node/node-host.js";
+export { createLocalHttpIngress } from "./host/node/local-http-ingress.js";
+export { openFsSnapshotCache } from "./host/node/fs-snapshot-cache.js";
+export { createFsWorkspaceStore } from "./host/node/fs-workspace-store.js";
 
-export { Nodepod } from "./sdk/nodepod";
-export { NodepodProcess } from "./sdk/nodepod-process";
-export { NodepodFS } from "./sdk/nodepod-fs";
-export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client";
+export { Nodepod } from "./sdk/nodepod.js";
+export { NodepodProcess } from "./sdk/nodepod-process.js";
+export { NodepodFS } from "./sdk/nodepod-fs.js";
+export { NodepodFSClient, NodepodFSClientError } from "./sdk/nodepod-fs-client.js";
 export {
   WorkspacePersistence,
   createMemoryWorkspaceStore,
   createIndexedDBWorkspaceStore,
   listIndexedDBWorkspaces,
   deleteIndexedDBWorkspace,
-} from "./persistence/workspace";
+} from "./persistence/workspace/index.js";
 export type {
   PersistenceOptions,
   PersistenceStatus,
@@ -46,21 +46,21 @@ export type {
   WorkspaceBatch,
   IndexedDBWorkspaceStoreOptions,
   StoredWorkspaceInfo,
-} from "./persistence/workspace";
-export { MemoryVolume } from "./memory-volume";
-export type { VolumeMutation, VolumeNodeInfo, MountEntry, MetaChange } from "./memory-volume";
-export { DependencyInstaller, install } from "./packages/installer";
-export type { InstallFlags, InstallOutcome, WorkspaceInstallOutcome } from "./packages/installer";
-export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace";
-export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace";
-export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy";
+} from "./persistence/workspace/index.js";
+export { MemoryVolume } from "./memory-volume.js";
+export type { VolumeMutation, VolumeNodeInfo, MountEntry, MetaChange } from "./memory-volume.js";
+export { DependencyInstaller, install } from "./packages/installer.js";
+export type { InstallFlags, InstallOutcome, WorkspaceInstallOutcome } from "./packages/installer.js";
+export { discoverWorkspaces, readWorkspacePatterns } from "./packages/workspace.js";
+export type { WorkspaceGraph, WorkspacePackage } from "./packages/workspace.js";
+export { RequestProxy, getProxyInstance, resetProxy, NodepodSWSetupError } from "./request-proxy.js";
 export type {
   ProxyOptions,
   ServiceWorkerConfig,
   NodepodSWFrameworkHint,
   PreviewOriginContext,
   PreviewOriginOption,
-} from "./request-proxy";
+} from "./request-proxy.js";
 export type {
   NodepodOptions,
   NodepodRequestOptions,
@@ -72,7 +72,7 @@ export type {
   SnapshotOptions,
   PerformanceStats,
   PerformanceTiming,
-} from "./sdk/types";
+} from "./sdk/types.js";
 export type {
   NodepodProfileReport,
   NodepodProfiler,
@@ -91,4 +91,4 @@ export type {
   ProfilerLevel,
   ProfilerOptions,
   ProfilePathDetail,
-} from "./profiling/types";
+} from "./profiling/types.js";

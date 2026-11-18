@@ -1,7 +1,7 @@
 // Buffer polyfill extending Uint8Array with Node.js Buffer API
 
 
-import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1, decodeShortAscii } from '../helpers/byte-encoding';
+import { bytesToBase64, base64ToBytes, bytesToHex, bytesToLatin1, decodeShortAscii } from '../helpers/byte-encoding.js';
 
 const textEnc = new TextEncoder();
 const textDec = new TextDecoder('utf-8');

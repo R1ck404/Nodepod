@@ -1,5 +1,5 @@
-import type { MemoryVolume } from "../memory-volume";
-import type { ShellLimits } from "./shell-options";
+import type { MemoryVolume } from "../memory-volume.js";
+import type { ShellLimits } from "./shell-options.js";
 
 /* ------------------------------------------------------------------ */
 /*  Result & context                                                   */

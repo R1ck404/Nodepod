@@ -1,13 +1,13 @@
 // spawns a ScriptEngine in the requested execution mode:
 // sandboxUrl → cross-origin iframe, useWorker → Worker thread, otherwise main thread
 
-import { ScriptEngine } from './script-engine';
-import { WorkerSandbox } from './worker-sandbox';
-import { IframeSandbox } from './iframe-sandbox';
-import type { MemoryVolume } from './memory-volume';
-import type { IScriptEngine, ExecutionOutcome, SpawnEngineConfig, EngineConfig } from './engine-types';
-import { ProcessManager } from './threading/process-manager';
-import { VFSBridge } from './threading/vfs-bridge';
+import { ScriptEngine } from './script-engine.js';
+import { WorkerSandbox } from './worker-sandbox.js';
+import { IframeSandbox } from './iframe-sandbox.js';
+import type { MemoryVolume } from './memory-volume.js';
+import type { IScriptEngine, ExecutionOutcome, SpawnEngineConfig, EngineConfig } from './engine-types.js';
+import { ProcessManager } from './threading/process-manager.js';
+import { VFSBridge } from './threading/vfs-bridge.js';
 
 function canUseWorker(): boolean {
   return typeof Worker !== 'undefined';
@@ -168,8 +168,8 @@ export async function spawnProcessWorkerEngine(
   return new ProcessWorkerAdapter(vol, config);
 }
 
-export { ScriptEngine } from './script-engine';
-export { WorkerSandbox } from './worker-sandbox';
-export { IframeSandbox } from './iframe-sandbox';
+export { ScriptEngine } from './script-engine.js';
+export { WorkerSandbox } from './worker-sandbox.js';
+export { IframeSandbox } from './iframe-sandbox.js';
 export { ProcessWorkerAdapter };
-export type { IScriptEngine, ExecutionOutcome, EngineConfig, SpawnEngineConfig, VolumeSnapshot } from './engine-types';
+export type { IScriptEngine, ExecutionOutcome, EngineConfig, SpawnEngineConfig, VolumeSnapshot } from './engine-types.js';

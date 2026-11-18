@@ -9,7 +9,7 @@ import {
   CDN_ESBUILD_BUNDLE,
   ESBUILD_HAS_BINARY,
   cdnImport,
-} from "../constants/cdn-urls";
+} from "../constants/cdn-urls.js";
 
 export type EsbuildEngine = typeof import("esbuild-wasm");
 
@@ -223,7 +223,7 @@ async function requestSharedModule(): Promise<WebAssembly.Module | null> {
   try {
     if (request) return await request();
     if (typeof document !== "undefined") {
-      const { getSharedEsbuildModule } = await import("./esbuild-wasm-module");
+      const { getSharedEsbuildModule } = await import("./esbuild-wasm-module.js");
       return await getSharedEsbuildModule();
     }
   } catch {

@@ -1,6 +1,6 @@
 // Console class matching Node.js constructor (accepts stdout/stderr streams)
 
-import { inspect } from "./util";
+import { inspect } from "./util.js";
 
 /* ------------------------------------------------------------------ */
 /*  Console class                                                      */

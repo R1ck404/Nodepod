@@ -9,14 +9,14 @@
 // compares the lockfile and config hashes in deps/_metadata.json and
 // re-optimizes on any mismatch, like it does with a cache on disk.
 
-import type { MemoryVolume } from "../memory-volume";
-import type { IDBSnapshotCache } from "./idb-cache";
+import type { MemoryVolume } from "../memory-volume.js";
+import type { IDBSnapshotCache } from "./idb-cache.js";
 import {
   collectBinarySnapshotParts,
   saveSnapshotParts,
   type BinarySnapshotParts,
-} from "./binary-snapshot";
-import { contentDigest } from "../helpers/digest";
+} from "./binary-snapshot.js";
+import { contentDigest } from "../helpers/digest.js";
 
 const SCHEMA = 1;
 const CACHE_DIR = ".vite";

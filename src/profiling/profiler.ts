@@ -14,7 +14,7 @@ import type {
   ProfilerLevel,
   ProfilerOptions,
   NodepodProfiler as NodepodProfilerApi,
-} from "./types";
+} from "./types.js";
 
 const DEFAULT_MAX_SPANS = 100_000;
 const DEFAULT_MAX_SAMPLES = 10_000;

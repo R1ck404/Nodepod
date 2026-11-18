@@ -1,4 +1,4 @@
-import type { BuiltinFn, ShellContext } from "../shell-types";
+import type { BuiltinFn, ShellContext } from "../shell-types.js";
 import {
   ok,
   fail,
@@ -11,7 +11,7 @@ import {
   DAYS_SHORT,
   DAYS_LONG,
   waitForShellDelay,
-} from "../shell-helpers";
+} from "../shell-helpers.js";
 
 // set by the registry so `which` and `type` can check builtins
 let _builtins: Map<string, BuiltinFn> | null = null;

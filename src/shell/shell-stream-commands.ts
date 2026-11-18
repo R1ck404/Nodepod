@@ -1,7 +1,7 @@
-import type { MemoryVolume } from "../memory-volume";
-import { regexSafetyError, resolvePath, yieldToEventLoop } from "./shell-helpers";
-import { ShellPipe, type CancellationToken, stringToBytes } from "./shell-stream";
-import { ShellLimitError } from "./shell-options";
+import type { MemoryVolume } from "../memory-volume.js";
+import { regexSafetyError, resolvePath, yieldToEventLoop } from "./shell-helpers.js";
+import { ShellPipe, type CancellationToken, stringToBytes } from "./shell-stream.js";
+import { ShellLimitError } from "./shell-options.js";
 
 export interface StreamCommandContext {
   cwd: string;

@@ -104,7 +104,7 @@
   ],
   "scripts": {
     "build:lib": "vite build --config vite.lib.config.js && node -e \"const fs=require('fs'); for (const f of ['__sw__.js','__nodepod_bridge__.html','__nodepod_bridge__.js']) fs.copyFileSync('static/'+f,'dist/'+f)\"",
-    "build:types": "tsc --project tsconfig.build.json",
+    "build:types": "tsc --project tsconfig.build.json && node scripts/fix-dts-extensions.mjs dist",
     "build:publish": "pnpm run build:lib && pnpm run build:types",
     "type-check": "tsc --noEmit",
     "test": "vitest run",

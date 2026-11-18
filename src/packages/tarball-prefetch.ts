@@ -4,8 +4,8 @@
 // requested as soon as its version is chosen, and extraction takes the bytes
 // (or the download in flight) from here.
 
-import { downloadTarball } from "./registry-client";
-import { getTarballCache } from "../persistence/tarball-cache";
+import { downloadTarball } from "./registry-client.js";
+import { getTarballCache } from "../persistence/tarball-cache.js";
 
 const MAX_IN_FLIGHT = 16;
 // archives prefetched and not taken yet (a tree whose install stops early

@@ -3,7 +3,7 @@
 // (builtins + any extras + paths); anything after is paths only. dirs
 // get a trailing '/' and files get ' ', like bash.
 
-import type { MemoryVolume } from "../memory-volume";
+import type { MemoryVolume } from "../memory-volume.js";
 
 export interface CompletionResult {
   token: string;

@@ -1,8 +1,8 @@
 // Recursive directory listing polyfill (readdirp-compatible) on MemoryVolume
 
 
-import type { MemoryVolume, FileStat } from "../memory-volume";
-import { setSharedVolume, getSharedVolume } from "./volume-registry";
+import type { MemoryVolume, FileStat } from "../memory-volume.js";
+import { setSharedVolume, getSharedVolume } from "./volume-registry.js";
 
 
 export function setVolume(vol: MemoryVolume): void {

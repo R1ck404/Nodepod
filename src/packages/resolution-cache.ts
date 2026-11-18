@@ -1,4 +1,4 @@
-import type { ResolvedDependency } from "./version-resolver";
+import type { ResolvedDependency } from "./version-resolver.js";
 
 const CACHE_NAME = "nodepod-resolution-v1";
 const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;

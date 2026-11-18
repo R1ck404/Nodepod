@@ -3,8 +3,8 @@
 // range. Every commit is a single readwrite transaction over all stores, so
 // entries and their blobs always land together or not at all.
 
-import type { WorkspaceBatch, WorkspaceEntry, WorkspaceManifest, WorkspaceStore } from "./types";
-import { changesTree } from "./paths";
+import type { WorkspaceBatch, WorkspaceEntry, WorkspaceManifest, WorkspaceStore } from "./types.js";
+import { changesTree } from "./paths.js";
 
 const DB_NAME = "nodepod-workspaces";
 const DB_VERSION = 1;

@@ -1,8 +1,8 @@
 // Chokidar-compatible file watcher on top of MemoryVolume.watch()
 
 
-import type { MemoryVolume, FileWatchHandle, FileStat } from "../memory-volume";
-import { setSharedVolume, getSharedVolume } from "./volume-registry";
+import type { MemoryVolume, FileWatchHandle, FileStat } from "../memory-volume.js";
+import { setSharedVolume, getSharedVolume } from "./volume-registry.js";
 
 
 export function setVolume(vol: MemoryVolume): void {

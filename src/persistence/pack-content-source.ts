@@ -6,9 +6,9 @@
 // range back through this source when something needs the bytes. The pack's
 // data buffer is never held in memory as a whole.
 
-import type { BinaryVolumeEntry, MemoryVolume, MountEntry, VolumeContentSource } from "../memory-volume";
-import type { IDBSnapshotCache, PackHead } from "./idb-cache";
-import type { VFSSnapshotEntry } from "../threading/worker-protocol";
+import type { BinaryVolumeEntry, MemoryVolume, MountEntry, VolumeContentSource } from "../memory-volume.js";
+import type { IDBSnapshotCache, PackHead } from "./idb-cache.js";
+import type { VFSSnapshotEntry } from "../threading/worker-protocol.js";
 
 // concurrent range reads while mounting a pack's pinned files
 const PINNED_READ_CONCURRENCY = 32;

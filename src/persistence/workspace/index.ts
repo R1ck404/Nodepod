@@ -1,17 +1,17 @@
-import type { MemoryVolume } from "../../memory-volume";
-import { WorkspacePersistence } from "./controller";
-import { acquireWorkspaceLock } from "./lock";
-import type { PersistenceOptions, WorkspaceStore } from "./types";
+import type { MemoryVolume } from "../../memory-volume.js";
+import { WorkspacePersistence } from "./controller.js";
+import { acquireWorkspaceLock } from "./lock.js";
+import type { PersistenceOptions, WorkspaceStore } from "./types.js";
 
-export { WorkspacePersistence } from "./controller";
-export { createMemoryWorkspaceStore } from "./memory-store";
+export { WorkspacePersistence } from "./controller.js";
+export { createMemoryWorkspaceStore } from "./memory-store.js";
 export {
   createIndexedDBWorkspaceStore,
   listIndexedDBWorkspaces,
   deleteIndexedDBWorkspace,
-} from "./idb-store";
-export type { IndexedDBWorkspaceStoreOptions, StoredWorkspaceInfo } from "./idb-store";
-export type * from "./types";
+} from "./idb-store.js";
+export type { IndexedDBWorkspaceStoreOptions, StoredWorkspaceInfo } from "./idb-store.js";
+export type * from "./types.js";
 
 /**
  * Boot-time setup: take the workspace lock, open the store, restore the

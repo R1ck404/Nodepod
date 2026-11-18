@@ -1,8 +1,8 @@
 // last-resort CDN polyfill via esm.sh, used when both the native .node binary and the lightningcss-wasm npm package fail to load
 // primary path is the npm package with VFS-to-CDN fallback for the large .wasm (see fetch patch in ScriptEngine)
 
-import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls";
-import { withHandle } from "../helpers/event-loop";
+import { CDN_LIGHTNINGCSS_WASM, cdnImport } from "../constants/cdn-urls.js";
+import { withHandle } from "../helpers/event-loop.js";
 
 // Bitfield constants -- must be available synchronously before WASM loads
 export const Features = {

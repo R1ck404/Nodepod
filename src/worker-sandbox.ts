@@ -1,8 +1,8 @@
 // executes code in a dedicated Web Worker behind the IScriptEngine interface
 
 import { wrap, proxy, Remote } from 'comlink';
-import type { MemoryVolume } from './memory-volume';
-import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types';
+import type { MemoryVolume } from './memory-volume.js';
+import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types.js';
 
 interface WorkerEndpoint {
   init(snapshot: VolumeSnapshot, config: EngineConfig): void;

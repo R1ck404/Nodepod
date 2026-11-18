@@ -1,6 +1,6 @@
 // TaskQueue — priority-sorted queue that dispatches tasks to the WorkerPool.
 
-import type { WorkerPool } from "./worker-pool";
+import type { WorkerPool } from "./worker-pool.js";
 import type {
   OffloadTask,
   OffloadResult,
@@ -12,9 +12,9 @@ import type {
   ExtractResult,
   BuildTask,
   BuildResult,
-} from "./offload-types";
+} from "./offload-types.js";
 import { transfer } from "comlink";
-import { profileTimestamp } from "../profiling/profiler";
+import { profileTimestamp } from "../profiling/profiler.js";
 
 // --- Internal types ---
 

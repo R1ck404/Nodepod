@@ -2,8 +2,8 @@
 // Mirrors Node's host-defined import.meta fields (url/filename/dirname/resolve/main).
 // Vite-only APIs (glob/env/hot) are intentionally absent — those are compile-time.
 
-import { pathToFileURL, fileURLToPath } from "../polyfills/url";
-import * as pathPolyfill from "../polyfills/path";
+import { pathToFileURL, fileURLToPath } from "../polyfills/url.js";
+import * as pathPolyfill from "../polyfills/path.js";
 
 export interface NodeImportMeta {
   url: string;

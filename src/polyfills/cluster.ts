@@ -1,6 +1,6 @@
 // stub - not available in browser, always reports as primary
 
-import { EventEmitter } from "./events";
+import { EventEmitter } from "./events.js";
 
 /* ------------------------------------------------------------------ */
 /*  Flags                                                              */

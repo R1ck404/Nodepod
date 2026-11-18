@@ -1,9 +1,9 @@
-import type { ShellCommand } from "../shell-types";
-import type { PmDeps } from "./pm-types";
-import { VERSIONS } from "../../constants/config";
-import { parseAst } from "../../polyfills/rollup";
-import { isTypeScriptFile, stripTypeScript } from "../../strip-typescript";
-import { resolvePath } from "../shell-helpers";
+import type { ShellCommand } from "../shell-types.js";
+import type { PmDeps } from "./pm-types.js";
+import { VERSIONS } from "../../constants/config.js";
+import { parseAst } from "../../polyfills/rollup.js";
+import { isTypeScriptFile, stripTypeScript } from "../../strip-typescript.js";
+import { resolvePath } from "../shell-helpers.js";
 
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";

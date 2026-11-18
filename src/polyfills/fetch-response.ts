@@ -2,8 +2,8 @@
 // Browser Fetch forbids reading Set-Cookie via headers.get() / iteration; use getSetCookie().
 
 import { splitCookiesString } from "set-cookie-parser";
-import type { ServerResponse } from "./http";
-import { getRegistry } from "../helpers/event-loop";
+import type { ServerResponse } from "./http.js";
+import { getRegistry } from "../helpers/event-loop.js";
 
 const HEADERS_PATCH = Symbol.for("nodepod.fetchHeadersSetCookieParity");
 const FETCH_CLASS_PATCH = Symbol.for("nodepod.fetchClassHeaderParity");

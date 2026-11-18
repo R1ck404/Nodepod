@@ -1,6 +1,6 @@
 // Version Resolver — semver parsing, range matching, and dependency tree resolution.
 
-import { RegistryClient, VersionDetail, type PackageMetadata } from "./registry-client";
+import { RegistryClient, VersionDetail, type PackageMetadata } from "./registry-client.js";
 
 // ---------------------------------------------------------------------------
 // Public types

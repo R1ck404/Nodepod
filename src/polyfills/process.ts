@@ -1,6 +1,6 @@
 // Process polyfill -- buildProcessEnv() constructs a full process object
 
-import { EventEmitter, EventHandler } from "./events";
+import { EventEmitter, EventHandler } from "./events.js";
 import {
   VERSIONS,
   NODE_SUB_VERSIONS,
@@ -10,13 +10,13 @@ import {
   MOCK_MEMORY,
   DEFAULT_ENV,
   DEFAULT_TERMINAL,
-} from "../constants/config";
+} from "../constants/config.js";
 import {
   getRegistry,
   isExitSentinel,
   ProcessExitSentinel,
   type Handle,
-} from "./../helpers/event-loop";
+} from "./../helpers/event-loop.js";
 
 // capture before engine wrapper overrides globalThis.console
 const _nativeConsole = console;

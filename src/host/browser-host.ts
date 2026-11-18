@@ -1,16 +1,16 @@
 import { ungzip } from "pako";
 import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
-import { openSnapshotCache } from "../persistence/idb-cache";
-import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
-import { createIndexedDBWorkspaceStore } from "../persistence/workspace/idb-store";
-import { registerDefaultHostFactory } from "./runtime-host";
+import { openSnapshotCache } from "../persistence/idb-cache.js";
+import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache.js";
+import { createIndexedDBWorkspaceStore } from "../persistence/workspace/idb-store.js";
+import { registerDefaultHostFactory } from "./runtime-host.js";
 import type {
   HostWorker,
   HttpIngress,
   OpenSnapshotCacheOptions,
   RuntimeHost,
   WorkerSpec,
-} from "./types";
+} from "./types.js";
 
 function wrapBrowserWorker(worker: Worker, revokeUrl?: string | null): HostWorker {
   const host = worker as unknown as HostWorker;

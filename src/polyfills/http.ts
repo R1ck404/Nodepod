@@ -2,15 +2,15 @@
 // createServer, request, get, Agent, STATUS_CODES, WebSocket upgrade bridging.
 // Uses function constructors (not classes) for pre-ES6 inheritance compat.
 
-import { EventEmitter, type EventHandler } from "./events";
-import { Readable, Writable } from "./stream";
-import { Buffer } from "./buffer";
-import { TcpSocket, TcpServer, type NetAddress } from "./net";
-import { createHash } from "./crypto";
-import { resolveProxyUrl } from "../cross-origin";
-import { fetchHeadersToNodeRecord } from "./fetch-response";
+import { EventEmitter, type EventHandler } from "./events.js";
+import { Readable, Writable } from "./stream.js";
+import { Buffer } from "./buffer.js";
+import { TcpSocket, TcpServer, type NetAddress } from "./net.js";
+import { createHash } from "./crypto.js";
+import { resolveProxyUrl } from "../cross-origin.js";
+import { fetchHeadersToNodeRecord } from "./fetch-response.js";
 // no event-loop import, the net.Server under us already registers TCPServerWrap
-import { TIMEOUTS } from "../constants/config";
+import { TIMEOUTS } from "../constants/config.js";
 
 // capture real browser WebSocket before any bundled lib can overwrite it
 const _runningInBrowser =

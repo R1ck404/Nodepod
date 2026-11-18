@@ -1,8 +1,8 @@
 // Stream polyfill -- Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished.
 // Uses function constructors (not classes) so Readable.call(this) works for pre-ES6 inheritance.
 
-import { EventEmitter } from "./events";
-import { Buffer } from "./buffer";
+import { EventEmitter } from "./events.js";
+import { Buffer } from "./buffer.js";
 
 function bufferByteLength(chunk: unknown): number {
   if (chunk instanceof Uint8Array) return chunk.byteLength;

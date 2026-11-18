@@ -3,9 +3,9 @@
 // buffer natively. Same wire shape as the spawn snapshot (VFSBinarySnapshot)
 // but built/applied with a path filter so it can carry just node_modules.
 
-import type { MemoryVolume } from "../memory-volume";
-import type { VFSBinarySnapshot } from "../threading/worker-protocol";
-import type { IDBSnapshotCache } from "./idb-cache";
+import type { MemoryVolume } from "../memory-volume.js";
+import type { VFSBinarySnapshot } from "../threading/worker-protocol.js";
+import type { IDBSnapshotCache } from "./idb-cache.js";
 
 // Collect all paths matching `filter` into a binary snapshot. Directories
 // matching the filter are recorded as empty entries so restores can recreate

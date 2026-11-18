@@ -10,11 +10,11 @@ import type {
   OpenSnapshotCacheOptions,
   RuntimeHost,
   WorkerSpec,
-} from "../types";
-import { spawnNodeEvalWorker } from "./node-worker-adapter";
-import { createLocalHttpIngress } from "./local-http-ingress";
-import { openFsSnapshotCache, defaultCacheDir } from "./fs-snapshot-cache";
-import { createFsWorkspaceStore } from "./fs-workspace-store";
+} from "../types.js";
+import { spawnNodeEvalWorker } from "./node-worker-adapter.js";
+import { createLocalHttpIngress } from "./local-http-ingress.js";
+import { openFsSnapshotCache, defaultCacheDir } from "./fs-snapshot-cache.js";
+import { createFsWorkspaceStore } from "./fs-workspace-store.js";
 
 export interface NodeHostOptions {
   /** Absolute path to dist/__worker__.js (or equivalent IIFE bundle). */

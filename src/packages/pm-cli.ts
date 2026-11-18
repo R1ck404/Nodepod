@@ -1,14 +1,14 @@
 // Shared package-manager CLI helpers used by npm/pnpm/yarn/bun shell commands.
 
-import type { MemoryVolume } from "../memory-volume";
-import type { ShellContext, ShellResult } from "../shell/shell-types";
-import { NPM_REGISTRY_URL, NPM_REGISTRY_URL_SLASH } from "../constants/config";
-import { RegistryClient, flushSharedRegistryCache } from "./registry-client";
-import { compareSemver, pickBestMatch, satisfiesRange } from "./version-resolver";
-import { clearResolutionMemoryCache } from "./resolution-cache";
-import { getTarballCache } from "../persistence/tarball-cache";
-import { packTarGz } from "./tar-pack";
-import { proxiedFetch } from "../cross-origin";
+import type { MemoryVolume } from "../memory-volume.js";
+import type { ShellContext, ShellResult } from "../shell/shell-types.js";
+import { NPM_REGISTRY_URL, NPM_REGISTRY_URL_SLASH } from "../constants/config.js";
+import { RegistryClient, flushSharedRegistryCache } from "./registry-client.js";
+import { compareSemver, pickBestMatch, satisfiesRange } from "./version-resolver.js";
+import { clearResolutionMemoryCache } from "./resolution-cache.js";
+import { getTarballCache } from "../persistence/tarball-cache.js";
+import { packTarGz } from "./tar-pack.js";
+import { proxiedFetch } from "../cross-origin.js";
 
 export type PkgManager = "npm" | "pnpm" | "yarn" | "bun";
 

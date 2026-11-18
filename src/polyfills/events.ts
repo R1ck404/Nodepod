@@ -2,9 +2,9 @@
 // EventEmitter.call(this) and Object.create(EventEmitter.prototype) work.
 // ES6 classes forbid calling without `new`, which breaks tons of npm packages.
 
-import { isExitSentinel } from "../helpers/event-loop";
-import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import { setImmediate, clearImmediate } from "./timers";
+import { isExitSentinel } from "../helpers/event-loop.js";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.js";
+import { setImmediate, clearImmediate } from "./timers.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;

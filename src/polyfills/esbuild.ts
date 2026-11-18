@@ -1,7 +1,7 @@
 // esbuild polyfill -- loads esbuild-wasm from CDN, routes file I/O through MemoryVolume
 
-import type { MemoryVolume } from "../memory-volume";
-import { CDN_ESBUILD_BINARY, PINNED_ESBUILD_WASM } from "../constants/cdn-urls";
+import type { MemoryVolume } from "../memory-volume.js";
+import { CDN_ESBUILD_BINARY, PINNED_ESBUILD_WASM } from "../constants/cdn-urls.js";
 import {
   getEsbuild,
   getEsbuildIfReady,
@@ -9,10 +9,10 @@ import {
   acquireDedicatedEsbuild,
   type EsbuildLease,
   runEsbuildTransform,
-} from "../helpers/esbuild-engine";
-import { stripTopLevelAwait } from "../syntax-transforms";
-import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config";
-import { getRegistry } from "../helpers/event-loop";
+} from "../helpers/esbuild-engine.js";
+import { stripTopLevelAwait } from "../syntax-transforms.js";
+import { ESBUILD_LOADER_MAP, RESOLVE_EXTENSIONS } from "../constants/config.js";
+import { getRegistry } from "../helpers/event-loop.js";
 
 const BUILTIN_MODULES = new Set([
   "assert",

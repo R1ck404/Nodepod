@@ -26,7 +26,7 @@ function readServiceWorkerSource(): string | null {
   }
 }
 
-import { DEFAULT_NODEPOD_CDN } from "./constants/config";
+import { DEFAULT_NODEPOD_CDN } from "./constants/config.js";
 
 export interface SandboxPageConfig {
   nodepodUrl?: string;

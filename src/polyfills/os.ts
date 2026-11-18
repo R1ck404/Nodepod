@@ -1,7 +1,7 @@
 // OS polyfill returning plausible Linux-like values
 
 
-import { MOCK_OS, MOCK_IDS, MOCK_CPU, MOCK_MEMORY, MOCK_LOADAVG } from "../constants/config";
+import { MOCK_OS, MOCK_IDS, MOCK_CPU, MOCK_MEMORY, MOCK_LOADAVG } from "../constants/config.js";
 
 export function hostname(): string {
   return MOCK_OS.HOSTNAME;

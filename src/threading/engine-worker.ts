@@ -2,9 +2,9 @@
 // Receives execution requests via Comlink, runs them in an isolated thread.
 
 import { expose } from 'comlink';
-import { MemoryVolume } from '../memory-volume';
-import { ScriptEngine } from '../script-engine';
-import type { VolumeSnapshot, EngineConfig, ExecutionOutcome } from '../engine-types';
+import { MemoryVolume } from '../memory-volume.js';
+import { ScriptEngine } from '../script-engine.js';
+import type { VolumeSnapshot, EngineConfig, ExecutionOutcome } from '../engine-types.js';
 
 let engine: ScriptEngine | null = null;
 let volume: MemoryVolume | null = null;

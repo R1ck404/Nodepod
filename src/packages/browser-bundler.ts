@@ -5,8 +5,8 @@ import {
   build,
   setVolume as setVFS,
   type BundleOutput as BuildResult,
-} from "../polyfills/esbuild";
-import type { MemoryVolume } from "../memory-volume";
+} from "../polyfills/esbuild.js";
+import type { MemoryVolume } from "../memory-volume.js";
 
 // ---------------------------------------------------------------------------
 // Module-level state

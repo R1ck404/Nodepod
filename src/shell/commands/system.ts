@@ -1,5 +1,5 @@
-import type { BuiltinFn } from "../shell-types";
-import { fail, ok, resolvePath, scheduleLongTimeout, yieldToEventLoop } from "../shell-helpers";
+import type { BuiltinFn } from "../shell-types.js";
+import { fail, ok, resolvePath, scheduleLongTimeout, yieldToEventLoop } from "../shell-helpers.js";
 
 function shellQuote(value: string): string {
   if (value.length > 0 && /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;

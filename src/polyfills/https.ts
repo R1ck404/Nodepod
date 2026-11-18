@@ -16,9 +16,9 @@ import {
   _buildClientRequest,
   Agent,
   globalAgent,
-} from './http';
+} from './http.js';
 
-import type { ConnectionOptions, AgentConfig } from './http';
+import type { ConnectionOptions, AgentConfig } from './http.js';
 
 // Re-export all shared types and classes under HTTPS naming
 export {

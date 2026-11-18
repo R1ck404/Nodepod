@@ -1,7 +1,7 @@
 // Shared utilities for shell builtins: colors, arg parsing, path helpers, result builders.
 
-import type { ShellResult } from "./shell-types";
-import * as pathModule from "../polyfills/path";
+import type { ShellResult } from "./shell-types.js";
+import * as pathModule from "../polyfills/path.js";
 
 /* ------------------------------------------------------------------ */
 /*  ANSI color helpers                                                 */

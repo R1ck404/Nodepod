@@ -1,7 +1,7 @@
 // Process handle returned by nodepod.spawn().
 // Emits 'output', 'error', 'exit'. Has write() for stdin and kill() to abort.
 
-import { EventEmitter } from "../polyfills/events";
+import { EventEmitter } from "../polyfills/events.js";
 
 export class NodepodProcess extends EventEmitter {
   private _abortController = new AbortController();

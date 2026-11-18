@@ -1,7 +1,7 @@
 // worker-side filesystem proxy
 // reads are instant from a local Map, writes go to both the local store and main thread
 
-import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
+import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol.js";
 
 export class WorkerVFS {
   private _files = new Map<string, Uint8Array>();

@@ -1,7 +1,7 @@
 // stub - not available in browser
 
-import { EventEmitter } from "./events";
-import { getRegistry, type Handle } from "../helpers/event-loop";
+import { EventEmitter } from "./events.js";
+import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
 export interface Socket extends EventEmitter {
   bind(_port?: number, _addr?: string, _cb?: () => void): this;

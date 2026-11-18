@@ -1,4 +1,4 @@
-import type { RuntimeHost } from "./types";
+import type { RuntimeHost } from "./types.js";
 
 const GLOBAL_FACTORY_KEY = "__NODEPOD_CREATE_BROWSER_HOST__";
 

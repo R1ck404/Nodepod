@@ -2,10 +2,10 @@
 // speaks Comlink's wire protocol directly so the message listener is synchronous on boot — avoids races with the first init() call
 // heavy deps (esbuild, pako) load from CDN lazily
 
-import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
-import { CDN_PAKO } from "../constants/config";
-import { getRuntimeHost } from "../host/runtime-host";
-import type { HostWorker } from "../host/types";
+import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls.js";
+import { CDN_PAKO } from "../constants/config.js";
+import { getRuntimeHost } from "../host/runtime-host.js";
+import type { HostWorker } from "../host/types.js";
 
 const WORKER_SOURCE = /* js */ `
 "use strict";

@@ -12,13 +12,13 @@
  * no hardcoding per package
  */
 
-import type { MemoryVolume } from "../memory-volume";
-import { EventEmitter } from "../polyfills/events";
-import { PassThrough } from "../polyfills/stream";
-import { getRegistry, type Handle } from "./event-loop";
-import { esmToCjs } from "../syntax-transforms";
+import type { MemoryVolume } from "../memory-volume.js";
+import { EventEmitter } from "../polyfills/events.js";
+import { PassThrough } from "../polyfills/stream.js";
+import { getRegistry, type Handle } from "./event-loop.js";
+import { esmToCjs } from "../syntax-transforms.js";
 import { parse } from "acorn";
-import { getWasiRuntimeSource } from "../polyfills/wasi";
+import { getWasiRuntimeSource } from "../polyfills/wasi.js";
 
 function scanWorkerDependencies(source: string): { dependencies: string[]; esm: boolean } {
   let ast: any;

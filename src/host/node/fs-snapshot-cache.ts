@@ -10,8 +10,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { IDBSnapshotCache, PackHead } from "../../persistence/idb-cache";
-import type { VFSBinarySnapshot } from "../../threading/worker-protocol";
+import type { IDBSnapshotCache, PackHead } from "../../persistence/idb-cache.js";
+import type { VFSBinarySnapshot } from "../../threading/worker-protocol.js";
 
 const SCHEMA = 2;
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;

@@ -6,8 +6,8 @@ import {
   CDN_ROLLUP_BROWSER,
   PINNED_ROLLUP_BROWSER,
   cdnImport,
-} from "../constants/cdn-urls";
-import { withHandle } from "../helpers/event-loop";
+} from "../constants/cdn-urls.js";
+import { withHandle } from "../helpers/event-loop.js";
 
 // acorn parser extended with JSX support
 const acornJsxParser = (acorn.Parser as any).extend(acornJsx());

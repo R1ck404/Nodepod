@@ -5,7 +5,7 @@
 // retries with backoff on the failures that are worth retrying (network
 // errors, timeouts, 5xx, 408/429). 4xx other than those are final.
 
-import { proxiedFetch } from "../cross-origin";
+import { proxiedFetch } from "../cross-origin.js";
 
 export interface RegistryFetchOptions {
   /** Per-attempt deadline. */

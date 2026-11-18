@@ -4,7 +4,7 @@
 // first build. A WebAssembly.Module can be posted to workers, so the
 // compile (and V8's optimized tier-up of it) happens once per session.
 
-import { CDN_ESBUILD_BINARY, ESBUILD_HAS_BINARY } from "../constants/cdn-urls";
+import { CDN_ESBUILD_BINARY, ESBUILD_HAS_BINARY } from "../constants/cdn-urls.js";
 
 let modulePromise: Promise<WebAssembly.Module | null> | null = null;
 let compiling = false;

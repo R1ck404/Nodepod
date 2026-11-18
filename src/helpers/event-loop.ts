@@ -4,7 +4,7 @@
 // so polyfills don't have to pair every register with a matching unref
 // in their error paths.
 
-import { getActiveContext } from "../threading/process-context";
+import { getActiveContext } from "../threading/process-context.js";
 
 // process.exit() throws this to unwind the script. We brand it so consumers
 // can use isExitSentinel(e) instead of matching on err.message, which would

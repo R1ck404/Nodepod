@@ -3,10 +3,10 @@
 // If Worker creation fails (CSP, etc.), acquire() throws so the caller can fall back.
 
 import { wrap, type Remote } from "comlink";
-import type { OffloadWorkerEndpoint, PoolConfig } from "./offload-types";
-import { createInlineWorker, revokeInlineWorkerUrl } from "./inline-worker";
-import { TIMEOUTS, LIMITS } from "../constants/config";
-import type { HostWorker } from "../host/types";
+import type { OffloadWorkerEndpoint, PoolConfig } from "./offload-types.js";
+import { createInlineWorker, revokeInlineWorkerUrl } from "./inline-worker.js";
+import { TIMEOUTS, LIMITS } from "../constants/config.js";
+import type { HostWorker } from "../host/types.js";
 
 // --- Internal types ---
 

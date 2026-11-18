@@ -1,8 +1,8 @@
 // Offload API — routes CPU-heavy tasks (esbuild, tarball extraction, bundling)
 // to a Web Worker pool. Falls back to main-thread if Workers aren't available.
 
-import { WorkerPool } from "./worker-pool";
-import { TaskQueue } from "./task-queue";
+import { WorkerPool } from "./worker-pool.js";
+import { TaskQueue } from "./task-queue.js";
 import type {
   OffloadTask,
   OffloadResult,
@@ -15,11 +15,11 @@ import type {
   ExtractResult,
   BuildTask,
   BuildResult,
-} from "./offload-types";
-import type { NodepodProfilerImpl } from "../profiling/profiler";
-import { profileTimestamp } from "../profiling/profiler";
+} from "./offload-types.js";
+import type { NodepodProfilerImpl } from "../profiling/profiler.js";
+import { profileTimestamp } from "../profiling/profiler.js";
 
-export { TaskPriority } from "./offload-types";
+export { TaskPriority } from "./offload-types.js";
 export type {
   TransformTask,
   TransformResult,
@@ -32,7 +32,7 @@ export type {
   OffloadTask,
   OffloadResult,
   PoolConfig,
-} from "./offload-types";
+} from "./offload-types.js";
 
 // --- Singleton state ---
 
@@ -76,7 +76,7 @@ async function mainThreadTransform(
 ): Promise<TransformResult> {
   // convertFileDirect, not convertFile — avoids circular: convertFile → offload → fallback → loop
   const { convertFileDirect, patchBuiltinImports, prepareTransformer } = await import(
-    "../module-transformer"
+    "../module-transformer.js"
   );
   await prepareTransformer();
 
@@ -88,7 +88,7 @@ async function mainThreadTransformBatch(
   task: TransformBatchTask,
 ): Promise<TransformBatchResult> {
   const { convertFileDirect, patchBuiltinImports, prepareTransformer } = await import(
-    "../module-transformer"
+    "../module-transformer.js"
   );
   await prepareTransformer();
   const results = await Promise.all(task.files.map(async (file) => {
@@ -127,7 +127,7 @@ async function gunzip(compressed: Uint8Array): Promise<Uint8Array> {
 async function mainThreadExtract(
   task: ExtractTask,
 ): Promise<ExtractResult> {
-  const { parseTarArchive } = await import("../packages/archive-extractor");
+  const { parseTarArchive } = await import("../packages/archive-extractor.js");
 
   let compressed: Uint8Array;
   if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
@@ -184,7 +184,7 @@ async function mainThreadExtract(
 }
 
 async function mainThreadBuild(task: BuildTask): Promise<BuildResult> {
-  const esbuild = await import("../polyfills/esbuild");
+  const esbuild = await import("../polyfills/esbuild.js");
   try {
     const result = await (esbuild as any).build({
       entryPoints: task.entryPoints,

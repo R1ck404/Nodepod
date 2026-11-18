@@ -5,7 +5,7 @@ import {
   rememberWasmMemoryRequirements,
   wasmMemoryRequirements,
   type WasmMemoryImport,
-} from "./wasm-memory-clamp";
+} from "./wasm-memory-clamp.js";
 
 const FIELD = "__nodepodWasmMemoryMetadata";
 type Annotation = [WebAssembly.Module, WasmMemoryImport[] | null];

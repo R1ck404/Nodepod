@@ -1,7 +1,7 @@
 // Shared MemoryVolume reference for polyfills that need VFS access
 
 
-import type { MemoryVolume } from "../memory-volume";
+import type { MemoryVolume } from "../memory-volume.js";
 
 let sharedVolume: MemoryVolume | null = null;
 

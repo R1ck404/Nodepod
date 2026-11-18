@@ -1,5 +1,5 @@
-import type { BuiltinFn } from "../shell-types";
-import { ok, fail } from "../shell-helpers";
+import type { BuiltinFn } from "../shell-types.js";
+import { ok, fail } from "../shell-helpers.js";
 
 function parseAssignments(args: string[]): Record<string, string> {
   const values: Record<string, string> = {};

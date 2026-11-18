@@ -12,8 +12,8 @@ import type {
   WorkspaceEntry,
   WorkspaceManifest,
   WorkspaceStore,
-} from "../../persistence/workspace/types";
-import { changesTree, isUnderOrAt } from "../../persistence/workspace/paths";
+} from "../../persistence/workspace/types.js";
+import { changesTree, isUnderOrAt } from "../../persistence/workspace/paths.js";
 
 const MANIFEST = "manifest.json";
 const BLOB_DIR = "blobs";

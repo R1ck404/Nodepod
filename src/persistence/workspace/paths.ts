@@ -1,7 +1,7 @@
 // Path helpers shared by the persistence controller and stores.
 
-import { isInternalVfsPath } from "../../constants/internal-vfs-paths";
-import type { WorkspaceBatch } from "./types";
+import { isInternalVfsPath } from "../../constants/internal-vfs-paths.js";
+import type { WorkspaceBatch } from "./types.js";
 
 export const DEFAULT_EXCLUDED_DIR_NAMES = ["node_modules", ".cache", ".npm"];
 

@@ -1,10 +1,10 @@
 // Zlib polyfill using pako for deflate/inflate/gzip + optional brotli-wasm
 
-import { Buffer } from "./buffer";
-import { Transform } from "./stream";
-import { CDN_BROTLI_WASM, cdnImport } from "../constants/cdn-urls";
+import { Buffer } from "./buffer.js";
+import { Transform } from "./stream.js";
+import { CDN_BROTLI_WASM, cdnImport } from "../constants/cdn-urls.js";
 import pako from "pako";
-import { getRegistry } from "../helpers/event-loop";
+import { getRegistry } from "../helpers/event-loop.js";
 
 
 export type BrotliEngine = {

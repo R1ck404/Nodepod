@@ -1,4 +1,4 @@
-import type { BuiltinFn, ShellContext } from "../shell-types";
+import type { BuiltinFn, ShellContext } from "../shell-types.js";
 import {
   ok,
   fail,
@@ -6,7 +6,7 @@ import {
   parseArgs,
   pathModule,
   yieldToEventLoop,
-} from "../shell-helpers";
+} from "../shell-helpers.js";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */

@@ -1,39 +1,39 @@
 // child_process polyfill -- exec, execSync, spawn, fork backed by NodepodShell.
 // Integrates with MemoryVolume directly.
 
-import { NodepodShell } from "../shell/shell-interpreter";
-import type { ShellResult, ShellContext } from "../shell/shell-types";
-import { EventEmitter } from "./events";
-import { Readable, Writable } from "./stream";
-import { Buffer } from "./buffer";
-import { serializeIpcMessage, type IpcSerialization } from "../helpers/ipc-serialization";
-import type { MemoryVolume } from "../memory-volume";
-import { ScriptEngine } from "../script-engine";
-import { getWorkerTransformCache } from "../threading/worker-transform-cache";
-import { prewarmEsbuild } from "../helpers/esbuild-engine";
-import type { PackageManifest } from "../types/manifest";
-import { resetActiveInterfaceCount } from "./readline";
+import { NodepodShell } from "../shell/shell-interpreter.js";
+import type { ShellResult, ShellContext } from "../shell/shell-types.js";
+import { EventEmitter } from "./events.js";
+import { Readable, Writable } from "./stream.js";
+import { Buffer } from "./buffer.js";
+import { serializeIpcMessage, type IpcSerialization } from "../helpers/ipc-serialization.js";
+import type { MemoryVolume } from "../memory-volume.js";
+import { ScriptEngine } from "../script-engine.js";
+import { getWorkerTransformCache } from "../threading/worker-transform-cache.js";
+import { prewarmEsbuild } from "../helpers/esbuild-engine.js";
+import type { PackageManifest } from "../types/manifest.js";
+import { resetActiveInterfaceCount } from "./readline.js";
 import {
   getRegistry,
   isExitSentinel,
   ProcessExitSentinel,
   type Handle,
-} from "../helpers/event-loop";
-import { createProcessContext, getActiveContext, setActiveContext } from "../threading/process-context";
-import type { ProcessContext } from "../threading/process-context";
-import type { PmDeps, PkgManager } from "../shell/commands/pm-types";
-import type { ShellOptions } from "../shell/shell-options";
-import { createNpmCommand } from "../shell/commands/npm";
-import { createPnpmCommand } from "../shell/commands/pnpm";
-import { createYarnCommand } from "../shell/commands/yarn";
-import { createBunCommand, createBunxCommand } from "../shell/commands/bun";
-import { createNodeCommand, createNpxCommand } from "../shell/commands/node";
-import { createGitCommand } from "../shell/commands/git";
-import { format as utilFormat, stripVTControlCharacters } from "./util";
-import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config";
-import { closeAllServers, getAllServers } from "./http";
-import { disposeAllTimers } from "./timers";
-import type { SyncChannelWorker } from "../threading/sync-channel";
+} from "../helpers/event-loop.js";
+import { createProcessContext, getActiveContext, setActiveContext } from "../threading/process-context.js";
+import type { ProcessContext } from "../threading/process-context.js";
+import type { PmDeps, PkgManager } from "../shell/commands/pm-types.js";
+import type { ShellOptions } from "../shell/shell-options.js";
+import { createNpmCommand } from "../shell/commands/npm.js";
+import { createPnpmCommand } from "../shell/commands/pnpm.js";
+import { createYarnCommand } from "../shell/commands/yarn.js";
+import { createBunCommand, createBunxCommand } from "../shell/commands/bun.js";
+import { createNodeCommand, createNpxCommand } from "../shell/commands/node.js";
+import { createGitCommand } from "../shell/commands/git.js";
+import { format as utilFormat, stripVTControlCharacters } from "./util.js";
+import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config.js";
+import { closeAllServers, getAllServers } from "./http.js";
+import { disposeAllTimers } from "./timers.js";
+import type { SyncChannelWorker } from "../threading/sync-channel.js";
 import {
   hasGlobalFlag,
   withoutGlobalFlags,
@@ -52,7 +52,7 @@ import {
   readPackageLock,
   packageJsonDepsMatchLock,
   resolveRegistry,
-} from "../packages/pm-cli";
+} from "../packages/pm-cli.js";
 
 let _shell: NodepodShell | null = null;
 let _vol: MemoryVolume | null = null;
@@ -234,7 +234,7 @@ export type ForkChildCallback = (
   opts: {
     cwd: string;
     env: Record<string, string>;
-    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    serialization?: import("../helpers/ipc-serialization.js").IpcSerialization;
     execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
@@ -783,7 +783,7 @@ function formatWarn(msg: string, pm: PkgManager): string {
 // shell installs get the same IDB snapshot cache the SDK uses (plan 015).
 // opened once per realm; IDB is available in workers, where the shell runs.
 let _shellSnapshotCache:
-  | import("../persistence/idb-cache").IDBSnapshotCache
+  | import("../persistence/idb-cache.js").IDBSnapshotCache
   | null
   | undefined;
 
@@ -795,7 +795,7 @@ function packSaveHandoff(): ((key: string) => boolean) | null {
 async function getShellSnapshotCache() {
   if (_shellSnapshotCache === undefined) {
     try {
-      const { openSnapshotCache } = await import("../persistence/idb-cache");
+      const { openSnapshotCache } = await import("../persistence/idb-cache.js");
       _shellSnapshotCache = await openSnapshotCache();
     } catch {
       _shellSnapshotCache = null;
@@ -888,7 +888,7 @@ async function installPackages(
 ): Promise<ShellResult> {
   if (hasGlobalFlag(args)) return installGlobal(withoutGlobalFlags(args), ctx, pm, opts);
 
-  const { DependencyInstaller } = await import("../packages/installer");
+  const { DependencyInstaller } = await import("../packages/installer.js");
   const snapshotCache = await getShellSnapshotCache();
   const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache, deferPackSave: packSaveHandoff() });
   let out = "";
@@ -1069,7 +1069,7 @@ async function listPackages(
   args: string[] = [],
 ): Promise<ShellResult> {
   if (hasGlobalFlag(args)) ctx = globalContext(_vol!, ctx);
-  const { DependencyInstaller } = await import("../packages/installer");
+  const { DependencyInstaller } = await import("../packages/installer.js");
   const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd });
   const pkgs = installer.listInstalled();
   const entries = Object.entries(pkgs);
@@ -1217,7 +1217,7 @@ async function npmInfo(
 
   // fall back to registry
   try {
-    const { RegistryClient } = await import("../packages/registry-client");
+    const { RegistryClient } = await import("../packages/registry-client.js");
     const client = new RegistryClient();
     const meta = await client.fetchManifest(name);
     const latest = meta["dist-tags"]?.latest;
@@ -1269,7 +1269,7 @@ async function npmCi(
     /* */
   }
 
-  const { DependencyInstaller } = await import("../packages/installer");
+  const { DependencyInstaller } = await import("../packages/installer.js");
   const snapshotCache = await getShellSnapshotCache();
   const installer = new DependencyInstaller(_vol!, {
     cwd: ctx.cwd,

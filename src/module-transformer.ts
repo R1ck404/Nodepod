@@ -2,13 +2,13 @@
 // pre-convert packages so synchronous require() works at runtime.
 // Transforms are offloaded to Web Workers when available.
 
-import type { MemoryVolume } from "./memory-volume";
-import { offload, profiledOffload, taskId, TaskPriority } from "./threading/offload";
-import type { TransformBatchResult, TransformBatchTask, TransformResult } from "./threading/offload-types";
-import { getEsbuild, getEsbuildIfReady, acquireEsbuild, type EsbuildEngine } from "./helpers/esbuild-engine";
-import type { NodepodProfilerImpl } from "./profiling/profiler";
-import { chunkTransformFiles } from "./threading/transform-batching";
-import { containsJsx } from "./threading/jsx-detection";
+import type { MemoryVolume } from "./memory-volume.js";
+import { offload, profiledOffload, taskId, TaskPriority } from "./threading/offload.js";
+import type { TransformBatchResult, TransformBatchTask, TransformResult } from "./threading/offload-types.js";
+import { getEsbuild, getEsbuildIfReady, acquireEsbuild, type EsbuildEngine } from "./helpers/esbuild-engine.js";
+import type { NodepodProfilerImpl } from "./profiling/profiler.js";
+import { chunkTransformFiles } from "./threading/transform-batching.js";
+import { containsJsx } from "./threading/jsx-detection.js";
 
 const inBrowser = typeof window !== "undefined";
 

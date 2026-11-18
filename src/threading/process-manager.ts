@@ -1,21 +1,21 @@
 // main-thread process lifecycle manager
 // spawns Web Worker processes, routes I/O, syncs VFS, tracks process tree
 
-import { EventEmitter } from "../polyfills/events";
-import type { MemoryVolume } from "../memory-volume";
-import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
-import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import { precompileWasm } from "../helpers/wasm-cache";
+import { EventEmitter } from "../polyfills/events.js";
+import type { MemoryVolume } from "../memory-volume.js";
+import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls.js";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.js";
+import { precompileWasm } from "../helpers/wasm-cache.js";
 import {
   getSharedEsbuildModule,
   prefetchSharedEsbuildModule,
-} from "../helpers/esbuild-wasm-module";
-import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
-import { ProcessHandle } from "./process-handle";
-import { buildFileSystemBridge } from "../polyfills/fs";
-import { handleFsProxy } from "../helpers/napi-wasm-worker";
-import { getSharedTransformStore, type TransformEntry } from "./transform-store";
-import { isRecoverableWasmPath, isWasmResolverProbe, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
+} from "../helpers/esbuild-wasm-module.js";
+import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite.js";
+import { ProcessHandle } from "./process-handle.js";
+import { buildFileSystemBridge } from "../polyfills/fs.js";
+import { handleFsProxy } from "../helpers/napi-wasm-worker.js";
+import { getSharedTransformStore, type TransformEntry } from "./transform-store.js";
+import { isRecoverableWasmPath, isWasmResolverProbe, prefetchWasmFromCdn } from "../helpers/wasm-cdn.js";
 import type {
   SpawnConfig,
   ProcessInfo,
@@ -32,15 +32,15 @@ import type {
   WorkerToMain_HttpClientRequest,
   WorkerToMain_SqlitePreload,
   WorkerToMain_PackSave,
-} from "./worker-protocol";
-import type { ShellOptions } from "../shell/shell-options";
-import type { VFSBridge } from "./vfs-bridge";
-import { getRuntimeHost } from "../host/runtime-host";
-import { getFetchPolicy } from "../cross-origin";
-import type { HostWorker } from "../host/types";
-import { SyncResultWriter, SYNC_STATUS_ERROR } from "./sync-channel";
-import type { PerformanceTracker } from "../performance-tracker";
-import type { NodepodProfilerImpl } from "../profiling/profiler";
+} from "./worker-protocol.js";
+import type { ShellOptions } from "../shell/shell-options.js";
+import type { VFSBridge } from "./vfs-bridge.js";
+import { getRuntimeHost } from "../host/runtime-host.js";
+import { getFetchPolicy } from "../cross-origin.js";
+import type { HostWorker } from "../host/types.js";
+import { SyncResultWriter, SYNC_STATUS_ERROR } from "./sync-channel.js";
+import type { PerformanceTracker } from "../performance-tracker.js";
+import type { NodepodProfilerImpl } from "../profiling/profiler.js";
 
 // A child's environment as node builds it: entries whose value is undefined
 // are dropped and the rest become strings. process.env here is a plain
