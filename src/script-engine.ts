@@ -959,7 +959,9 @@ async function fetchVirtualServer(
   init: RequestInit | undefined,
   target: LoopbackTarget,
 ): Promise<Response | null> {
-  const request = new Request(input as RequestInfo, init);
+  // clone a Request input: reading its body here would leave the caller's
+  // Request used, and the network fallback still has to send it
+  const request = new Request(input instanceof Request ? input.clone() : input, init);
   const method = request.method.toUpperCase();
   const headers: Record<string, string> = {};
   request.headers.forEach((value, key) => {
