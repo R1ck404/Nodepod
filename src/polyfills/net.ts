@@ -396,9 +396,169 @@ export function isIPv6(addr: string): boolean {
   return isIP(addr) === 6;
 }
 
+type IPFamily = 4 | 6;
+interface ParsedIP {
+  family: IPFamily;
+  value: bigint;
+}
+interface SocketAddressLike {
+  address: string;
+  family?: string;
+}
+type BlockRule =
+  | { kind: "address"; ip: ParsedIP; text: string }
+  | { kind: "range"; start: ParsedIP; end: ParsedIP; text: string }
+  | { kind: "subnet"; ip: ParsedIP; prefix: number; text: string };
+
+function invalidArg(name: string, value: unknown): never {
+  const e = new TypeError(
+    `The argument '${name}' is invalid. Received ${JSON.stringify(value)}`,
+  ) as TypeError & { code: string };
+  e.code = "ERR_INVALID_ARG_VALUE";
+  throw e;
+}
+
+function parseFamily(family: unknown): IPFamily {
+  if (family === undefined || family === "ipv4" || family === "IPv4") return 4;
+  if (family === "ipv6" || family === "IPv6") return 6;
+  return invalidArg("family", family);
+}
+
+function parseIP(addr: string, family: IPFamily): ParsedIP | null {
+  if (family === 4) {
+    if (!isIPv4Literal(addr)) return null;
+    let value = 0n;
+    for (const part of addr.split(".")) value = (value << 8n) | BigInt(part);
+    return { family: 4, value };
+  }
+  if (!isIPv6Literal(addr)) return null;
+  let text = addr;
+  const v4Tail = text.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4Tail) {
+    const v4 = parseIP(v4Tail[1]!, 4)!.value;
+    text =
+      text.slice(0, -v4Tail[1]!.length) +
+      (v4 >> 16n).toString(16) +
+      ":" +
+      (v4 & 0xffffn).toString(16);
+  }
+  const sides = text.split("::");
+  const left = sides[0] ? sides[0].split(":") : [];
+  const right = sides.length > 1 && sides[1] ? sides[1].split(":") : [];
+  const fill = sides.length > 1 ? 8 - left.length - right.length : 0;
+  const groups = [...left, ...new Array<string>(fill).fill("0"), ...right];
+  let value = 0n;
+  for (const g of groups) value = (value << 16n) | BigInt("0x" + g);
+  return { family: 6, value };
+}
+
+// ::ffff:a.b.c.d is the IPv6 spelling of an IPv4 address; Node matches it
+// against IPv4 rules too.
+function mappedV4(ip: ParsedIP): ParsedIP | null {
+  if (ip.family === 6 && ip.value >> 32n === 0xffffn) {
+    return { family: 4, value: ip.value & 0xffffffffn };
+  }
+  return null;
+}
+
+function ruleMatches(rule: BlockRule, ip: ParsedIP): boolean {
+  const ruleFamily = rule.kind === "range" ? rule.start.family : rule.ip.family;
+  if (ruleFamily !== ip.family) return false;
+  if (rule.kind === "address") return rule.ip.value === ip.value;
+  if (rule.kind === "range") return ip.value >= rule.start.value && ip.value <= rule.end.value;
+  const shift = BigInt(ip.family === 4 ? 32 : 128) - BigInt(rule.prefix);
+  return rule.ip.value >> shift === ip.value >> shift;
+}
+
+const familyLabel = (family: IPFamily): string => (family === 4 ? "IPv4" : "IPv6");
+
+// net.BlockList: Vite's host check and several dev servers construct one.
+export class BlockList {
+  private _rules: BlockRule[] = [];
+
+  static isBlockList(value: unknown): value is BlockList {
+    return value instanceof BlockList;
+  }
+
+  get rules(): string[] {
+    return this._rules.map((r) => r.text).reverse(); // Node lists the newest rule first
+  }
+
+  addAddress(address: string | SocketAddressLike, family?: string): void {
+    const { addr, fam } = this._input("address", address, family);
+    const ip = parseIP(addr, fam) ?? invalidArg("address", address);
+    this._rules.push({ kind: "address", ip, text: `Address: ${familyLabel(fam)} ${addr}` });
+  }
+
+  addRange(
+    start: string | SocketAddressLike,
+    end: string | SocketAddressLike,
+    family?: string,
+  ): void {
+    const a = this._input("start", start, family);
+    const b = this._input("end", end, family);
+    const s = parseIP(a.addr, a.fam) ?? invalidArg("start", start);
+    const e = parseIP(b.addr, a.fam) ?? invalidArg("end", end);
+    if (s.value > e.value) invalidArg("start", start);
+    this._rules.push({
+      kind: "range",
+      start: s,
+      end: e,
+      text: `Range: ${familyLabel(a.fam)} ${a.addr}-${b.addr}`,
+    });
+  }
+
+  addSubnet(net: string | SocketAddressLike, prefix: number, family?: string): void {
+    const { addr, fam } = this._input("network", net, family);
+    const ip = parseIP(addr, fam) ?? invalidArg("network", net);
+    const max = fam === 4 ? 32 : 128;
+    if (typeof prefix !== "number" || !Number.isInteger(prefix) || prefix < 0 || prefix > max) {
+      const e = new RangeError(
+        `The value of "prefix" is out of range. It must be >= 0 && <= ${max}. Received ${String(prefix)}`,
+      ) as RangeError & { code: string };
+      e.code = "ERR_OUT_OF_RANGE";
+      throw e;
+    }
+    this._rules.push({
+      kind: "subnet",
+      ip,
+      prefix,
+      text: `Subnet: ${familyLabel(fam)} ${addr}/${prefix}`,
+    });
+  }
+
+  check(address: string | SocketAddressLike, family?: string): boolean {
+    let input: { addr: string; fam: IPFamily };
+    try {
+      input = this._input("address", address, family);
+    } catch {
+      return false;
+    }
+    const ip = parseIP(input.addr, input.fam);
+    if (!ip) return false;
+    const mapped = mappedV4(ip);
+    return this._rules.some(
+      (r) => ruleMatches(r, ip) || (mapped !== null && ruleMatches(r, mapped)),
+    );
+  }
+
+  private _input(
+    name: string,
+    value: string | SocketAddressLike,
+    family?: string,
+  ): { addr: string; fam: IPFamily } {
+    if (value && typeof value === "object") {
+      return { addr: String(value.address), fam: parseFamily(value.family) };
+    }
+    if (typeof value !== "string") invalidArg(name, value);
+    return { addr: value, fam: parseFamily(family) };
+  }
+}
+
 export default {
   Socket: TcpSocket,
   Server: TcpServer,
+  BlockList,
   createServer,
   createConnection,
   connect,

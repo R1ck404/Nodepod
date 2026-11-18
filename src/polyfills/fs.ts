@@ -1920,6 +1920,19 @@ export function buildFileSystemBridge(
 
     fstatSync(fd: number, opts?: StatOptions): FileStat | undefined {
       const entry = openFiles.get(fd);
+      if (!entry && (fd === 0 || fd === 1 || fd === 2)) {
+        // stdin/stdout/stderr are always open in Node. Emscripten's NODERAWFS
+        // (sharp's wasm32 build, others) fstat's them while initializing.
+        return runStat(() => ({
+          ...volume.statSync("/"),
+          isDirectory: () => false,
+          isCharacterDevice: () => true,
+          mode: 0o20620,
+          size: 0,
+          blocks: 0,
+          ino: fd + 1,
+        }), opts);
+      }
       if (!entry) {
         const err = new Error("EBADF: bad file descriptor, fstat") as Error & {
           code: string;
