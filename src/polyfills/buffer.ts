@@ -102,6 +102,21 @@ class BufferPolyfill extends Uint8Array {
       return new BufferPolyfill(source);
     }
 
+    // Node accepts the object produced by Buffer#toJSON(), e.g. a Buffer sent over a JSON IPC channel,
+    // and objects whose valueOf() returns a string, array or buffer.
+    if (source && typeof source === 'object' && !ArrayBuffer.isView(source) && !(source instanceof ArrayBuffer)) {
+      const obj = source as unknown as { type?: unknown; data?: unknown; valueOf?: () => unknown };
+      if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
+        return new BufferPolyfill(obj.data as number[]);
+      }
+      if (typeof obj.valueOf === 'function') {
+        const primitive = obj.valueOf();
+        if (primitive !== source && primitive != null && (typeof primitive === 'string' || typeof primitive === 'object')) {
+          return BufferPolyfill.from(primitive as string, encOrMapper as string);
+        }
+      }
+    }
+
     if (typeof source === 'string') {
       // the common case first, without normalizing the encoding name
       if (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') {

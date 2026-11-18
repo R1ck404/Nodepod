@@ -423,3 +423,31 @@ describe("Buffer", () => {
     });
   });
 });
+
+describe("Buffer.from with objects", () => {
+  it("accepts the toJSON() form, as after a JSON round trip", async () => {
+    const { Buffer: NativeBuffer } = await import("node:buffer");
+    const json = JSON.parse(JSON.stringify(Buffer.from("héllo")));
+    expect(json).toEqual({ type: "Buffer", data: [...NativeBuffer.from("héllo")] });
+    const buf = Buffer.from(json);
+    expect(Buffer.isBuffer(buf)).toBe(true);
+    expect(buf.toString()).toBe("héllo");
+    expect([...buf]).toEqual([...NativeBuffer.from(json)]);
+  });
+
+  it("uses valueOf() when it returns a string, array or buffer, as Node does", async () => {
+    const { Buffer: NativeBuffer } = await import("node:buffer");
+    const inputs: unknown[] = [
+      new String("abc"),
+      { valueOf: () => [1, 2, 3] },
+      { valueOf: () => Buffer.from("xy") },
+    ];
+    for (const input of inputs) {
+      const nativeInput = (input as { valueOf(): unknown }).valueOf() instanceof Uint8Array
+        ? { valueOf: () => NativeBuffer.from("xy") }
+        : input;
+      expect([...Buffer.from(input as string)]).toEqual([...NativeBuffer.from(nativeInput as string)]);
+    }
+    expect([...Buffer.from(new String("6869") as unknown as string, "hex")]).toEqual([0x68, 0x69]);
+  });
+});
