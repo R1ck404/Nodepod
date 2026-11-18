@@ -1,15 +1,15 @@
 // SQLite polyfill using wa-sqlite for DatabaseSync and StatementSync
 
-import type { MemoryVolume } from "../memory-volume";
+import type { MemoryVolume } from "../memory-volume.js";
 import {
   CDN_WA_SQLITE,
   CDN_WA_SQLITE_WASM,
   cdnImport,
-} from "../constants/cdn-urls";
-import { getRegistry } from "../helpers/event-loop";
-import { getCachedModule, precompileWasm } from "../helpers/wasm-cache";
-import { Buffer } from "./buffer";
-import { setSharedVolume, getSharedVolume } from "./volume-registry";
+} from "../constants/cdn-urls.js";
+import { getRegistry } from "../helpers/event-loop.js";
+import { getCachedModule, precompileWasm } from "../helpers/wasm-cache.js";
+import { Buffer } from "./buffer.js";
+import { setSharedVolume, getSharedVolume } from "./volume-registry.js";
 import { Factory, SQLiteError } from "wa-sqlite/src/sqlite-api.js";
 import * as SQLite from "wa-sqlite/src/sqlite-constants.js";
 import waSqliteFactory from "wa-sqlite/dist/wa-sqlite.mjs";

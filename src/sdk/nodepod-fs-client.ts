@@ -7,8 +7,8 @@
 // thread, a sibling writing directly would desync it). send write requests
 // back over a MessagePort if you need them.
 
-import { SharedVFSReader } from "../threading/shared-vfs";
-import type { SharedVFSStat } from "../threading/shared-vfs";
+import { SharedVFSReader } from "../threading/shared-vfs.js";
+import type { SharedVFSStat } from "../threading/shared-vfs.js";
 
 export class NodepodFSClientError extends Error {
   readonly code: string;

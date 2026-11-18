@@ -1,6 +1,6 @@
 // shared types for the script engine and its execution modes
 
-import type { MemoryVolume } from './memory-volume';
+import type { MemoryVolume } from './memory-volume.js';
 
 export interface EngineConfig {
   cwd?: string;

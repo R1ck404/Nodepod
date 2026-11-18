@@ -2,17 +2,17 @@
 // Heavy work is offloaded to web workers when available.
 
 import pako from "pako";
-import { MemoryVolume } from "../memory-volume";
-import { downloadTarball } from "./registry-client";
-import { takePrefetchedTarball } from "./tarball-prefetch";
-import * as path from "../polyfills/path";
-import { offload, profiledOffload, taskId, TaskPriority } from "../threading/offload";
-import type { ExtractResult } from "../threading/offload-types";
-import { base64ToBytes } from "../helpers/byte-encoding";
-import { precompileWasm } from "../helpers/wasm-cache";
-import { getTarballCache, shouldRefreshTarball } from "../persistence/tarball-cache";
-import { digestSync } from "../polyfills/sync-digest";
-import type { NodepodProfilerImpl } from "../profiling/profiler";
+import { MemoryVolume } from "../memory-volume.js";
+import { downloadTarball } from "./registry-client.js";
+import { takePrefetchedTarball } from "./tarball-prefetch.js";
+import * as path from "../polyfills/path.js";
+import { offload, profiledOffload, taskId, TaskPriority } from "../threading/offload.js";
+import type { ExtractResult } from "../threading/offload-types.js";
+import { base64ToBytes } from "../helpers/byte-encoding.js";
+import { precompileWasm } from "../helpers/wasm-cache.js";
+import { getTarballCache, shouldRefreshTarball } from "../persistence/tarball-cache.js";
+import { digestSync } from "../polyfills/sync-digest.js";
+import type { NodepodProfilerImpl } from "../profiling/profiler.js";
 
 // skip round-tripping very large tarballs back from the worker just to cache
 const TARBALL_CACHE_MAX_BYTES = 20 * 1024 * 1024;

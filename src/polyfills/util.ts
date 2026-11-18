@@ -1,6 +1,6 @@
 // Utility helpers: format, inspect, inherits, promisify, deprecate, type checks, etc.
 
-import { Buffer } from "./buffer";
+import { Buffer } from "./buffer.js";
 
 export function format(template?: unknown, ...values: unknown[]): string {
   // console.log() prints an empty line; format(undefined) is "undefined"

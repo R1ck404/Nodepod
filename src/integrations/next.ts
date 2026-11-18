@@ -20,15 +20,15 @@
 // test harnesses that don't have `next` installed.
 
 import type { NextRequest, NextResponse as NextResponseType } from "next/server";
-import { readServiceWorkerSource } from "./shared/read-sw";
-import { readPreviewBridgeSource } from "./shared/read-preview-bridge";
+import { readServiceWorkerSource } from "./shared/read-sw.js";
+import { readPreviewBridgeSource } from "./shared/read-preview-bridge.js";
 import {
   swResponseHeaders,
   previewBridgeResponseHeaders,
   DEFAULT_SW_PATH,
   DEFAULT_BRIDGE_HTML_PATH,
   DEFAULT_BRIDGE_SCRIPT_PATH,
-} from "./shared/headers";
+} from "./shared/headers.js";
 
 /** Drop-in matcher for `export const config = { matcher: nodepodMatcher }`. */
 export const nodepodMatcher = DEFAULT_SW_PATH;

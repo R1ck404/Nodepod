@@ -1,15 +1,15 @@
-import { MemoryVolume } from "../memory-volume";
-import { DependencyInstaller, isPackFile } from "../packages/installer";
-import { collectBinarySnapshotParts, saveSnapshotParts } from "../persistence/binary-snapshot";
+import { MemoryVolume } from "../memory-volume.js";
+import { DependencyInstaller, isPackFile } from "../packages/installer.js";
+import { collectBinarySnapshotParts, saveSnapshotParts } from "../persistence/binary-snapshot.js";
 import {
   RequestProxy,
   getProxyInstance,
   NodepodSWSetupError,
   markTransferable,
   type IVirtualServer,
-} from "../request-proxy";
-import type { VolumeSnapshot } from "../engine-types";
-import { Buffer } from "../polyfills/buffer";
+} from "../request-proxy.js";
+import type { VolumeSnapshot } from "../engine-types.js";
+import { Buffer } from "../polyfills/buffer.js";
 import type {
   NodepodOptions,
   NodepodProfiler,
@@ -18,61 +18,61 @@ import type {
   Snapshot,
   SnapshotOptions,
   SpawnOptions,
-} from "./types";
-import type { ShellOptions } from "../shell/shell-options";
-import { NodepodFS } from "./nodepod-fs";
-import { NodepodProcess } from "./nodepod-process";
-import { NodepodTerminal } from "./nodepod-terminal";
-import { getCompletions } from "../shell/shell-completions";
-import { parse as parseShell } from "../shell/shell-parser";
-import { builtins as shellBuiltins } from "../shell/shell-builtins";
-import { ProcessManager } from "../threading/process-manager";
-import { setAllowedDomains } from "../cross-origin";
-import type { ProcessHandle } from "../threading/process-handle";
-import { VFSBridge } from "../threading/vfs-bridge";
+} from "./types.js";
+import type { ShellOptions } from "../shell/shell-options.js";
+import { NodepodFS } from "./nodepod-fs.js";
+import { NodepodProcess } from "./nodepod-process.js";
+import { NodepodTerminal } from "./nodepod-terminal.js";
+import { getCompletions } from "../shell/shell-completions.js";
+import { parse as parseShell } from "../shell/shell-parser.js";
+import { builtins as shellBuiltins } from "../shell/shell-builtins.js";
+import { ProcessManager } from "../threading/process-manager.js";
+import { setAllowedDomains } from "../cross-origin.js";
+import type { ProcessHandle } from "../threading/process-handle.js";
+import { VFSBridge } from "../threading/vfs-bridge.js";
 import {
   isSharedArrayBufferAvailable,
   SharedVFSController,
   SharedVFSReader,
-} from "../threading/shared-vfs";
-import { NodepodFSClient } from "./nodepod-fs-client";
-import { SyncChannelController } from "../threading/sync-channel";
-import { MemoryHandler } from "../memory-handler";
+} from "../threading/shared-vfs.js";
+import { NodepodFSClient } from "./nodepod-fs-client.js";
+import { SyncChannelController } from "../threading/sync-channel.js";
+import { MemoryHandler } from "../memory-handler.js";
 // Browser default host is registered by `@r1ck404/nodepod` (src/index.ts).
 // Headless installs its host via `@r1ck404/nodepod/headless` before boot.
-import { ensureRuntimeHost } from "../host/runtime-host";
-import type { HttpIngress } from "../host/types";
-import type { CompletedResponse } from "../polyfills/http";
-import { getEsbuild } from "../helpers/esbuild-engine";
-import { disposeEsbuild } from "../helpers/esbuild-engine";
-import { disposePool, poolStats } from "../threading/offload";
+import { ensureRuntimeHost } from "../host/runtime-host.js";
+import type { HttpIngress } from "../host/types.js";
+import type { CompletedResponse } from "../polyfills/http.js";
+import { getEsbuild } from "../helpers/esbuild-engine.js";
+import { disposeEsbuild } from "../helpers/esbuild-engine.js";
+import { disposePool, poolStats } from "../threading/offload.js";
 import {
   disposeWasmCache,
   reclaimWasmCache,
   wasmCacheStats,
-} from "../helpers/wasm-cache";
-import { getWorkerTransformCache } from "../threading/worker-transform-cache";
-import { invalidateBundleCache } from "../packages/browser-bundler";
+} from "../helpers/wasm-cache.js";
+import { getWorkerTransformCache } from "../threading/worker-transform-cache.js";
+import { invalidateBundleCache } from "../packages/browser-bundler.js";
 import {
   PerformanceTracker,
   type PerformanceStats,
-} from "../performance-tracker";
-import { NodepodProfilerImpl } from "../profiling/profiler";
-import { PreviewInspector } from "./preview-inspector";
-import { TerminalServerUrlOutputStream } from "./server-url-output";
-import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import type { IDBSnapshotCache } from "../persistence/idb-cache";
+} from "../performance-tracker.js";
+import { NodepodProfilerImpl } from "../profiling/profiler.js";
+import { PreviewInspector } from "./preview-inspector.js";
+import { TerminalServerUrlOutputStream } from "./server-url-output.js";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.js";
+import type { IDBSnapshotCache } from "../persistence/idb-cache.js";
 import {
   openWorkspacePersistence,
   type WorkspacePersistence,
-} from "../persistence/workspace";
+} from "../persistence/workspace/index.js";
 import {
   PackContentSource,
   adoptMountedPack,
   canPageFrom,
-} from "../persistence/pack-content-source";
-import { watchToolCaches } from "../persistence/tool-cache";
-import { createOffThreadDeflater, type OffThreadDeflater } from "../helpers/deflate-worker";
+} from "../persistence/pack-content-source.js";
+import { watchToolCaches } from "../persistence/tool-cache.js";
+import { createOffThreadDeflater, type OffThreadDeflater } from "../helpers/deflate-worker.js";
 
 let activeNodepodCount = 0;
 

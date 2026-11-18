@@ -1,13 +1,13 @@
 // Assembles all builtin commands from category modules into one map.
 
-import type { BuiltinFn } from "./shell-types";
-import { fileOpsCommands } from "./commands/file-ops";
-import { directoryCommands } from "./commands/directory";
-import { textProcessingCommands } from "./commands/text-processing";
-import { searchCommands } from "./commands/search";
-import { shellEnvCommands, setBuiltinsRef } from "./commands/shell-env";
-import { bashBuiltinCommands } from "./commands/bash-builtins";
-import { systemCommands } from "./commands/system";
+import type { BuiltinFn } from "./shell-types.js";
+import { fileOpsCommands } from "./commands/file-ops.js";
+import { directoryCommands } from "./commands/directory.js";
+import { textProcessingCommands } from "./commands/text-processing.js";
+import { searchCommands } from "./commands/search.js";
+import { shellEnvCommands, setBuiltinsRef } from "./commands/shell-env.js";
+import { bashBuiltinCommands } from "./commands/bash-builtins.js";
+import { systemCommands } from "./commands/system.js";
 
 export const builtins = new Map<string, BuiltinFn>([
   ...fileOpsCommands,

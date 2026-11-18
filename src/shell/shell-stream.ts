@@ -1,7 +1,7 @@
 /** Small dependency-free async byte stream used by shell pipelines. */
 
-import { ShellLimitError } from "./shell-options";
-import type { ShellLimits } from "./shell-options";
+import { ShellLimitError } from "./shell-options.js";
+import type { ShellLimits } from "./shell-options.js";
 
 export interface CancellationToken {
   readonly signal: AbortSignal;

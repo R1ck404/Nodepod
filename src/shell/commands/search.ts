@@ -1,7 +1,7 @@
-import type { BuiltinFn } from "../shell-types";
-import type { MemoryVolume } from "../../memory-volume";
-import { ok, fail, resolvePath, globToRegex, yieldToEventLoop } from "../shell-helpers";
-import { LS_BLOCK_SIZE } from "../../constants/config";
+import type { BuiltinFn } from "../shell-types.js";
+import type { MemoryVolume } from "../../memory-volume.js";
+import { ok, fail, resolvePath, globToRegex, yieldToEventLoop } from "../shell-helpers.js";
+import { LS_BLOCK_SIZE } from "../../constants/config.js";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */

@@ -1,7 +1,7 @@
-import type { ShellCommand } from "../shell-types";
-import { splitLeadingSilentFlags, type PmDeps } from "./pm-types";
-import { VERSIONS } from "../../constants/config";
-import { GLOBAL_BIN, GLOBAL_LIB, GLOBAL_PREFIX, hasGlobalFlag } from "../../packages/pm-cli";
+import type { ShellCommand } from "../shell-types.js";
+import { splitLeadingSilentFlags, type PmDeps } from "./pm-types.js";
+import { VERSIONS } from "../../constants/config.js";
+import { GLOBAL_BIN, GLOBAL_LIB, GLOBAL_PREFIX, hasGlobalFlag } from "../../packages/pm-cli.js";
 
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";

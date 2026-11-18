@@ -1,8 +1,8 @@
 // In-memory WorkspaceStore. Useful for tests and for handing one workspace
 // between Nodepod instances on the same page; nothing survives a reload.
 
-import type { WorkspaceBatch, WorkspaceEntry, WorkspaceManifest, WorkspaceStore } from "./types";
-import { changesTree, isUnderOrAt } from "./paths";
+import type { WorkspaceBatch, WorkspaceEntry, WorkspaceManifest, WorkspaceStore } from "./types.js";
+import { changesTree, isUnderOrAt } from "./paths.js";
 
 export function createMemoryWorkspaceStore(): WorkspaceStore {
   let saved = false;

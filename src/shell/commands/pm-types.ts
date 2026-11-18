@@ -1,7 +1,7 @@
 // Shared types for package manager commands (npm, pnpm, yarn, bun).
 // Each PM file is a factory that receives these deps from child_process.ts.
 
-import type { ShellCommand, ShellResult, ShellContext } from "../shell-types";
+import type { ShellCommand, ShellResult, ShellContext } from "../shell-types.js";
 
 export type PkgManager = "npm" | "pnpm" | "yarn" | "bun";
 

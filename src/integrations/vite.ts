@@ -9,16 +9,16 @@
 // peer dep at runtime.
 
 import type { Plugin } from "vite";
-import { readServiceWorkerSource } from "./shared/read-sw";
-import { readWorkerBundleSource } from "./shared/read-worker";
-import { readPreviewBridgeSource } from "./shared/read-preview-bridge";
+import { readServiceWorkerSource } from "./shared/read-sw.js";
+import { readWorkerBundleSource } from "./shared/read-worker.js";
+import { readPreviewBridgeSource } from "./shared/read-preview-bridge.js";
 import {
   swResponseHeaders,
   previewBridgeResponseHeaders,
   DEFAULT_SW_PATH,
   DEFAULT_BRIDGE_HTML_PATH,
   DEFAULT_BRIDGE_SCRIPT_PATH,
-} from "./shared/headers";
+} from "./shared/headers.js";
 
 const WORKER_ASSET_PATH = "/__worker__.js";
 

@@ -1,4 +1,4 @@
-import type { RequestProxy } from "../request-proxy";
+import type { RequestProxy } from "../request-proxy.js";
 
 export type InspectWaitUntil =
   | "domcontentloaded"

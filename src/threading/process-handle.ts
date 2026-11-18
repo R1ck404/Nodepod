@@ -1,16 +1,16 @@
 // ProcessHandle — per-process main-thread state.
 // Tracks lifecycle, routes I/O, emits events for each spawned worker.
 
-import { EventEmitter } from "../polyfills/events";
-import type { HostWorker } from "../host/types";
-import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
+import { EventEmitter } from "../polyfills/events.js";
+import type { HostWorker } from "../host/types.js";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata.js";
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
   SpawnConfig,
   MainToWorker_Init,
   MainToWorker_Exec,
-} from "./worker-protocol";
+} from "./worker-protocol.js";
 
 const MAX_HANDLE_OUTPUT_BYTES = 5_000_000;
 const PROCESS_READY_TIMEOUT_MS = 30_000;

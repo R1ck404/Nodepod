@@ -1,10 +1,10 @@
 // syncs the canonical MemoryVolume with worker VFS clones
 // creates snapshots for init, applies worker writes, broadcasts changes
 
-import type { MemoryVolume } from "../memory-volume";
-import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import type { VFSBinarySnapshot, VFSSnapshotEntry, WorkerToMain_VFSMeta } from "./worker-protocol";
-import type { SharedVFSController } from "./shared-vfs";
+import type { MemoryVolume } from "../memory-volume.js";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.js";
+import type { VFSBinarySnapshot, VFSSnapshotEntry, WorkerToMain_VFSMeta } from "./worker-protocol.js";
+import type { SharedVFSController } from "./shared-vfs.js";
 
 const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
 

@@ -9,7 +9,7 @@
 // keeps the active frame until an async callback's returned promise settles so
 // the frame is still current when await registers its continuation handler.
 
-import { registerExitCleanup } from "../helpers/promise-exit";
+import { registerExitCleanup } from "../helpers/promise-exit.js";
 
 type StoreFrame = Map<object, unknown>;
 

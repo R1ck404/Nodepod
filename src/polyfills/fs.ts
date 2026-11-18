@@ -7,19 +7,19 @@ import type {
   WatchCallback,
   WatchEventKind,
   VolumeFileHandle,
-} from "../memory-volume";
-import { makeSystemError } from "../memory-volume";
-import { precompileWasm } from "../helpers/wasm-cache";
+} from "../memory-volume.js";
+import { makeSystemError } from "../memory-volume.js";
+import { precompileWasm } from "../helpers/wasm-cache.js";
 import {
   prefetchWasmFromCdn,
   resolveWasmAssetPath,
-} from "../helpers/wasm-cdn";
-import { Readable, Writable } from "./stream";
-import { Buffer } from "./buffer";
-import type { FsReadStreamInstance, FsReadableState, FsWriteStreamInstance, FsWriteStreamOptions } from "../types/fs-streams";
-import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop";
-import { setImmediate as scheduleImmediate } from "./timers";
-import { settledPromise, settledResolve, settledReject } from "../helpers/sync-scope";
+} from "../helpers/wasm-cdn.js";
+import { Readable, Writable } from "./stream.js";
+import { Buffer } from "./buffer.js";
+import type { FsReadStreamInstance, FsReadableState, FsWriteStreamInstance, FsWriteStreamOptions } from "../types/fs-streams.js";
+import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop.js";
+import { setImmediate as scheduleImmediate } from "./timers.js";
+import { settledPromise, settledResolve, settledReject } from "../helpers/sync-scope.js";
 
 export type { FileStat, FileWatchHandle, WatchCallback, WatchEventKind };
 
@@ -584,12 +584,12 @@ export interface FsBridge {
       autoClose?: boolean;
       fd?: number;
     },
-  ): import("./stream").Readable;
+  ): import("./stream.js").Readable;
   createWriteStream(
     target: string,
     opts?: FsWriteStreamOptions,
   ): FsWriteStreamInstance;
-  ReadStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Readable;
+  ReadStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream.js").Readable;
   WriteStream: new (path: unknown, opts?: FsWriteStreamOptions) => FsWriteStreamInstance;
   cpSync(src: unknown, dest: unknown, opts?: CpOptions): void;
   cp(src: unknown, dest: unknown, optsOrCb?: unknown, cb?: (err: Error | null) => void): void;

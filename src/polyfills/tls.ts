@@ -1,6 +1,6 @@
 // stub - not available in browser
 
-import { EventEmitter } from "./events";
+import { EventEmitter } from "./events.js";
 
 export interface TLSSocket extends EventEmitter {
   authorized: boolean;

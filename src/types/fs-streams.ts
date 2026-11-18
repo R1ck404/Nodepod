@@ -1,7 +1,7 @@
 // Types for fs ReadStream/WriteStream. These are old-style function constructors
 // (not classes) because graceful-fs uses .apply(this, arguments) which breaks classes.
 
-import type { Writable } from "../polyfills/stream";
+import type { Writable } from "../polyfills/stream.js";
 
 /* ---- ReadableState ---- */
 

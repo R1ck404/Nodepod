@@ -7,18 +7,18 @@
 // carry /__virtual__/{instanceId}/{port}/... back to the right instance.
 // Legacy /__virtual__/{port}/... falls back to DEFAULT_INSTANCE.
 
-import type { CompletedResponse } from "./polyfills/http";
+import type { CompletedResponse } from "./polyfills/http.js";
 import {
   Server,
   setServerListenCallback,
   setServerCloseCallback,
   encodeFrame,
   decodeFrame,
-} from "./polyfills/http";
-import { EventEmitter } from "./polyfills/events";
-import { Buffer } from "./polyfills/buffer";
-import { bytesToBase64 } from "./helpers/byte-encoding";
-import { beginForegroundActivity, noteForegroundActivity } from "./helpers/foreground-activity";
+} from "./polyfills/http.js";
+import { EventEmitter } from "./polyfills/events.js";
+import { Buffer } from "./polyfills/buffer.js";
+import { bytesToBase64 } from "./helpers/byte-encoding.js";
+import { beginForegroundActivity, noteForegroundActivity } from "./helpers/foreground-activity.js";
 
 // Response buffers nothing else references (just received from a process
 // worker): the preview relay may transfer them to the service worker as-is.
@@ -42,20 +42,20 @@ function transferableBuffer(bytes: Uint8Array): ArrayBuffer {
   // a copy (Buffer#slice would be a view over the same memory)
   return new Uint8Array(bytes).buffer as ArrayBuffer;
 }
-import { TIMEOUTS, WS_OPCODE } from "./constants/config";
-import { createHash } from "./polyfills/crypto";
+import { TIMEOUTS, WS_OPCODE } from "./constants/config.js";
+import { createHash } from "./polyfills/crypto.js";
 import {
   NodepodSWSetupError,
   detectFrameworkHint,
-} from "./integrations/shared/errors";
+} from "./integrations/shared/errors.js";
 import {
   VirtualCookieJar,
   mergeCookieHeaders,
-} from "./cookie-jar";
-import { recordToFetchHeaders } from "./polyfills/fetch-response";
+} from "./cookie-jar.js";
+import { recordToFetchHeaders } from "./polyfills/fetch-response.js";
 
 export { NodepodSWSetupError };
-export type { NodepodSWFrameworkHint } from "./integrations/shared/errors";
+export type { NodepodSWFrameworkHint } from "./integrations/shared/errors.js";
 
 const _enc = new TextEncoder();
 
@@ -133,7 +133,7 @@ interface InstanceState {
   workerWsConns: Map<string, { pid: number }>;
   wsConns: Map<
     string,
-    { socket: import("./polyfills/net").TcpSocket; cleanup: () => void }
+    { socket: import("./polyfills/net.js").TcpSocket; cleanup: () => void }
   >;
   /** kept so detach() can remove it */
   wsFrameListener: ((msg: any) => void) | null;

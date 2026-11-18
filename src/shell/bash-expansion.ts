@@ -1,7 +1,7 @@
-import type { MemoryVolume } from "../memory-volume";
-import { expandGlob } from "./shell-parser";
-import type { ShellLimits } from "./shell-options";
-import { ShellLimitError } from "./shell-options";
+import type { MemoryVolume } from "../memory-volume.js";
+import { expandGlob } from "./shell-parser.js";
+import type { ShellLimits } from "./shell-options.js";
+import { ShellLimitError } from "./shell-options.js";
 
 export interface BashExpansionContext {
   env: Record<string, string>;

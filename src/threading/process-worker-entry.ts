@@ -1,34 +1,34 @@
 // per-process Web Worker entry — each worker gets its own MemoryVolume, ScriptEngine, and NodepodShell
 // I/O flows through postMessage using the protocol in worker-protocol.ts
 
-import { MemoryVolume } from "../memory-volume";
-import type { CompletedResponse } from "../polyfills/http";
+import { MemoryVolume } from "../memory-volume.js";
+import type { CompletedResponse } from "../polyfills/http.js";
 import {
   installBodyReadLifetime,
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
-} from "../polyfills/fetch-response";
-import { installWasmWorkLifetime } from "../helpers/event-loop";
-import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
+} from "../polyfills/fetch-response.js";
+import { installWasmWorkLifetime } from "../helpers/event-loop.js";
+import { ScriptEngine, setChildProcessPolyfill } from "../script-engine.js";
 import {
   setSqliteHostBridge,
   warmSqliteEngine,
   WASM_CACHE_PATH,
   WASM_SAB_HEADER_BYTES,
   WASM_SAB_MAX_BYTES,
-} from "../polyfills/sqlite";
-import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import { applyFetchPolicy } from "../cross-origin";
+} from "../polyfills/sqlite.js";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths.js";
+import { applyFetchPolicy } from "../cross-origin.js";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
 installBodyReadLifetime();
 // before the memory clamp (handleInit) wraps these, so its paths are held too
 installWasmWorkLifetime();
-import { SyncChannelWorker } from "./sync-channel";
-import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client";
-import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp";
-import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
+import { SyncChannelWorker } from "./sync-channel.js";
+import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client.js";
+import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp.js";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata.js";
 import type {
   MainToWorkerMessage,
   MainToWorker_Init,
@@ -36,12 +36,12 @@ import type {
   VFSSnapshotEntry,
   WorkerToMainMessage,
   WorkerToMain_VFSBatch,
-} from "./worker-protocol";
+} from "./worker-protocol.js";
 
 let _pid = 0;
 let _cwd = "/";
 let _env: Record<string, string> = {};
-let _shellOptions: import("../shell/shell-options").ShellOptions | undefined;
+let _shellOptions: import("../shell/shell-options.js").ShellOptions | undefined;
 let _volume: MemoryVolume | null = null;
 let _initialized = false;
 let _abortController: AbortController | null = null;
@@ -50,7 +50,7 @@ let _abortController: AbortController | null = null;
 let _suppressVFSWatch = false;
 
 let _shellInitialized = false;
-let _shellMod: typeof import("../polyfills/child_process") | null = null;
+let _shellMod: typeof import("../polyfills/child_process.js") | null = null;
 let _syncChannelWorker: SyncChannelWorker | null = null;
 let _sabEnabled = true;
 let _ipcMessageHandler: ((data: unknown) => void) | null = null;
@@ -454,9 +454,9 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   post({ type: "ready", pid: _pid });
 }
 
-async function ensureShell(): Promise<typeof import("../polyfills/child_process")> {
+async function ensureShell(): Promise<typeof import("../polyfills/child_process.js")> {
   if (!_shellMod) {
-    _shellMod = await import("../polyfills/child_process");
+    _shellMod = await import("../polyfills/child_process.js");
     // must be eager — sync require('child_process') needs this before any microtask fires
     setChildProcessPolyfill(_shellMod);
   }
@@ -468,9 +468,9 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process"
     _shellMod.setSabEnabled(_sabEnabled);
     _shellMod.setSpawnChildCallback(spawnChild);
     _shellMod.setForkChildCallback(forkChild);
-    const wtMod = await import("../polyfills/worker_threads");
+    const wtMod = await import("../polyfills/worker_threads.js");
     wtMod.setWorkerThreadForkCallback(workerThreadFork);
-    const httpMod = await import("../polyfills/http");
+    const httpMod = await import("../polyfills/http.js");
     httpMod.setServerListenCallback((port: number) => {
       post({ type: "server-listen", port, hostname: "0.0.0.0" });
     });
@@ -627,7 +627,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     } | undefined;
 
     if (msg.isWorkerThread) {
-      const { MessagePort } = await import("../polyfills/worker_threads");
+      const { MessagePort } = await import("../polyfills/worker_threads.js");
       const pp = new MessagePort();
       const pendingParentMessages: unknown[] = [];
       const flushParentMessages = () => {
@@ -830,7 +830,7 @@ async function handleHttpRequest(msg: {
   body: string | ArrayBuffer | null;
 }): Promise<void> {
   try {
-    const httpMod = await import("../polyfills/http");
+    const httpMod = await import("../polyfills/http.js");
     const server = httpMod.getServer(msg.port);
     if (!server) {
       post({
@@ -844,7 +844,7 @@ async function handleHttpRequest(msg: {
       return;
     }
 
-    const { Buffer } = await import("../polyfills/buffer");
+    const { Buffer } = await import("../polyfills/buffer.js");
     // binary request bodies arrive as a transferred ArrayBuffer (wrapped, not copied)
     const bodyBuf = msg.body ? (Buffer.from(msg.body as string) as any) : undefined;
     const result = await server.dispatchRequest(
@@ -926,7 +926,7 @@ function handleHttpClientResponse(msg: {
     return;
   }
   void (async () => {
-    const { Buffer } = await import("../polyfills/buffer");
+    const { Buffer } = await import("../polyfills/buffer.js");
     let bodyVal: Buffer | string | null = null;
     if (msg.body instanceof ArrayBuffer) {
       bodyVal = Buffer.from(new Uint8Array(msg.body));
@@ -959,9 +959,9 @@ async function handleWsUpgrade(msg: {
   headers: Record<string, string>;
 }): Promise<void> {
   try {
-    const httpMod = await import("../polyfills/http");
+    const httpMod = await import("../polyfills/http.js");
     const { encodeFrame, decodeFrame } = httpMod;
-    const { Buffer } = await import("../polyfills/buffer");
+    const { Buffer } = await import("../polyfills/buffer.js");
 
     const server = httpMod.getServer(msg.port);
     if (!server) {
@@ -1065,7 +1065,7 @@ export function forkChild(
   opts: {
     cwd: string;
     env: Record<string, string>;
-    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    serialization?: import("../helpers/ipc-serialization.js").IpcSerialization;
     execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
@@ -1258,7 +1258,7 @@ export function spawnChild(
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
-): import("../polyfills/child_process").SpawnChildOperation {
+): import("../polyfills/child_process.js").SpawnChildOperation {
   const requestId = _nextRequestId++;
   const operation = new Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>((resolve, reject) => {
     let stdout = "";

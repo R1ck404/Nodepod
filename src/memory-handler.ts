@@ -1,7 +1,7 @@
 // Centralized memory optimization handler for Nodepod.
 // Provides LRU caches, heap monitoring, and pressure callbacks.
 
-import type { FileStat } from './memory-volume';
+import type { FileStat } from './memory-volume.js';
 
 /* ---- LRU Cache ---- */
 

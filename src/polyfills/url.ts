@@ -1,5 +1,5 @@
 // URL module with legacy parse/format/resolve and fileURLToPath/pathToFileURL
-import { parse as parseQueryString, stringify as stringifyQuery } from "./querystring";
+import { parse as parseQueryString, stringify as stringifyQuery } from "./querystring.js";
 
 export interface Url {
   protocol?: string | null;

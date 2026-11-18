@@ -1,8 +1,8 @@
 // Interactive terminal with line editing, history, raw/cooked mode, etc.
 // xterm.js is a peer dep -- passed in via TerminalOptions, not imported here.
 
-import type { TerminalOptions, TerminalTheme } from "./types";
-import { DEFAULT_TERMINAL } from "../constants/config";
+import type { TerminalOptions, TerminalTheme } from "./types.js";
+import { DEFAULT_TERMINAL } from "../constants/config.js";
 
 // GitHub Dark theme
 const DEFAULT_THEME: TerminalTheme = {

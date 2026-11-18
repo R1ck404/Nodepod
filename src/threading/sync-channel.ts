@@ -2,7 +2,7 @@
 // worker allocates a slot, posts spawn-sync, blocks on Atomics.wait()
 // main thread runs the child, writes result to the slot, calls Atomics.notify()
 
-import { isSharedArrayBufferAvailable } from "./shared-vfs";
+import { isSharedArrayBufferAvailable } from "./shared-vfs.js";
 
 // shared memory layout
 // per-slot (16KB = 4096 Int32s):

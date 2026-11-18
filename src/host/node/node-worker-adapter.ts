@@ -3,7 +3,7 @@ import type {
   HostWorker,
   HostWorkerErrorHandler,
   HostWorkerMessageHandler,
-} from "../types";
+} from "../types.js";
 
 /**
  * Bootstrap that runs inside worker_threads and presents a browser Worker

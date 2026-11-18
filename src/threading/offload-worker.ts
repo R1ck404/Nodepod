@@ -14,15 +14,15 @@ import type {
   BuildTask,
   BuildResult,
   BuildOutputFile,
-} from "./offload-types";
+} from "./offload-types.js";
 
 let esbuildEngine: any = null;
 let pakoModule: any = null;
 let initialized = false;
 
-import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY, cdnImport } from "../constants/cdn-urls";
-import { CDN_PAKO } from "../constants/config";
-import { containsJsx } from "./jsx-detection";
+import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY, cdnImport } from "../constants/cdn-urls.js";
+import { CDN_PAKO } from "../constants/config.js";
+import { containsJsx } from "./jsx-detection.js";
 
 const ESBUILD_ESM_URL = CDN_ESBUILD_ESM;
 const ESBUILD_WASM_URL = CDN_ESBUILD_BINARY;

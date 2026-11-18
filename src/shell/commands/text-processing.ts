@@ -1,4 +1,4 @@
-import type { BuiltinFn, ShellContext, ShellResult } from "../shell-types";
+import type { BuiltinFn, ShellContext, ShellResult } from "../shell-types.js";
 import {
   ok,
   fail,
@@ -15,8 +15,8 @@ import {
   BOLD_RED,
   yieldToEventLoop,
   regexSafetyError,
-} from "../shell-helpers";
-import { YES_REPEAT_COUNT } from "../../constants/config";
+} from "../shell-helpers.js";
+import { YES_REPEAT_COUNT } from "../../constants/config.js";
 
 /* ------------------------------------------------------------------ */
 /*  echo / printf                                                      */

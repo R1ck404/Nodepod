@@ -9,7 +9,7 @@ import {
   isExitSentinel,
   type Handle,
   type HandleType,
-} from "../helpers/event-loop";
+} from "../helpers/event-loop.js";
 
 // keep references to the raw browser timer functions. captured at import
 // so later patches of globalThis.setTimeout don't recurse through us.

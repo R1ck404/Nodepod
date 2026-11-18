@@ -1,10 +1,10 @@
 // Crypto polyfill using Web Crypto API with synchronous fallbacks
 
 import { scrypt as nobleScrypt } from "@noble/hashes/scrypt";
-import { Buffer } from "./buffer";
-import { EventEmitter } from "./events";
-import { digestSync, hmacSync, createStreamingDigest, createStreamingHmac, type StreamingDigest } from "./sync-digest";
-import { bytesToHex, bytesToBase64 } from "../helpers/byte-encoding";
+import { Buffer } from "./buffer.js";
+import { EventEmitter } from "./events.js";
+import { digestSync, hmacSync, createStreamingDigest, createStreamingHmac, type StreamingDigest } from "./sync-digest.js";
+import { bytesToHex, bytesToBase64 } from "../helpers/byte-encoding.js";
 
 // createHash runs per module and per response (etags): name it once
 const normalizedAlgs = new Map<string, string>();

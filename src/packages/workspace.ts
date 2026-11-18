@@ -1,6 +1,6 @@
-import { MemoryVolume } from "../memory-volume";
-import * as path from "../polyfills/path";
-import type { PackageManifest } from "../types/manifest";
+import { MemoryVolume } from "../memory-volume.js";
+import * as path from "../polyfills/path.js";
+import type { PackageManifest } from "../types/manifest.js";
 
 export interface WorkspacePackage {
   name: string;

@@ -10,8 +10,8 @@ import type {
   PipelineNode,
   CommandNode,
   RedirectNode,
-} from "./shell-types";
-import type { MemoryVolume } from "../memory-volume";
+} from "./shell-types.js";
+import type { MemoryVolume } from "../memory-volume.js";
 
 /* ------------------------------------------------------------------ */
 /*  Variable & substitution expansion                                  */

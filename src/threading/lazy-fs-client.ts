@@ -8,7 +8,7 @@
 //   payload:  bytes after the 16-byte header
 // Result types: 0=undefined 1=null 2=bool 3=number 4=string 5=buffer 6=json 9=bigint
 
-import type { VolumeMissHandler } from "../memory-volume";
+import type { VolumeMissHandler } from "../memory-volume.js";
 
 const HEADER_BYTES = 16;
 const DEFAULT_PAYLOAD = 256 * 1024;

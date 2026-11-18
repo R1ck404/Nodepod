@@ -9,14 +9,14 @@
 //   L2 — IndexedDB keyed by SHA-256, storing the compiled WebAssembly.Module
 //        via structured clone (Chromium/Firefox). Warm reloads skip compile.
 
-import { untrackedWasm } from "./event-loop";
-import { readWasmMemoryImports, rememberWasmMemoryRequirements, wasmMemoryRequirements } from "./wasm-memory-clamp";
+import { untrackedWasm } from "./event-loop.js";
+import { readWasmMemoryImports, rememberWasmMemoryRequirements, wasmMemoryRequirements } from "./wasm-memory-clamp.js";
 import {
   getWasmModuleCache,
   isHashingWasmContent,
   quickWasmHash,
   wasmContentHash,
-} from "../persistence/wasm-module-cache";
+} from "../persistence/wasm-module-cache.js";
 
 const PRECOMPILE_THRESHOLD = 4 * 1024 * 1024; // 4 MB
 

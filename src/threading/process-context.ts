@@ -2,8 +2,8 @@
 // Replaces module-level mutable state (the old `let _xxx` in child_process, fs, etc.).
 // One active context on main thread; each worker gets its own.
 
-import type { MemoryVolume } from "../memory-volume";
-import { createHandleRegistry, type HandleRegistry } from "../helpers/event-loop";
+import type { MemoryVolume } from "../memory-volume.js";
+import { createHandleRegistry, type HandleRegistry } from "../helpers/event-loop.js";
 
 // --- I/O interfaces ---
 

@@ -1,42 +1,42 @@
 // Dependency Installer
 // Handles the full install lifecycle: resolve, download, extract, transform, bin stubs, lock file.
 
-import { MemoryVolume } from "../memory-volume";
-import { RegistryClient, RegistryConfig } from "./registry-client";
+import { MemoryVolume } from "../memory-volume.js";
+import { RegistryClient, RegistryConfig } from "./registry-client.js";
 import {
   resolveDependencyTree,
   resolveFromManifest,
   ResolvedDependency,
   ResolutionConfig,
-} from "./version-resolver";
-import { downloadAndExtract } from "./archive-extractor";
-import { convertPackage, prepareTransformer } from "../module-transformer";
-import type { PackageManifest } from "../types/manifest";
-import * as path from "../polyfills/path";
-import type { IDBSnapshotCache } from "../persistence/idb-cache";
-import { canPageFrom, type PackContentSource } from "../persistence/pack-content-source";
-import type { VFSSnapshotEntry } from "../threading/worker-protocol";
-import { quickDigest } from "../helpers/digest";
-import { restoreToolCache } from "../persistence/tool-cache";
-import { prefetchTarball, releasePrefetchedTarballs } from "./tarball-prefetch";
-import { requestEsbuildPrefetch } from "../helpers/esbuild-wasm-module";
+} from "./version-resolver.js";
+import { downloadAndExtract } from "./archive-extractor.js";
+import { convertPackage, prepareTransformer } from "../module-transformer.js";
+import type { PackageManifest } from "../types/manifest.js";
+import * as path from "../polyfills/path.js";
+import type { IDBSnapshotCache } from "../persistence/idb-cache.js";
+import { canPageFrom, type PackContentSource } from "../persistence/pack-content-source.js";
+import type { VFSSnapshotEntry } from "../threading/worker-protocol.js";
+import { quickDigest } from "../helpers/digest.js";
+import { restoreToolCache } from "../persistence/tool-cache.js";
+import { prefetchTarball, releasePrefetchedTarballs } from "./tarball-prefetch.js";
+import { requestEsbuildPrefetch } from "../helpers/esbuild-wasm-module.js";
 import {
   collectBinarySnapshotParts,
   restoreBinarySnapshot,
   saveSnapshotParts,
-} from "../persistence/binary-snapshot";
-import { getTarballCache } from "../persistence/tarball-cache";
-import { CDN_ESBUILD_ESM } from "../constants/cdn-urls";
-import type { PerformanceTracker } from "../performance-tracker";
-import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler";
-import { resolveWithCache } from "./resolution-cache";
-import { NPM_REGISTRY_URL } from "../constants/config";
-import { writeNpmPackageLock } from "./pm-cli";
+} from "../persistence/binary-snapshot.js";
+import { getTarballCache } from "../persistence/tarball-cache.js";
+import { CDN_ESBUILD_ESM } from "../constants/cdn-urls.js";
+import type { PerformanceTracker } from "../performance-tracker.js";
+import type { NodepodProfilerImpl, ProfileSpanToken } from "../profiling/profiler.js";
+import { resolveWithCache } from "./resolution-cache.js";
+import { NPM_REGISTRY_URL } from "../constants/config.js";
+import { writeNpmPackageLock } from "./pm-cli.js";
 import {
   discoverWorkspaces,
   workspaceDependencyNames,
   type WorkspaceGraph,
-} from "./workspace";
+} from "./workspace.js";
 
 const RESOLVER_CACHE_VERSION = 3;
 const MATERIALIZE_ATTEMPTS = 3;
@@ -1255,12 +1255,12 @@ export async function install(
   return installer.install(specifier, undefined, flags);
 }
 
-export { RegistryClient } from "./registry-client";
+export { RegistryClient } from "./registry-client.js";
 export type {
   RegistryConfig,
   VersionDetail,
   PackageMetadata,
-} from "./registry-client";
-export type { ResolvedDependency, ResolutionConfig } from "./version-resolver";
-export type { ExtractionOptions } from "./archive-extractor";
+} from "./registry-client.js";
+export type { ResolvedDependency, ResolutionConfig } from "./version-resolver.js";
+export type { ExtractionOptions } from "./archive-extractor.js";
 export { splitSpecifier };

@@ -1,13 +1,13 @@
 // Virtual git backed by the VFS (.git/ directories).
 // GitHub API support when GITHUB_TOKEN is set.
 
-import type { ShellCommand, ShellContext, ShellResult } from "../shell-types";
-import type { MemoryVolume } from "../../memory-volume";
-import { ok, fail, RESET, DIM, GREEN, BOLD_RED, CYAN, yieldToEventLoop } from "../shell-helpers";
-import { VERSIONS } from "../../constants/config";
-import { proxiedFetch } from "../../cross-origin";
-import * as pathModule from "../../polyfills/path";
-import { createHash } from "../../polyfills/crypto";
+import type { ShellCommand, ShellContext, ShellResult } from "../shell-types.js";
+import type { MemoryVolume } from "../../memory-volume.js";
+import { ok, fail, RESET, DIM, GREEN, BOLD_RED, CYAN, yieldToEventLoop } from "../shell-helpers.js";
+import { VERSIONS } from "../../constants/config.js";
+import { proxiedFetch } from "../../cross-origin.js";
+import * as pathModule from "../../polyfills/path.js";
+import { createHash } from "../../polyfills/crypto.js";
 
 /* ------------------------------------------------------------------ */
 /*  ANSI helpers                                                       */

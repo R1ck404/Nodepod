@@ -1,11 +1,11 @@
 // ws-compatible WebSocket polyfill wrapping browser native WebSocket
 
 
-import { encodeFrame, decodeFrame, WS_GUID } from "./http";
-import { Buffer } from "./buffer";
-import { createHash } from "./crypto";
-import type { TcpSocket } from "./net";
-import { getRegistry, type Handle } from "../helpers/event-loop";
+import { encodeFrame, decodeFrame, WS_GUID } from "./http.js";
+import { Buffer } from "./buffer.js";
+import { createHash } from "./crypto.js";
+import type { TcpSocket } from "./net.js";
+import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
 // polyfill for environments missing CloseEvent / MessageEvent
 const SafeCloseEvent: typeof CloseEvent =

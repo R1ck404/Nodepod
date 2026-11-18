@@ -6,17 +6,17 @@
 // independent of how mutations were ordered or coalesced, and keeps the
 // steady-state cost to a WeakMap slot per saved file.
 
-import { EventEmitter } from "../../polyfills/events";
-import type { MemoryVolume, MountEntry, VolumeMutation, VolumeNodeInfo } from "../../memory-volume";
-import type { WorkspaceLock } from "./lock";
-import { createPathFilter, DEFAULT_EXCLUDED_DIR_NAMES } from "./paths";
+import { EventEmitter } from "../../polyfills/events.js";
+import type { MemoryVolume, MountEntry, VolumeMutation, VolumeNodeInfo } from "../../memory-volume.js";
+import type { WorkspaceLock } from "./lock.js";
+import { createPathFilter, DEFAULT_EXCLUDED_DIR_NAMES } from "./paths.js";
 import type {
   PersistenceSavedEvent,
   PersistenceStatus,
   WorkspaceBatch,
   WorkspaceEntry,
   WorkspaceStore,
-} from "./types";
+} from "./types.js";
 
 const DEFAULT_DEBOUNCE_MS = 250;
 // save at least this often while changes keep streaming in

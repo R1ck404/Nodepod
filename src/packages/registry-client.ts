@@ -35,16 +35,16 @@ export interface RegistryConfig {
   profiler?: NodepodProfilerImpl | null;
 }
 
-import { NPM_REGISTRY_URL } from "../constants/config";
-import { getProxy } from "../cross-origin";
-import type { NodepodProfilerImpl } from "../profiling/profiler";
+import { NPM_REGISTRY_URL } from "../constants/config.js";
+import { getProxy } from "../cross-origin.js";
+import type { NodepodProfilerImpl } from "../profiling/profiler.js";
 import {
   fetchWithRetry,
   METADATA_TIMEOUT_MS,
   readBodyWithTimeout,
   RegistryFetchError,
   TARBALL_TIMEOUT_MS,
-} from "./registry-fetch";
+} from "./registry-fetch.js";
 
 const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
 const REGISTRY_CACHE_NAME = "nodepod-registry-v1";

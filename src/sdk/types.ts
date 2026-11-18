@@ -1,10 +1,10 @@
-import type { VolumeSnapshot } from "../engine-types";
-import type { MemoryHandlerOptions } from "../memory-handler";
-import type { ShellOptions } from "../shell/shell-options";
-import type { PreviewOriginOption } from "../request-proxy";
-import type { PersistenceOptions } from "../persistence/workspace/types";
-export type { ShellLimits, ShellOptions } from "../shell/shell-options";
-export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
+import type { VolumeSnapshot } from "../engine-types.js";
+import type { MemoryHandlerOptions } from "../memory-handler.js";
+import type { ShellOptions } from "../shell/shell-options.js";
+import type { PreviewOriginOption } from "../request-proxy.js";
+import type { PersistenceOptions } from "../persistence/workspace/types.js";
+export type { ShellLimits, ShellOptions } from "../shell/shell-options.js";
+export type { PerformanceStats, PerformanceTiming } from "../performance-tracker.js";
 export type {
   NodepodProfileReport,
   NodepodProfiler,
@@ -23,7 +23,7 @@ export type {
   ProfilerLevel,
   ProfilerOptions,
   ProfilePathDetail,
-} from "../profiling/types";
+} from "../profiling/types.js";
 
 /* ---- Boot options ---- */
 
@@ -31,7 +31,7 @@ export interface NodepodOptions {
   /** Shell policy shared by the pod's terminal and spawned processes. */
   shell?: ShellOptions;
   /** Opt-in Nodepod subsystem profiling. Disabled by default. */
-  profiler?: import("../profiling/types").ProfilerOptions;
+  profiler?: import("../profiling/types.js").ProfilerOptions;
   files?: Record<string, string | Uint8Array>;
   /**
    * Save the project filesystem and restore it on the next boot with the

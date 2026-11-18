@@ -1,6 +1,6 @@
-import type { IDBSnapshotCache } from "../persistence/idb-cache";
-import type { WorkspaceStore } from "../persistence/workspace/types";
-import type { RequestProxy } from "../request-proxy";
+import type { IDBSnapshotCache } from "../persistence/idb-cache.js";
+import type { WorkspaceStore } from "../persistence/workspace/types.js";
+import type { RequestProxy } from "../request-proxy.js";
 
 /** Minimal message event shape shared by browser Workers and Node adapters. */
 export interface HostMessageEvent {

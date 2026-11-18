@@ -2,9 +2,9 @@
 // enhanced with generic napi-rs WASI worker support
 
 
-import { EventEmitter } from "./events";
-import { PassThrough } from "./stream";
-import { getRegistry, type Handle } from "../helpers/event-loop";
+import { EventEmitter } from "./events.js";
+import { PassThrough } from "./stream.js";
+import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
 // shared defaults for main thread; child workers get per-engine overrides via buildResolver
 export let isMainThread = true;

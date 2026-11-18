@@ -1,8 +1,8 @@
 // Worker Protocol — typed messages for main<->worker communication.
 // Flows via postMessage. Binary data (VFS snapshots) transferred zero-copy.
 
-import type { ShellOptions } from "../shell/shell-options";
-import type { FetchPolicy } from "../cross-origin";
+import type { ShellOptions } from "../shell/shell-options.js";
+import type { FetchPolicy } from "../cross-origin.js";
 
 // --- VFS snapshot (binary transfer) ---
 
@@ -76,7 +76,7 @@ export interface MainToWorker_Exec {
   isShell?: boolean;
   shellCommand?: string;
   isFork?: boolean;
-  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  serialization?: import("../helpers/ipc-serialization.js").IpcSerialization;
   execArgv?: string[];
   // If true, worker sends "shell-done" instead of "exit" and stays alive
   persistent?: boolean;
@@ -353,7 +353,7 @@ export interface WorkerToMain_ForkRequest {
   args: string[];
   cwd: string;
   env: Record<string, string>;
-  serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+  serialization?: import("../helpers/ipc-serialization.js").IpcSerialization;
   execArgv?: string[];
 }
 

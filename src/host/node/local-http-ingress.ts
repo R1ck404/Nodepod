@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { RequestProxy } from "../../request-proxy";
-import type { HttpIngress } from "../types";
+import type { RequestProxy } from "../../request-proxy.js";
+import type { HttpIngress } from "../types.js";
 
 export interface LocalHttpIngressOptions {
   proxy: RequestProxy;

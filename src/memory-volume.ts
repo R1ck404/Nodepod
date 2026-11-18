@@ -1,11 +1,11 @@
 // in-memory VFS with POSIX-like semantics
 
-import type { VolumeSnapshot, VolumeEntry } from './engine-types';
-import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding';
-import { MOCK_IDS, MOCK_FS } from './constants/config';
-import type { MemoryHandler } from './memory-handler';
+import type { VolumeSnapshot, VolumeEntry } from './engine-types.js';
+import { bytesToBase64, base64ToBytes } from './helpers/byte-encoding.js';
+import { MOCK_IDS, MOCK_FS } from './constants/config.js';
+import type { MemoryHandler } from './memory-handler.js';
 import pako from 'pako';
-import { lastForegroundActivity } from './helpers/foreground-activity';
+import { lastForegroundActivity } from './helpers/foreground-activity.js';
 
 export interface VolumeNode {
   kind: 'file' | 'directory' | 'symlink';

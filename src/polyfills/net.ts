@@ -1,10 +1,10 @@
 // TCP / net polyfill -- all networking is simulated, no real kernel sockets
 
-import { EventEmitter, type EventHandler } from "./events";
-import { Duplex } from "./stream";
-import { Buffer } from "./buffer";
-import { PORT_RANGE } from "../constants/config";
-import { getRegistry, type Handle } from "../helpers/event-loop";
+import { EventEmitter, type EventHandler } from "./events.js";
+import { Duplex } from "./stream.js";
+import { Buffer } from "./buffer.js";
+import { PORT_RANGE } from "../constants/config.js";
+import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
 
 export interface NetAddress {

@@ -1,7 +1,7 @@
 // executes code in a cross-origin iframe for maximum browser isolation
 
-import type { MemoryVolume } from './memory-volume';
-import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types';
+import type { MemoryVolume } from './memory-volume.js';
+import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types.js';
 
 interface CrossOriginMessage {
   type: 'init' | 'execute' | 'runFile' | 'clearCache' | 'syncFile' | 'ready' | 'result' | 'error' | 'console';

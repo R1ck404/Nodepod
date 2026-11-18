@@ -1,7 +1,7 @@
 // stub - deprecated in Node.js, minimal pass-through implementation
 
 
-import { EventEmitter } from "./events";
+import { EventEmitter } from "./events.js";
 
 /* ------------------------------------------------------------------ */
 /*  Domain                                                             */

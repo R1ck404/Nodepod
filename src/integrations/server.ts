@@ -5,15 +5,15 @@
 // Express / Fastify / bare http.
 
 import { Buffer } from "node:buffer";
-import { readServiceWorkerSource } from "./shared/read-sw";
-import { readPreviewBridgeSource } from "./shared/read-preview-bridge";
+import { readServiceWorkerSource } from "./shared/read-sw.js";
+import { readPreviewBridgeSource } from "./shared/read-preview-bridge.js";
 import {
   swResponseHeaders,
   previewBridgeResponseHeaders,
   DEFAULT_SW_PATH,
   DEFAULT_BRIDGE_HTML_PATH,
   DEFAULT_BRIDGE_SCRIPT_PATH,
-} from "./shared/headers";
+} from "./shared/headers.js";
 
 export {
   DEFAULT_SW_PATH,

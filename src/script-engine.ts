@@ -1,54 +1,54 @@
 // ScriptEngine — JS execution engine with require(), module resolution,
 // ESM-to-CJS conversion, and Node.js polyfills. Runs in the browser.
 
-import { MemoryVolume } from "./memory-volume";
+import { MemoryVolume } from "./memory-volume.js";
 import type {
   IScriptEngine,
   ExecutionOutcome,
   EngineConfig,
   LoadedModule,
-} from "./engine-types";
-import type { PackageManifest } from "./types/manifest";
-import { quickDigest, contentDigest } from "./helpers/digest";
-import { createImportMeta } from "./helpers/import-meta";
-import { LRUCache as _LRUCache } from "./memory-handler";
-import { bytesToBase64, bytesToHex, decodeShortAscii } from "./helpers/byte-encoding";
-import { inSyncScope, syncScopeDepth, setSyncPromiseClass } from "./helpers/sync-scope";
-import { guardExitCallback, guardExitRejection, installPromiseExitGuard } from "./helpers/promise-exit";
-import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
-import * as pathPolyfill from "./polyfills/path";
+} from "./engine-types.js";
+import type { PackageManifest } from "./types/manifest.js";
+import { quickDigest, contentDigest } from "./helpers/digest.js";
+import { createImportMeta } from "./helpers/import-meta.js";
+import { LRUCache as _LRUCache } from "./memory-handler.js";
+import { bytesToBase64, bytesToHex, decodeShortAscii } from "./helpers/byte-encoding.js";
+import { inSyncScope, syncScopeDepth, setSyncPromiseClass } from "./helpers/sync-scope.js";
+import { guardExitCallback, guardExitRejection, installPromiseExitGuard } from "./helpers/promise-exit.js";
+import { buildFileSystemBridge, FsBridge } from "./polyfills/fs.js";
+import * as pathPolyfill from "./polyfills/path.js";
 import {
   RESOLVE_EXTENSIONS,
   MAIN_FIELD_EXTENSIONS,
   INDEX_FILES,
   IMPORTS_FIELD_EXTENSIONS,
-} from "./constants/config";
+} from "./constants/config.js";
 // a module path's candidate extensions, in probe order
 const FILE_EXTENSIONS_WITH_NODE: readonly string[] = [...MAIN_FIELD_EXTENSIONS, ".node"];
-import { buildProcessEnv, ProcessObject } from "./polyfills/process";
-import * as httpPolyfill from "./polyfills/http";
-import { proxyUrlForFetch } from "./cross-origin";
+import { buildProcessEnv, ProcessObject } from "./polyfills/process.js";
+import * as httpPolyfill from "./polyfills/http.js";
+import { proxyUrlForFetch } from "./cross-origin.js";
 import {
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
   patchFetchNodeAdapterExports,
-} from "./polyfills/fetch-response";
+} from "./polyfills/fetch-response.js";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
-import * as httpsPolyfill from "./polyfills/https";
-import * as tcpPolyfill from "./polyfills/net";
-import eventBusPolyfill from "./polyfills/events";
-import streamPolyfill from "./polyfills/stream";
-import * as urlPolyfill from "./polyfills/url";
-import * as qsPolyfill from "./polyfills/querystring";
-import * as helpersPolyfill from "./polyfills/util";
-import * as ttyPolyfill from "./polyfills/tty";
-import * as osPolyfill from "./polyfills/os";
-import * as hashingPolyfill from "./polyfills/crypto";
-import * as compressionPolyfill from "./polyfills/zlib";
-import * as dnsPolyfill from "./polyfills/dns";
-import bufferPolyfill, { Buffer as NodeBuffer } from "./polyfills/buffer";
+import * as httpsPolyfill from "./polyfills/https.js";
+import * as tcpPolyfill from "./polyfills/net.js";
+import eventBusPolyfill from "./polyfills/events.js";
+import streamPolyfill from "./polyfills/stream.js";
+import * as urlPolyfill from "./polyfills/url.js";
+import * as qsPolyfill from "./polyfills/querystring.js";
+import * as helpersPolyfill from "./polyfills/util.js";
+import * as ttyPolyfill from "./polyfills/tty.js";
+import * as osPolyfill from "./polyfills/os.js";
+import * as hashingPolyfill from "./polyfills/crypto.js";
+import * as compressionPolyfill from "./polyfills/zlib.js";
+import * as dnsPolyfill from "./polyfills/dns.js";
+import bufferPolyfill, { Buffer as NodeBuffer } from "./polyfills/buffer.js";
 // Descriptor for a Proxy that forwards to `source` over an empty target. The
 // target never has the property, so reporting it non-configurable breaks the
 // Proxy invariant and throws. ES module namespaces (the lazily imported
@@ -92,37 +92,37 @@ export function setChildProcessPolyfill(mod: any): void {
   _shellExecPolyfill = mod;
   _initShellExec = mod.initShellExec;
 }
-import { getProxyInstance } from "./request-proxy";
-import * as watcherPolyfill from "./polyfills/chokidar";
-import * as wsPolyfill from "./polyfills/ws";
-import * as macEventsPolyfill from "./polyfills/fsevents";
-import * as scannerPolyfill from "./polyfills/readdirp";
-import * as moduleSysPolyfill from "./polyfills/module";
-import * as perfPolyfill from "./polyfills/perf_hooks";
-import * as threadPoolPolyfill from "./polyfills/worker_threads";
-import * as esbuildPolyfill from "./polyfills/esbuild";
-import * as rollupPolyfill from "./polyfills/rollup";
-import * as v8Polyfill from "./polyfills/v8";
-import * as lineReaderPolyfill from "./polyfills/readline";
-import * as tlsPolyfill from "./polyfills/tls";
-import * as http2Polyfill from "./polyfills/http2";
-import * as clusterPolyfill from "./polyfills/cluster";
-import * as udpPolyfill from "./polyfills/dgram";
-import * as vmPolyfill from "./polyfills/vm";
-import * as debugPolyfill from "./polyfills/inspector";
-import * as asyncCtxPolyfill from "./polyfills/async_hooks";
-import * as domainPolyfill from "./polyfills/domain";
-import * as tracePolyfill from "./polyfills/diagnostics_channel";
-import * as consolePolyfill from "./polyfills/console";
-import * as replPolyfill from "./polyfills/repl";
-import * as testPolyfill from "./polyfills/test";
-import * as traceEventsPolyfill from "./polyfills/trace_events";
-import * as wasiPolyfill from "./polyfills/wasi";
-import * as seaPolyfill from "./polyfills/sea";
-import * as sqlitePolyfill from "./polyfills/sqlite";
-import * as quicPolyfill from "./polyfills/quic";
-import * as lightningcssPolyfill from "./polyfills/lightningcss";
-import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker";
+import { getProxyInstance } from "./request-proxy.js";
+import * as watcherPolyfill from "./polyfills/chokidar.js";
+import * as wsPolyfill from "./polyfills/ws.js";
+import * as macEventsPolyfill from "./polyfills/fsevents.js";
+import * as scannerPolyfill from "./polyfills/readdirp.js";
+import * as moduleSysPolyfill from "./polyfills/module.js";
+import * as perfPolyfill from "./polyfills/perf_hooks.js";
+import * as threadPoolPolyfill from "./polyfills/worker_threads.js";
+import * as esbuildPolyfill from "./polyfills/esbuild.js";
+import * as rollupPolyfill from "./polyfills/rollup.js";
+import * as v8Polyfill from "./polyfills/v8.js";
+import * as lineReaderPolyfill from "./polyfills/readline.js";
+import * as tlsPolyfill from "./polyfills/tls.js";
+import * as http2Polyfill from "./polyfills/http2.js";
+import * as clusterPolyfill from "./polyfills/cluster.js";
+import * as udpPolyfill from "./polyfills/dgram.js";
+import * as vmPolyfill from "./polyfills/vm.js";
+import * as debugPolyfill from "./polyfills/inspector.js";
+import * as asyncCtxPolyfill from "./polyfills/async_hooks.js";
+import * as domainPolyfill from "./polyfills/domain.js";
+import * as tracePolyfill from "./polyfills/diagnostics_channel.js";
+import * as consolePolyfill from "./polyfills/console.js";
+import * as replPolyfill from "./polyfills/repl.js";
+import * as testPolyfill from "./polyfills/test.js";
+import * as traceEventsPolyfill from "./polyfills/trace_events.js";
+import * as wasiPolyfill from "./polyfills/wasi.js";
+import * as seaPolyfill from "./polyfills/sea.js";
+import * as sqlitePolyfill from "./polyfills/sqlite.js";
+import * as quicPolyfill from "./polyfills/quic.js";
+import * as lightningcssPolyfill from "./polyfills/lightningcss.js";
+import { createNapiWorkerFactory, isNapiWasiWorkerScript } from "./helpers/napi-wasm-worker.js";
 import {
   promises as streamPromises,
   Readable,
@@ -130,16 +130,16 @@ import {
   Duplex,
   Transform,
   PassThrough,
-} from "./polyfills/stream";
-import { promises as dnsPromises } from "./polyfills/dns";
-import { promises as readlinePromises } from "./polyfills/readline";
+} from "./polyfills/stream.js";
+import { promises as dnsPromises } from "./polyfills/dns.js";
+import { promises as readlinePromises } from "./polyfills/readline.js";
 
-import assertPolyfill from "./polyfills/assert";
-import stringDecoderPolyfill from "./polyfills/string_decoder";
-import timersPolyfill from "./polyfills/timers";
-import { promises as timersPromises } from "./polyfills/timers";
-import * as punycodePolyfill from "./polyfills/punycode";
-import constantsPolyfill from "./polyfills/constants";
+import assertPolyfill from "./polyfills/assert.js";
+import stringDecoderPolyfill from "./polyfills/string_decoder.js";
+import timersPolyfill from "./polyfills/timers.js";
+import { promises as timersPromises } from "./polyfills/timers.js";
+import * as punycodePolyfill from "./polyfills/punycode.js";
+import constantsPolyfill from "./polyfills/constants.js";
 import {
   resolve as resolveExports,
   imports as resolveImports,
@@ -151,7 +151,7 @@ import {
   hasTopLevelAwait,
   stripTopLevelAwait,
   topLevelParser,
-} from "./syntax-transforms";
+} from "./syntax-transforms.js";
 import {
   getCachedModule,
   cloneCachedModule,
@@ -159,19 +159,19 @@ import {
   compileWasmInWorker,
   registerCompiledModule,
   PRECOMPILE_THRESHOLD,
-} from "./helpers/wasm-cache";
+} from "./helpers/wasm-cache.js";
 import {
   buildCdnWasmUrl,
   resolveWasmAssetPath,
-} from "./helpers/wasm-cdn";
-import { getRegistry } from "./helpers/event-loop";
+} from "./helpers/wasm-cdn.js";
+import { getRegistry } from "./helpers/event-loop.js";
 import * as acorn from "acorn";
-import { isTypeScriptFile, stripTypeScript } from "./strip-typescript";
+import { isTypeScriptFile, stripTypeScript } from "./strip-typescript.js";
 import {
   lexModule,
   hasStaticModuleSyntax,
   patchDynamicImports,
-} from "./helpers/module-lexer";
+} from "./helpers/module-lexer.js";
 
 // CSS files must never go through stripTypeScript
 function isCSSFile(filename: string): boolean {
@@ -1791,7 +1791,7 @@ export interface EngineOptions {
     workerData: unknown;
     threadId: number;
   };
-  handler?: import("./memory-handler").MemoryHandler;
+  handler?: import("./memory-handler.js").MemoryHandler;
   enableSharedArrayBuffer?: boolean;
   /** Injected transform cache (e.g. the shared worker LRU). Takes precedence
    *  over `handler`'s cache. Must behave like Map<string, string>. */
@@ -3441,7 +3441,7 @@ export class ScriptEngine {
     this.opts = opts;
 
     // Don't call initShellExec here — Nodepod.boot() sets up the shell with correct cwd
-    import("./polyfills/child_process")
+    import("./polyfills/child_process.js")
       .then((mod) => {
         _shellExecPolyfill = mod;
         _initShellExec = mod.initShellExec;
@@ -4405,5 +4405,5 @@ export type {
   IScriptEngine,
   ExecutionOutcome,
   EngineConfig,
-} from "./engine-types";
+} from "./engine-types.js";
 export default ScriptEngine;

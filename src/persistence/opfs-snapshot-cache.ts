@@ -1,5 +1,5 @@
-import type { IDBSnapshotCache, PackHead } from "./idb-cache";
-import type { VFSBinarySnapshot, VFSSnapshotEntry } from "../threading/worker-protocol";
+import type { IDBSnapshotCache, PackHead } from "./idb-cache.js";
+import type { VFSBinarySnapshot, VFSSnapshotEntry } from "../threading/worker-protocol.js";
 
 const STORE_DIR = "nodepod-package-packs-v1";
 const SCHEMA = 1;

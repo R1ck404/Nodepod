@@ -1,8 +1,8 @@
 // readline polyfill — createInterface, emitKeypressEvents, terminal helpers
 // we track line/cursor on every keystroke because @clack reads rl.line directly
 
-import { EventEmitter } from "./events";
-import { getRegistry, type Handle } from "../helpers/event-loop";
+import { EventEmitter } from "./events.js";
+import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
 // the wait loop checks this so it doesn't bail while the user is typing
 let _activeInterfaceCount = 0;

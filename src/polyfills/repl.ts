@@ -1,8 +1,8 @@
 // lightweight REPL stub for compatibility
 
 
-import { EventEmitter } from "./events";
-import { builtinModules } from "./module";
+import { EventEmitter } from "./events.js";
+import { builtinModules } from "./module.js";
 
 export const _builtinLibs = builtinModules.filter(name => !name.startsWith("node:") && !name.startsWith("_"));
 

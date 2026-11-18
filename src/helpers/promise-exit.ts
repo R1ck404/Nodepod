@@ -1,5 +1,5 @@
-import { isExitSentinel } from "./event-loop";
-import { getActiveContext, type ProcessContext } from "../threading/process-context";
+import { isExitSentinel } from "./event-loop.js";
+import { getActiveContext, type ProcessContext } from "../threading/process-context.js";
 
 // An explicit exit has already notified the process runner. Its unwind must
 // not become an application rejection (or run catch/finally after termination).
