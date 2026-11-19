@@ -1862,6 +1862,16 @@ function shallowCopy(source: Record<string, unknown>): Record<string, unknown> {
   return copy;
 }
 
+// Packages that keep resolving require-first even for import. Nodepod turns an
+// ES module's named imports into one-time reads, so a binding the exporter
+// assigns after the import ran (`export let locator;` in svelte's compiler
+// state, set later by reset()) stays undefined in its importers. These
+// packages ship a bundled build behind the `require` condition that has no
+// such cross-module bindings, and loading their ES module source instead made
+// every SvelteKit template fail with "locator is not a function". Drop an
+// entry once named imports are live bindings.
+const REQUIRE_FIRST_PACKAGES: ReadonlySet<string> = new Set(["svelte"]);
+
 // ── Core module registry ──
 const CORE_MODULES: Record<string, unknown> = {
   path: pathPolyfill,
@@ -2477,7 +2487,7 @@ function buildResolver(
                 { node: true, import: true, ...condExtra },
                 { import: true, ...condExtra },
               ]
-            : preferEsm
+            : preferEsm && !REQUIRE_FIRST_PACKAGES.has(pkgName)
             ? [
                 { node: true, import: true, ...condExtra },
                 { browser: true, import: true, ...condExtra },

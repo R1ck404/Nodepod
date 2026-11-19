@@ -91,6 +91,35 @@ describe("Forge compatibility regressions", () => {
       expect(await runtime.execute(code, "/workspace/probe.cjs").exports).toEqual(["cjs", "esm"]);
     },
   );
+  // svelte's ES module source depends on `export let` bindings assigned after
+  // import (compiler/state.js), which Nodepod's named imports don't follow; its
+  // bundled build sits behind the `require` condition. Without this, every
+  // SvelteKit template failed with "locator is not a function".
+  it("keeps resolving svelte require-first for import()", async () => {
+    const runtime = engine({
+      "/workspace/node_modules/svelte/package.json": JSON.stringify({
+        name: "svelte",
+        exports: { "./compiler": { require: "./compiler/index.js", default: "./src/compiler/index.js" } },
+      }),
+      "/workspace/node_modules/svelte/compiler/index.js": "exports.build = 'bundled';",
+      "/workspace/node_modules/svelte/src/compiler/index.js": "export const build = 'source';",
+      "/workspace/node_modules/other/package.json": JSON.stringify({
+        name: "other",
+        exports: { require: "./cjs.cjs", default: "./esm.mjs" },
+      }),
+      "/workspace/node_modules/other/cjs.cjs": "exports.build = 'cjs';",
+      "/workspace/node_modules/other/esm.mjs": "export const build = 'esm';",
+    });
+    const result = await runtime.execute(
+      `module.exports = (async () => [
+        (await import('svelte/compiler')).build,
+        (await import('other')).build,
+      ])();`,
+      "/workspace/probe.cjs",
+    ).exports;
+    // svelte keeps its bundled build; everything else follows import conditions
+    expect(result).toEqual(["bundled", "esm"]);
+  });
   it("uses import conditions inside an ES module loaded synchronously by require", () => {
     const runtime = engine({
       "/workspace/node_modules/dual/package.json": JSON.stringify({
