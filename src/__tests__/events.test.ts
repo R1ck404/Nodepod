@@ -307,3 +307,52 @@ describe("EventEmitter", () => {
     });
   });
 });
+
+describe("EventEmitterAsyncResource", () => {
+  const { EventEmitterAsyncResource } = eventModule as any;
+
+  it("is exported by name and on the default export", async () => {
+    const named = (await import("../polyfills/events")).EventEmitterAsyncResource;
+    expect(typeof named).toBe("function");
+    expect(EventEmitterAsyncResource).toBe(named);
+  });
+
+  it("is an EventEmitter that emits in place", () => {
+    const ee = new EventEmitterAsyncResource({ name: "pool" });
+    expect(ee).toBeInstanceOf(EventEmitter);
+    const seen: unknown[] = [];
+    ee.on("message", (a: unknown, b: unknown) => seen.push(a, b));
+    expect(ee.emit("message", 1, 2)).toBe(true);
+    expect(ee.emit("nothing")).toBe(false);
+    expect(seen).toEqual([1, 2]);
+  });
+
+  it("exposes an asyncResource tied to the emitter", () => {
+    const a = new EventEmitterAsyncResource({ triggerAsyncId: 7 });
+    const b = new EventEmitterAsyncResource();
+    expect(a.asyncResource.eventEmitter).toBe(a);
+    expect(typeof a.asyncId()).toBe("number");
+    expect(a.asyncId()).not.toBe(b.asyncId());
+    expect(a.triggerAsyncId()).toBe(7);
+    expect(a.asyncResource.runInAsyncScope((x: number, y: number) => x + y, null, 2, 3)).toBe(5);
+    const fn = () => 1;
+    expect(a.asyncResource.bind(fn)()).toBe(1);
+    expect(() => a.emitDestroy()).not.toThrow();
+  });
+
+  it("can be subclassed, as tinypool does", () => {
+    class Pool extends EventEmitterAsyncResource {
+      constructor() {
+        super({ name: "Pool" });
+      }
+      run() {
+        this.emit("drain");
+      }
+    }
+    const pool = new Pool();
+    let drained = 0;
+    pool.on("drain", () => drained++);
+    pool.run();
+    expect(drained).toBe(1);
+  });
+});

@@ -338,6 +338,7 @@ const moduleFacade = EventEmitter as EventEmitterConstructor & {
   on: (target: EventEmitter, name: string) => AsyncIterable<unknown[]>;
   getEventListeners: (target: EventEmitter, name: string) => EventHandler[];
   listenerCount: (target: EventEmitter, name: string) => number;
+  EventEmitterAsyncResource: typeof EventEmitterAsyncResource;
 };
 
 moduleFacade.EventEmitter = EventEmitter;
@@ -442,6 +443,53 @@ moduleFacade.on = (target: EventEmitter, name: string) => {
   };
   return iter;
 };
+
+/**
+ * EventEmitterAsyncResource: an EventEmitter tied to an async resource (Node >= 17.4). Nodepod has no
+ * async-context tracking, so the resource runs callbacks directly; emitted events run in place.
+ * Used by tinypool (Vitest's worker pool) and other libraries that subclass it.
+ */
+let nextAsyncId = 1;
+export class EventEmitterAsyncResource extends (EventEmitter as unknown as { new (opts?: object): EventEmitter }) {
+  readonly asyncResource: {
+    readonly eventEmitter: EventEmitterAsyncResource;
+    asyncId(): number;
+    triggerAsyncId(): number;
+    runInAsyncScope<R>(fn: (...args: unknown[]) => R, thisArg?: unknown, ...args: unknown[]): R;
+    emitDestroy(): void;
+    bind<F extends (...args: unknown[]) => unknown>(fn: F): F;
+  };
+  constructor(options?: { name?: string; triggerAsyncId?: number; requireManualDestroy?: boolean; captureRejections?: boolean } | string) {
+    super(typeof options === "object" ? options : undefined);
+    const id = nextAsyncId++;
+    const trigger = typeof options === "object" && options.triggerAsyncId ? options.triggerAsyncId : 0;
+    const emitter = this;
+    this.asyncResource = {
+      eventEmitter: emitter,
+      asyncId: () => id,
+      triggerAsyncId: () => trigger,
+      runInAsyncScope: (fn, thisArg, ...args) => fn.apply(thisArg, args),
+      emitDestroy: () => {},
+      bind: (fn) => fn,
+    };
+  }
+  emit(event: string | symbol, ...args: unknown[]): boolean {
+    return this.asyncResource.runInAsyncScope(
+      () => (EventEmitter.prototype as unknown as { emit: (e: string | symbol, ...a: unknown[]) => boolean }).emit.call(this, event, ...args),
+    );
+  }
+  emitDestroy(): void {
+    this.asyncResource.emitDestroy();
+  }
+  asyncId(): number {
+    return this.asyncResource.asyncId();
+  }
+  triggerAsyncId(): number {
+    return this.asyncResource.triggerAsyncId();
+  }
+}
+
+moduleFacade.EventEmitterAsyncResource = EventEmitterAsyncResource;
 
 moduleFacade.getEventListeners = (target: EventEmitter, name: string) =>
   target.listeners(name);
