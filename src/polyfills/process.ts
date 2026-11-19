@@ -29,8 +29,8 @@ interface OutputStreamBridge {
   isTTY: boolean;
   columns: number;
   rows: number;
-  write: (data: string | Buffer, encoding?: string, cb?: () => void) => boolean;
-  end?: (data?: string, cb?: () => void) => void;
+  write: (data: string | Buffer, encoding?: string | (() => void), cb?: () => void) => boolean;
+  end?: (data?: string | (() => void), encoding?: string | (() => void), cb?: () => void) => void;
   on: (evt: string, fn: EventHandler) => OutputStreamBridge;
   once: (evt: string, fn: EventHandler) => OutputStreamBridge;
   off: (evt: string, fn: EventHandler) => OutputStreamBridge;
@@ -376,20 +376,27 @@ function fabricateStream(
     setEncoding(_enc) {
       return stream;
     },
-    write(data, _enc?, cb?) {
+    // write(chunk[, encoding][, callback]): the callback may come second, as in Node
+    write(data, enc?, cb?) {
+      if (typeof enc === "function") cb = enc;
       if (isOutput && writeFn && data != null) {
         const text = typeof data === "string" ? data : String(data);
         writeFn(text);
       }
-      if (cb) queueMicrotask(cb);
+      if (typeof cb === "function") queueMicrotask(cb);
       return true;
     },
-    end(data?, cb?) {
+    // end([chunk][, encoding][, callback])
+    end(data?, enc?, cb?) {
+      if (typeof data === "function") {
+        cb = data;
+        data = undefined;
+      } else if (typeof enc === "function") cb = enc;
       if (isOutput && writeFn && data != null) {
         const text = typeof data === "string" ? data : String(data);
         writeFn(text);
       }
-      if (cb) queueMicrotask(cb);
+      if (typeof cb === "function") queueMicrotask(cb);
     },
     read() {
       return null;
@@ -494,10 +501,11 @@ function fabricateStream(
   };
 
   if (isOutput && writeFn) {
-    stream.write = (data: string | Buffer, _enc?: string, cb?: () => void) => {
+    stream.write = (data: string | Buffer, enc?: string | (() => void), cb?: () => void) => {
+      if (typeof enc === "function") cb = enc;
       const text = typeof data === "string" ? data : data.toString();
       const ok = writeFn(text);
-      if (cb) queueMicrotask(cb);
+      if (typeof cb === "function") queueMicrotask(cb);
       return ok;
     };
   }

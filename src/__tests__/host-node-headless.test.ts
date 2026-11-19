@@ -286,6 +286,52 @@ describe("node headless host", () => {
     } finally { await pod.teardown(); }
   }, 15_000);
 
+  it("ends a forked child's stdout and stderr when it exits, as Vitest 5's pool waits for", async () => {
+    setRuntimeHost(createNodeHost({ workerPath }));
+    const pod = await Nodepod.boot({
+      workdir: "/app", packageStore: "memory", enableSnapshotCache: false,
+      files: {
+        "/app/child.js": `
+          console.log('out'); console.error('err');
+          process.on('message', ()=>{});
+          process.send('ready');
+        `,
+        "/app/exits.js": "console.log('bye');",
+        // Mirrors ForksPoolWorker.stop(): kill, await 'exit', then await 'end' or 'close' on each stream.
+        "/app/main.js": `
+          const {fork}=require('child_process');
+          const flushed=(s)=>s.readableEnded||s.destroyed?Promise.resolve():new Promise(r=>{s.once('end',r);s.once('close',r);});
+          const exited=(c)=>new Promise(r=>c.exitCode!=null?r():c.once('exit',r));
+          (async()=>{
+            const killed=fork('./child.js',[],{stdio:'pipe',serialization:'advanced'});
+            let out='';
+            killed.stdout.on('data',d=>out+=d);
+            await new Promise(r=>killed.once('message',r));
+            killed.kill();
+            await exited(killed);
+            await flushed(killed.stdout); await flushed(killed.stderr);
+            console.log('killed flushed', JSON.stringify(out.trim()), killed.stdout.readableEnded, killed.stderr.readableEnded);
+            const done=fork('./exits.js',[],{stdio:'pipe'});
+            done.stdout.resume(); done.stderr.resume();
+            await exited(done);
+            await flushed(done.stdout); await flushed(done.stderr);
+            console.log('exited flushed');
+          })();
+        `,
+      },
+    });
+    try {
+      const proc = await pod.spawn("node", ["main.js"], { cwd: "/app" });
+      const chunks: string[] = [];
+      proc.on("output", chunk=>chunks.push(chunk));
+      let timer: ReturnType<typeof setTimeout>;
+      const result = await Promise.race([proc.completion, new Promise<never>((_, reject)=>{timer=setTimeout(()=>reject(new Error("timed out: " + chunks.join(""))), 10_000);})]).finally(()=>clearTimeout(timer));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('killed flushed "out" true true\n');
+      expect(result.stdout).toContain("exited flushed\n");
+    } finally { await pod.teardown(); }
+  }, 30_000);
+
   it("keeps active-server URLs byte-for-byte unchanged in spawn output", async () => {
     setRuntimeHost(
       createNodeHost({
