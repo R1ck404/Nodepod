@@ -253,7 +253,8 @@ describe("Forge compatibility regressions", () => {
         export const result = [typeof test, test === named, test === cjs, cjs.test === cjs, ran];`,
     });
     expect((await runtime.runFileTLA("/workspace/probe.mjs")).exports).toMatchObject({
-      result: ["function", true, true, true, true],
+      // As in Node, test() queues the test: its callback has not run when the module body ends.
+      result: ["function", true, true, true, false],
     });
   });
 });
