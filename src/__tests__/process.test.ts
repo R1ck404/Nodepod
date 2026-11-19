@@ -121,6 +121,32 @@ describe("process polyfill", () => {
       proc.stdout.write("test");
       expect(output).toContain("test");
     });
+
+    // Vitest 5's workers wait for `write("", cb)` before reporting a file as finished
+    it("calls the callback when it is the second or third argument, as Node does", async () => {
+      for (const config of [{ onStdout: () => {}, onStderr: () => {} }, {}]) {
+        const proc = buildProcessEnv(config);
+        for (const stream of [proc.stdout, proc.stderr]) {
+          const calls: string[] = [];
+          stream.write("", () => calls.push("empty"));
+          stream.write("x", () => calls.push("second"));
+          stream.write("x", "utf8", () => calls.push("third"));
+          stream.end?.(() => calls.push("end only"));
+          stream.end?.("x", () => calls.push("end second"));
+          stream.end?.("x", "utf8", () => calls.push("end third"));
+          await new Promise((r) => setTimeout(r, 0));
+          expect(calls).toEqual(["empty", "second", "third", "end only", "end second", "end third"]);
+        }
+      }
+    });
+
+    it("does not write the callback or treat it as data", () => {
+      const output: string[] = [];
+      const proc = buildProcessEnv({ onStdout: (text) => output.push(text) });
+      proc.stdout.write("a", () => {});
+      proc.stdout.end?.(() => {});
+      expect(output.join("")).toBe("a");
+    });
   });
 
   describe("kill / signals", () => {

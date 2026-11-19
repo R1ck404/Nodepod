@@ -3068,6 +3068,10 @@ export function fork(
       childHandle.close();
       child.exitCode = exitCode;
       child.connected = false;
+      // end the stdio streams, as Node does when the child's pipes close;
+      // callers wait for their 'end' or 'close' (Vitest 5's forks pool does)
+      child.stdout?.push(null);
+      child.stderr?.push(null);
       child.emit("exit", exitCode, null);
       child.emit("close", exitCode, null);
     },
