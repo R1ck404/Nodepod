@@ -31,7 +31,8 @@ export type WorkerThreadForkFn = (
     onStderr?: (data: string) => void;
   },
 ) => {
-  postMessage: (data: unknown) => void;
+  /** `transferList` may hold MessagePorts; see encodeTransfer */
+  postMessage: (data: unknown, transferList?: readonly unknown[]) => void;
   sendStdin: (data: string) => void;
   endStdin: () => void;
   terminate: () => void;
@@ -79,19 +80,184 @@ export const MessagePort = function MessagePort(this: any) {
   EventEmitter.call(this);
   // starts unref'd, node refs on start()
   this._elHandle = null;
+  // browser MessagePort behind a MessageChannel port (see wrapHostPort)
+  this._host = null;
+  this._closed = false;
 } as unknown as MessagePortConstructor;
 
 Object.setPrototypeOf(MessagePort.prototype, EventEmitter.prototype);
 
-MessagePort.prototype.postMessage = function postMessage(_val: unknown, _transfer?: unknown[]): void {};
+// A MessageChannel's ports are backed by a browser MessageChannel, so they
+// can be transferred to another worker thread (each thread is a Web Worker):
+// tinypool, and Vitest's threads pool on it, hand a port to every worker.
+// Messages travel in an envelope; ports inside them are encoded by
+// encodeTransfer and rebuilt by decodeTransfer on the receiving side.
+const PORT_MARKER = "__nodepodMessagePort__";
+const CLOSE_MARKER = "__nodepodMessagePortClose__";
+
+type HostPort = {
+  postMessage(data: unknown, transfer?: Transferable[]): void;
+  close(): void;
+  onmessage: ((e: { data: unknown }) => void) | null;
+  onmessageerror: ((e: unknown) => void) | null;
+};
+
+function hostChannel(): { port1: HostPort; port2: HostPort } | null {
+  const HostChannel = (globalThis as { MessageChannel?: new () => { port1: HostPort; port2: HostPort } })
+    .MessageChannel;
+  // installed polyfills (or Node itself) may put this module's class there
+  if (typeof HostChannel !== "function" || (HostChannel as unknown) === MessageChannel) return null;
+  return new HostChannel();
+}
+
+/** Wrap a browser MessagePort in a Node-style one. */
+export function wrapHostPort(host: HostPort): MessagePort {
+  const port = new MessagePort() as any;
+  port._host = host;
+  return port;
+}
+
+function startHost(port: any): void {
+  const host = port._host as HostPort | null;
+  if (!host || host.onmessage || port._closed) return;
+  // setting onmessage starts the browser port; it queues messages until then,
+  // as Node does until a 'message' listener is attached or start() is called
+  host.onmessage = (e) => {
+    const env = e.data as { data?: unknown; ports?: HostPort[]; [CLOSE_MARKER]?: true } | null;
+    if (env && env[CLOSE_MARKER]) {
+      closePort(port, false);
+      return;
+    }
+    port.emit("message", decodeTransfer(env?.data, env?.ports));
+  };
+  host.onmessageerror = (e) => port.emit("messageerror", e);
+}
+
+function closePort(port: any, notifyPeer: boolean): void {
+  if (port._closed) return;
+  port._closed = true;
+  const host = port._host as HostPort | null;
+  if (host) {
+    if (notifyPeer) {
+      try {
+        host.postMessage({ [CLOSE_MARKER]: true });
+      } catch {
+        /* peer already gone */
+      }
+    }
+    host.onmessage = null;
+    host.close();
+  }
+  (port._elHandle as Handle | null)?.close();
+  port._elHandle = null;
+  queueMicrotask(() => port.emit("close"));
+}
+
+/**
+ * Prepare a message for a browser postMessage: every MessagePort in
+ * `transferList` is replaced inside `value` by a marker, and its browser port
+ * is returned for the transfer list. Without ports the value is unchanged.
+ */
+export function encodeTransfer(
+  value: unknown,
+  transferList?: readonly unknown[] | { transfer?: readonly unknown[] } | null,
+): { data: unknown; ports: HostPort[] } {
+  const list = Array.isArray(transferList)
+    ? transferList
+    : ((transferList as { transfer?: readonly unknown[] } | null | undefined)?.transfer ?? []);
+  const indices = new Map<object, number>();
+  const ports: HostPort[] = [];
+  for (const item of list) {
+    if (!(item instanceof MessagePort) || indices.has(item)) continue;
+    const port = item as any;
+    if (!port._host) {
+      throw new DOMException("MessagePort cannot be transferred: it has no browser port", "DataCloneError");
+    }
+    if (port._closed) {
+      throw new DOMException("MessagePort in transfer list is already detached", "DataCloneError");
+    }
+    indices.set(item, ports.length);
+    ports.push(port._host);
+    // the browser port moves to the receiver; this side is detached
+    port._closed = true;
+    port._host = null;
+    (port._elHandle as Handle | null)?.close();
+    port._elHandle = null;
+  }
+  if (ports.length === 0) return { data: value, ports };
+  const copies = new Map<object, unknown>();
+  const replace = (v: unknown): unknown => {
+    if (v === null || typeof v !== "object") return v;
+    const index = indices.get(v as object);
+    if (index !== undefined) return { [PORT_MARKER]: index };
+    if (copies.has(v as object)) return copies.get(v as object);
+    if (Array.isArray(v)) {
+      const out: unknown[] = [];
+      copies.set(v, out);
+      for (const item of v) out.push(replace(item));
+      return out;
+    }
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;
+    const out: Record<string, unknown> = {};
+    copies.set(v as object, out);
+    for (const key of Object.keys(v as object)) out[key] = replace((v as Record<string, unknown>)[key]);
+    return out;
+  };
+  return { data: replace(value), ports };
+}
+
+/** Undo encodeTransfer on the receiving side. */
+export function decodeTransfer(data: unknown, ports?: readonly HostPort[] | null): unknown {
+  if (!ports || ports.length === 0) return data;
+  const wrapped = ports.map((p) => wrapHostPort(p));
+  const seen = new Set<object>();
+  const restore = (v: unknown): unknown => {
+    if (v === null || typeof v !== "object") return v;
+    const marker = (v as Record<string, unknown>)[PORT_MARKER];
+    if (typeof marker === "number" && Object.keys(v as object).length === 1) return wrapped[marker];
+    if (seen.has(v as object)) return v;
+    seen.add(v as object);
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) v[i] = restore(v[i]);
+    } else {
+      const proto = Object.getPrototypeOf(v);
+      if (proto === Object.prototype || proto === null) {
+        for (const key of Object.keys(v as object)) {
+          (v as Record<string, unknown>)[key] = restore((v as Record<string, unknown>)[key]);
+        }
+      }
+    }
+    return v;
+  };
+  return restore(data);
+}
+
+MessagePort.prototype.postMessage = function postMessage(
+  this: any,
+  val: unknown,
+  transfer?: readonly unknown[] | { transfer?: readonly unknown[] },
+): void {
+  const host = this._host as HostPort | null;
+  if (!host || this._closed) return;
+  const { data, ports } = encodeTransfer(val, transfer);
+  host.postMessage({ data, ports }, ports as unknown as Transferable[]);
+};
 MessagePort.prototype.start = function start(this: any): void {
+  if (this._closed) return;
   if (!this._elHandle) this._elHandle = getRegistry().register("MessagePort");
+  startHost(this);
 };
 MessagePort.prototype.close = function close(this: any): void {
-  (this._elHandle as Handle | null)?.close();
-  this._elHandle = null;
+  if (!this._host) {
+    (this._elHandle as Handle | null)?.close();
+    this._elHandle = null;
+    return;
+  }
+  closePort(this, true);
 };
 MessagePort.prototype.ref = function ref(this: any): void {
+  if (this._closed) return;
   if (!this._elHandle) this._elHandle = getRegistry().register("MessagePort");
   else this._elHandle.ref();
 };
@@ -108,7 +274,10 @@ MessagePort.prototype.addListener = function addListener(
   handler: (...args: any[]) => void,
 ): any {
   EventEmitter.prototype.addListener.call(this, name, handler);
-  if (name === "message") this.ref();
+  if (name === "message") {
+    this.ref();
+    startHost(this);
+  }
   return this;
 };
 MessagePort.prototype.on = MessagePort.prototype.addListener;
@@ -118,7 +287,10 @@ MessagePort.prototype.once = function once(
   handler: (...args: any[]) => void,
 ): any {
   EventEmitter.prototype.once.call(this, name, handler);
-  if (name === "message") this.ref();
+  if (name === "message") {
+    this.ref();
+    startHost(this);
+  }
   return this;
 };
 MessagePort.prototype.removeListener = function removeListener(
@@ -145,7 +317,10 @@ MessagePort.prototype.prependListener = function prependListener(
   handler: (...args: any[]) => void,
 ): any {
   EventEmitter.prototype.prependListener.call(this, name, handler);
-  if (name === "message") this.ref();
+  if (name === "message") {
+    this.ref();
+    startHost(this);
+  }
   return this;
 };
 MessagePort.prototype.prependOnceListener = function prependOnceListener(
@@ -154,7 +329,10 @@ MessagePort.prototype.prependOnceListener = function prependOnceListener(
   handler: (...args: any[]) => void,
 ): any {
   EventEmitter.prototype.prependOnceListener.call(this, name, handler);
-  if (name === "message") this.ref();
+  if (name === "message") {
+    this.ref();
+    startHost(this);
+  }
   return this;
 };
 
@@ -221,10 +399,16 @@ interface MessageChannelConstructor {
 
 export const MessageChannel = function MessageChannel(this: any) {
   if (!this) return;
+  const host = hostChannel();
+  if (host) {
+    this.port1 = wrapHostPort(host.port1);
+    this.port2 = wrapHostPort(host.port2);
+    return;
+  }
   this.port1 = new MessagePort();
   this.port2 = new MessagePort();
 
-  // wire the two ports together
+  // no browser MessageChannel: wire the two ports together in memory
   const p1 = this.port1;
   const p2 = this.port2;
   p1.postMessage = (val: unknown) => {
@@ -393,9 +577,9 @@ export const Worker = function Worker(
 
 Object.setPrototypeOf(Worker.prototype, EventEmitter.prototype);
 
-Worker.prototype.postMessage = function postMessage(this: any, value: unknown, _transferListOrOptions?: unknown): void {
+Worker.prototype.postMessage = function postMessage(this: any, value: unknown, transferListOrOptions?: unknown): void {
   if (this._handle && !this._terminated) {
-    this._handle.postMessage(value);
+    this._handle.postMessage(value, transferListOrOptions);
   }
 };
 
@@ -546,4 +730,6 @@ export default {
   getWorkerThreadForkCallback,
   setWorkerConstructorOverride,
   installHostMessagePortKeepAlive,
+  encodeTransfer,
+  decodeTransfer,
 };

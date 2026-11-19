@@ -1511,7 +1511,16 @@ export async function executeNodeBinary(
   let exitResolve!: () => void;
   const exitPromise = new Promise<void>((r) => { exitResolve = r; });
 
-  proc.exit = ((c = 0) => {
+  proc.exit = ((arg?: number) => {
+    // no argument: exit with process.exitCode, as node does (vitest sets it
+    // after a failed run, then calls process.exit() when closing times out)
+    const c =
+      typeof arg === "number"
+        ? arg
+        : typeof proc.exitCode === "number"
+          ? proc.exitCode
+          : 0;
+    proc.exitCode = c;
     // suppress tear-down when dev servers are active (SES/error handlers call exit(1) but we want to keep serving)
     if (getAllServers().size > 0 && c !== 0) {
       proc.exitCode = c;

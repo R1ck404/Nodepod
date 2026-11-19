@@ -466,7 +466,10 @@ Readable.prototype.isPaused = function isPaused(): boolean {
 Readable.prototype.pipe = function pipe(target: any, options?: { end?: boolean }): any {
   const self = this;
   const onData = function onData(chunk: unknown) {
-    const needDrain = !target.write(chunk);
+    // only an explicit `false` asks for a pause, as in Node: a replaced
+    // write() that returns nothing (Vitest's renderer wraps process.stdout's)
+    // would otherwise pause the source for a 'drain' that never comes
+    const needDrain = target.write(chunk) === false;
     if (needDrain) {
       self.pause();
       target.once("drain", function onDrain() { self.resume(); });

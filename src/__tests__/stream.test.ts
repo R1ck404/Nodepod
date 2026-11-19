@@ -171,6 +171,21 @@ describe("pipe integration", () => {
     await new Promise<void>((resolve) => w.on("finish", resolve));
     expect(collected.join("")).toBe("chunk1chunk2");
   });
+
+  // Vitest 5's renderer swaps process.stdout.write for one that returns
+  // nothing; a worker's output piped there must still flow and end
+  it("keeps flowing when the destination's write returns undefined", async () => {
+    const source = new PassThrough();
+    const written: string[] = [];
+    const dest = { write: (chunk: unknown) => void written.push(String(chunk)), end() {}, on() {}, once() {}, emit() {} };
+    source.pipe(dest, { end: false });
+    const ended = new Promise<void>((resolve) => source.once("end", resolve));
+    source.write("a");
+    source.write("b");
+    source.end();
+    await ended;
+    expect(written.join("")).toBe("ab");
+  });
 });
 
 describe("async iteration", () => {

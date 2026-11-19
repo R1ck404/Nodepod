@@ -1413,23 +1413,29 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
+        // transferred MessagePorts (tinypool's task ports) move on with
+        // the message
         childHandle.on("ipc-message", (ipcMsg: any) => {
           const payload = ipcMsg?.data ?? ipcMsg;
+          const ports: MessagePort[] = ipcMsg?.ports ?? [];
           if (!handle.workerExited) {
             handle.postMessage({
               type: "ipc-message",
               targetRequestId: msg.requestId,
               data: payload,
-            } as any);
+              ports,
+            } as any, ports);
           }
         });
 
         handle.on("ipc-message", (ipcMsg: any) => {
           if (ipcMsg.targetRequestId === msg.requestId) {
+            const ports: MessagePort[] = ipcMsg.ports ?? [];
             childHandle.postMessage({
               type: "ipc-message",
               data: ipcMsg.data,
-            });
+              ports,
+            }, ports);
           }
         });
 

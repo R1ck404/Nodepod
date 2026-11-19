@@ -9,6 +9,7 @@ import {
   installNodeFetchClassParity,
 } from "../polyfills/fetch-response.js";
 import { installWasmWorkLifetime } from "../helpers/event-loop.js";
+import { decodeTransfer, encodeTransfer } from "../polyfills/worker_threads.js";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine.js";
 import {
   setSqliteHostBridge,
@@ -305,13 +306,17 @@ self.addEventListener("message", (ev: MessageEvent) => {
     }
     case "ipc-message": {
       const ipcMsg = msg as any;
+      // worker_threads messages can carry transferred MessagePorts
+      const data = ipcMsg.ports?.length
+        ? decodeTransfer(ipcMsg.data, ipcMsg.ports)
+        : ipcMsg.data;
       if (ipcMsg.targetRequestId !== undefined) {
         // we're the parent — route to the fork callback for a child
         const ipcCb = _ipcCallbacks.get(ipcMsg.targetRequestId);
-        if (ipcCb) ipcCb(ipcMsg.data);
+        if (ipcCb) ipcCb(data);
       } else {
         // we're the forked child — emit on the process object
-        handleIPCMessage(ipcMsg.data);
+        handleIPCMessage(data);
       }
       break;
     }
@@ -670,8 +675,9 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
         if (name === "message") flushParentMessages();
         return pp;
       }) as typeof pp.prependOnceListener;
-      pp.postMessage = (data: unknown) => {
-        post({ type: "ipc-message", data });
+      pp.postMessage = (value: unknown, transferList?: readonly unknown[]) => {
+        const { data, ports } = encodeTransfer(value, transferList);
+        post({ type: "ipc-message", data, ports: ports as unknown as MessagePort[] }, ports as unknown as Transferable[]);
       };
 
       shell.setIPCReceiveHandler((data: unknown) => {
@@ -1156,7 +1162,7 @@ function workerThreadFork(
     onStderr?: (data: string) => void;
   },
 ): {
-  postMessage: (data: unknown) => void;
+  postMessage: (data: unknown, transferList?: readonly unknown[]) => void;
   sendStdin: (data: string) => void;
   endStdin: () => void;
   terminate: () => void;
@@ -1221,12 +1227,14 @@ function workerThreadFork(
 
   return {
     requestId,
-    postMessage: (data: unknown) => {
+    postMessage: (value: unknown, transferList?: readonly unknown[]) => {
+      const { data, ports } = encodeTransfer(value, transferList);
       post({
         type: "ipc-message",
         targetRequestId: requestId,
         data,
-      });
+        ports: ports as unknown as MessagePort[],
+      }, ports as unknown as Transferable[]);
     },
     sendStdin: (data: string) => {
       post({ type: "child-stdin", requestId, data });
