@@ -100,7 +100,9 @@
     "./dist/index.mjs",
     "./dist/index.cjs",
     "./dist/headless.mjs",
-    "./dist/headless.cjs"
+    "./dist/headless.cjs",
+    "./dist/*.js",
+    "./dist/*.cjs"
   ],
   "scripts": {
     "build:lib": "vite build --config vite.lib.config.js && node -e \"const fs=require('fs'); for (const f of ['__sw__.js','__nodepod_bridge__.html','__nodepod_bridge__.js']) fs.copyFileSync('static/'+f,'dist/'+f)\"",
