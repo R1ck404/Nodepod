@@ -125,10 +125,12 @@ describe("Forge compatibility regressions", () => {
     }
   });
   it("rejects marked objects in worker messages, including cycles, maps and sets", () => {
-    for (const [Channel, mark] of [
+    // Node only has markAsUncloneable from 22.10; CI's test job runs Node 20,
+    // so compare against the native one only where it exists.
+    for (const [Channel, mark] of ([
       [MessageChannel, markAsUncloneable],
       [NativeMessageChannel, nativeMarkAsUncloneable],
-    ] as const) {
+    ] as const).filter(([, candidate]) => typeof candidate === "function")) {
       const { port1, port2 } = new Channel();
       const markValue = mark as (value: unknown) => void;
       try {
