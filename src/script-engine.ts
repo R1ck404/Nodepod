@@ -1114,7 +1114,7 @@ function syncAwaitOnce(val: unknown): unknown {
     // only a SyncPromise can report a rejection synchronously; a rejection
     // handler on a pending native promise would just swallow its error
     const onRejected =
-      (val as any)._force === (SyncPromiseClass.prototype as any)._force
+      isSyncPromiseInstance(val)
         ? (e: unknown) => {
             error = e;
             rejected = true;
@@ -1177,6 +1177,13 @@ asyncBody.pick = (deAsynced: () => unknown, native: () => Promise<unknown>): Pro
 // Promise subclass that resolves .then() synchronously when the executor resolves sync.
 // Needed because async functions always return native Promises, but when their body
 // resolves synchronously we want __syncAwait to unwrap the result.
+// SyncPromise instances, tracked without touching properties of the value:
+// a resolved value can be a Proxy that throws on unknown keys (Chai's
+// assertion objects do), and Node itself reads only `.then`.
+const syncPromiseInstances = new WeakSet<object>();
+const isSyncPromiseInstance = (v: unknown): boolean =>
+  typeof v === "object" && v !== null && syncPromiseInstances.has(v);
+
 // Injected as `Promise` inside module wrappers.
 function createSyncPromise(): typeof Promise {
   // async_hooks installs a context-propagating global Promise during module
@@ -1190,10 +1197,7 @@ function createSyncPromise(): typeof Promise {
   const markHandled = (p: Promise<unknown>): void => {
     NativePromise.prototype.then.call(p, undefined, noop);
   };
-  const isSyncPromise = (v: unknown): v is SyncPromise<any> =>
-    !!v &&
-    typeof v === "object" &&
-    (v as any)._force === SyncPromise.prototype._force;
+  const isSyncPromise = (v: unknown): v is SyncPromise<any> => isSyncPromiseInstance(v);
 
   class SyncPromise<T> extends NativePromise<T> {
     private _syncValue: T | undefined;
@@ -1277,6 +1281,7 @@ function createSyncPromise(): typeof Promise {
           },
         );
       });
+      syncPromiseInstances.add(this);
 
       this._syncValue = syncVal;
       this._syncResolved = syncResolved;
