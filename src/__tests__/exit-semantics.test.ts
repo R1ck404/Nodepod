@@ -367,6 +367,22 @@ describe("exit semantics - libuv-parity", () => {
       expect(r.exitCode).toBe(42);
     });
 
+    // vitest sets exitCode after a failed run, then calls process.exit()
+    // when closing times out; the run used to end with code 0
+    it("process.exit() without a code uses process.exitCode", async () => {
+      const { ctx } = setup({
+        "/exit-no-arg.js": `
+          process.exitCode = 3;
+          process.on("exit", (c) => console.log("exit-code=" + c));
+          setInterval(() => {}, 1000);
+          setTimeout(() => process.exit(), 10);
+        `,
+      });
+      const r = await executeNodeBinary("/exit-no-arg.js", [], ctx);
+      expect(r.stdout).toContain("exit-code=3");
+      expect(r.exitCode).toBe(3);
+    });
+
     it("beforeExit handler receives process.exitCode (not 0)", async () => {
       const { ctx } = setup({
         "/be-code.js": `

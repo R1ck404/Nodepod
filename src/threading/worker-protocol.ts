@@ -186,6 +186,9 @@ export interface MainToWorker_HttpClientResponse {
 export interface MainToWorker_IPC {
   type: "ipc-message";
   data: unknown;
+  // browser MessagePorts transferred with a worker_threads message; `data`
+  // refers to them by index (see encodeTransfer in polyfills/worker_threads)
+  ports?: MessagePort[];
   // Routes to a specific fork callback when sent to a parent worker
   targetRequestId?: number;
 }
@@ -454,6 +457,9 @@ export interface WorkerToMain_HttpResponse {
 export interface WorkerToMain_IPC {
   type: "ipc-message";
   data: unknown;
+  // browser MessagePorts transferred with a worker_threads message; `data`
+  // refers to them by index (see encodeTransfer in polyfills/worker_threads)
+  ports?: MessagePort[];
   targetRequestId?: number;
 }
 
