@@ -807,6 +807,18 @@ class BufferPolyfill extends Uint8Array {
   }
 }
 
+// Class statics are non-enumerable, but Node's Buffer statics (isBuffer, from, alloc, ...) are
+// enumerable. Libraries copy them with `for (key in Buffer)` (safer-buffer, under iconv-lite,
+// raw-body and body-parser), and without this they end up with no `isBuffer`.
+// Only the methods the class declares; `prototype`, `name` and `length` stay hidden.
+for (const key of Object.getOwnPropertyNames(BufferPolyfill)) {
+  if (key === 'prototype') continue;
+  const desc = Object.getOwnPropertyDescriptor(BufferPolyfill, key);
+  if (desc && typeof desc.value === 'function' && desc.configurable) {
+    Object.defineProperty(BufferPolyfill, key, { enumerable: true });
+  }
+}
+
 // Wrap BufferPolyfill so it can be called without `new` (like Node.js's deprecated Buffer())
 // Cast to BufferConstructor so downstream code sees Node.js-compatible Buffer types.
 const Buffer = new Proxy(BufferPolyfill, {

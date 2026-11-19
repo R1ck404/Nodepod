@@ -451,3 +451,50 @@ describe("Buffer.from with objects", () => {
     expect([...Buffer.from(new String("6869") as unknown as string, "hex")]).toEqual([0x68, 0x69]);
   });
 });
+
+// safer-buffer (under iconv-lite, raw-body and body-parser) copies Buffer's statics with
+// `for (key in Buffer)`; without enumerable statics it got no isBuffer and express.json()
+// returned an empty body.
+describe("Buffer statics are enumerable, as in Node", () => {
+  const statics = ["from", "alloc", "allocUnsafe", "allocUnsafeSlow", "concat", "compare", "isBuffer", "isEncoding", "byteLength"];
+
+  it("lists the statics in Object.keys and for...in, without class internals", () => {
+    const keys = Object.keys(Buffer);
+    for (const name of statics) expect(keys).toContain(name);
+    const seen: string[] = [];
+    for (const key in Buffer) seen.push(key);
+    for (const name of statics) expect(seen).toContain(name);
+    for (const hidden of ["prototype", "name", "length", "constructor"]) expect(keys).not.toContain(hidden);
+  });
+
+  it("only lists keys that Node's Buffer lists too", async () => {
+    const { Buffer: NativeBuffer } = await import("node:buffer");
+    const nativeKeys = new Set(Object.keys(NativeBuffer));
+    for (const name of statics) expect(nativeKeys.has(name)).toBe(true);
+  });
+
+  it("survives safer-buffer's copy loop, through the class and the exported Buffer", () => {
+    for (const source of [Buffer, bufferModule.Buffer as typeof Buffer]) {
+      const Safer: Record<string, unknown> = {};
+      // verbatim from safer-buffer/safer.js
+      for (const key in source) {
+        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+        if (key === "allocUnsafe" || key === "allocUnsafeSlow") continue;
+        Safer[key] = (source as unknown as Record<string, unknown>)[key];
+      }
+      expect(typeof Safer.isBuffer).toBe("function");
+      expect((Safer.isBuffer as (v: unknown) => boolean)(Buffer.from("hi"))).toBe(true);
+      expect((Safer.isBuffer as (v: unknown) => boolean)(new Uint8Array(2))).toBe(false);
+      expect(Safer.allocUnsafe).toBeUndefined();
+      expect(String((Safer.from as (s: string) => Buffer)("hi"))).toBe("hi");
+    }
+  });
+
+  it("leaves instances and the prototype alone", () => {
+    const own = Object.keys(Buffer.prototype);
+    expect(own).not.toContain("isBuffer");
+    expect(Object.keys(Buffer.from("ab"))).toEqual(["0", "1"]);
+    expect(Buffer.isBuffer(Buffer.from("x"))).toBe(true);
+    expect(Buffer.concat([Buffer.from("a"), Buffer.from("b")]).toString()).toBe("ab");
+  });
+});
