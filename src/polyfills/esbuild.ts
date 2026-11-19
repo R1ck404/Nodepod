@@ -107,6 +107,7 @@ export interface BundleConfig {
   minify?: boolean;
   sourcemap?: boolean | "inline" | "external";
   external?: string[];
+  packages?: "bundle" | "external";
   write?: boolean;
   plugins?: unknown[];
   absWorkingDir?: string;
@@ -252,7 +253,7 @@ async function buildOn(leased: EsbuildLease, cfg: BundleConfig, write: boolean):
   try {
     const engine = leased.engine;
 
-    const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions);
+    const volumePlugin = createVolumePlugin(cfg.external, cfg.platform, cfg.conditions, cfg.packages);
     const userPlugins = [...(cfg.plugins || [])];
     // volume plugin goes last so other plugins' onLoad handlers run first
     if (volumePlugin) userPlugins.push(volumePlugin);
@@ -951,7 +952,12 @@ function stripNamespacePrefixes(output: BundleOutput): void {
   }
 }
 
-function createVolumePlugin(externals?: string[], platform?: string, conditions?: string[]): unknown {
+function createVolumePlugin(
+  externals?: string[],
+  platform?: string,
+  conditions?: string[],
+  packages?: "bundle" | "external",
+): unknown {
   if (!volumeRef) return null;
   const vol = volumeRef;
 
@@ -983,6 +989,16 @@ function createVolumePlugin(externals?: string[], platform?: string, conditions?
 
       b.onResolve({ filter: /.*/ }, (args) => {
         const { path: raw, importer } = args;
+
+        // Plugin resolution runs before esbuild's package externalization.
+        // Honor it here so packages such as React keep their runtime identity.
+        if (
+          packages === "external" &&
+          args.kind !== "entry-point" &&
+          !/^(?:\.{1,2}(?:\/|$)|\/|#)/.test(raw)
+        ) {
+          return { path: raw, external: true };
+        }
 
         if (raw.endsWith(".node")) {
           return { external: true };

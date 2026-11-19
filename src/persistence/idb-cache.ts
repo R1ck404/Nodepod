@@ -59,6 +59,16 @@ function newVersion(): string {
 function openDB(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
   return new Promise((resolve) => {
+    let settled = false;
+    const settle = (db: IDBDatabase | null): void => {
+      if (settled) {
+        // the open finished after we gave up on it: don't leak the handle
+        try { db?.close(); } catch { /* ignore */ }
+        return;
+      }
+      settled = true;
+      resolve(db);
+    };
     try {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
@@ -67,10 +77,13 @@ function openDB(): Promise<IDBDatabase | null> {
           db.createObjectStore(STORE_NAME);
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
+      req.onsuccess = () => settle(req.result);
+      req.onerror = () => settle(null);
+      // another tab holds an older version open: run without the cache
+      // rather than leaving boot() waiting until that tab closes
+      req.onblocked = () => settle(null);
     } catch {
-      resolve(null);
+      settle(null);
     }
   });
 }

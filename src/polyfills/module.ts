@@ -80,12 +80,9 @@ export function isBuiltin(id: string): boolean {
   // relative and absolute paths are never builtins
   if (c === 46 /* . */ || c === 47 /* / */) return false;
   const set = builtinLookup();
-  if (set.has(stripped)) return true;
-  const slash = stripped.indexOf("/");
-  if (slash !== -1) {
-    return set.has(stripped.slice(0, slash));
-  }
-  return false;
+  // Subpaths are builtins only when listed explicitly. In particular,
+  // punycode/ names the npm package, not the punycode builtin.
+  return set.has(stripped);
 }
 
 export function createRequire(origin: string): (specifier: string) => unknown {

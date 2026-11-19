@@ -1,0 +1,193 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Forge compatibility verification</title>
+<pre id="status">ready</pre>
+<pre id="log"></pre>
+<script type="module">
+  import { Nodepod } from '/dist/index.mjs';
+  window.results = {};
+  const log = (text) => (document.querySelector('#log').textContent += text + '\n');
+  window.runCompatibility = async (routerVersion = '8.4.0', viteVersion = '^8.0.0') => {
+    const response = await fetch('/memory/forge-router-fixture.json');
+    if (!response.ok)
+      throw new Error('Run node tests/browser/prepare-forge-compatibility.mjs before this probe');
+    const files = await response.json();
+    const manifest = JSON.parse(files['/workspace/package.json']);
+    for (const group of ['dependencies', 'devDependencies']) {
+      for (const name of Object.keys(manifest[group])) {
+        if (name === 'react-router' || name.startsWith('@react-router/'))
+          manifest[group][name] = routerVersion;
+        if (name === 'vite') manifest[group][name] = viteVersion;
+      }
+    }
+    files['/workspace/package.json'] = JSON.stringify(manifest);
+    const pod = await Nodepod.boot({
+      files,
+      workdir: '/workspace',
+      watermark: false,
+      serviceWorker: false,
+      preloadEsbuild: false,
+      packageStore: 'memory',
+      sharedVFSBufferSize: 128 * 1024 * 1024,
+    });
+    window.pod = pod;
+    const results = (window.results = {
+      routerVersion,
+      viteVersion,
+      isolation: crossOriginIsolated,
+      sharedMemory: pod.isSharedArrayBufferEnabled,
+      manifest,
+      probes: {},
+    });
+    document.querySelector('#status').textContent = 'running';
+    async function run(name, source) {
+      await pod.fs.writeFile('/workspace/probe.mjs', source);
+      const process = await pod.spawn('node', ['probe.mjs'], { cwd: '/workspace' });
+      const timer = setTimeout(() => process.kill(), 30000);
+      try {
+        results.probes[name] = await process.completion;
+      } finally {
+        clearTimeout(timer);
+      }
+      log(name + ': ' + JSON.stringify(results.probes[name]));
+    }
+    try {
+      await run('version', `console.log(process.version, process.versions.node);`);
+      await run(
+        'node-test',
+        `import test, { test as named } from 'node:test';
+      console.log('default', typeof test, 'named', typeof named, 'equal', test === named);
+      test('minimal', () => {});`,
+      );
+      // Exact published Router imports map, in an isolated virtual package.
+      await pod.fs.writeFile(
+        '/workspace/import-fixture/package.json',
+        JSON.stringify({
+          type: 'module',
+          imports: {
+            '#module-sync-enabled': {
+              default: './module-sync-enabled/false.cjs',
+              'module-sync': './module-sync-enabled/true.mjs',
+            },
+          },
+        }),
+      );
+      await pod.fs.writeFile(
+        '/workspace/import-fixture/module-sync-enabled/false.cjs',
+        'module.exports = false;',
+      );
+      await pod.fs.writeFile(
+        '/workspace/import-fixture/module-sync-enabled/true.mjs',
+        'export default true;',
+      );
+      await pod.fs.writeFile(
+        '/workspace/import-fixture/entry.mjs',
+        `import enabled from '#module-sync-enabled'; export default enabled;`,
+      );
+      await run(
+        'conditional-fixture',
+        `import enabled from './import-fixture/entry.mjs'; console.log('enabled', enabled);`,
+      );
+      log('installing starter dependencies');
+      await pod.packages.installFromManifest('/workspace/package.json', { withDevDeps: true });
+      results.installed = true;
+      await run(
+        'external-package-bundle',
+        `import {build} from 'esbuild'; import {createRequire} from 'node:module';
+      const require=createRequire(import.meta.url);
+      const result=await build({stdin:{contents:"module.exports = require('react');",resolveDir:'/workspace'},bundle:true,write:false,platform:'node',format:'cjs',packages:'external'});
+      const module={exports:{}};
+      new Function('require','module','exports',result.outputFiles[0].text)(require,module,module.exports);
+      if(module.exports!==require('react'))throw new Error('bundled a duplicate external React');
+      console.log('external React identity preserved');
+    `,
+      );
+      await run(
+        'react-identity',
+        `import {createRequire} from 'node:module'; import fs from 'node:fs';
+      const root=createRequire('/workspace/probe.cjs'); const first=root('react');
+      for(const file of ['/workspace/probe.cjs','/workspace/node_modules/react-dom/client.js','/workspace/node_modules/react-dom/cjs/react-dom-client.development.js','/workspace/node_modules/react-router/dist/development/index.mjs']) {
+        const req=createRequire(file); const resolved=req.resolve('react');
+        console.log(file,resolved,req('react').version,req('react')===first);
+      }
+      for(const key of Object.keys(root.cache).filter(key=>/\\/react\\//.test(key)))console.log('react-cache',key);
+    `,
+      );
+      await run(
+        'dependency-files',
+        `import fs from 'node:fs';
+      for (const root of ['/workspace/node_modules','/node_modules']) {
+        console.log(root, fs.existsSync(root) ? fs.readdirSync(root).filter(n => /spdx|punycode/.test(n)) : 'absent');
+        for (const name of ['spdx-expression-parse','spdx-license-ids','punycode']) {
+          const file=root+'/'+name+'/package.json';
+          console.log(file,fs.existsSync(file) ? fs.readFileSync(file,'utf8') : 'absent');
+        }
+      }
+      const root='/workspace/node_modules/@react-router/dev/dist';
+      const index='/workspace/node_modules/@react-router/dev/module-sync-enabled/index.mjs';
+      console.log('router index.mjs',fs.existsSync(index) ? fs.readFileSync(index,'utf8') : 'absent');
+      for (const name of fs.readdirSync(root).filter(n => /\\.[cm]?js$/.test(n))) {
+        const source=fs.readFileSync(root+'/'+name,'utf8');
+        if(source.includes('module-sync-enabled')) {
+          const lines=source.split('\\n'); const index=lines.findIndex(line=>line.includes('module-sync-enabled'));
+          console.log(name,lines.slice(Math.max(0,index-12),index+5).join('\\n'));
+        }
+      }`,
+      );
+      await run(
+        'router-imports',
+        `import {createRequire} from 'node:module'; import fs from 'node:fs';
+      const req = createRequire('/workspace/node_modules/@react-router/dev/dist/probe.cjs');
+      console.log(fs.readFileSync('/workspace/node_modules/@react-router/dev/package.json', 'utf8'));
+      console.log('resolved', req.resolve('#module-sync-enabled')); console.log('value', req('#module-sync-enabled'));`,
+      );
+      // Router 8 no longer depends on these SPDX packages. Check this only
+      // when the installation includes the package that originally failed.
+      if (await pod.fs.exists('/workspace/node_modules/spdx-expression-parse/package.json'))
+        await run(
+          'spdx',
+          `import {createRequire} from 'node:module'; import fs from 'node:fs';
+      const req = createRequire('/workspace/node_modules/spdx-expression-parse/probe.cjs');
+      const file='/workspace/node_modules/spdx-license-ids/index.json';
+      console.log('index.json',fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,'utf8')).length : 'absent');
+      console.log('resolved', req.resolve('spdx-license-ids')); console.log('length', req('spdx-license-ids').length);`,
+        );
+      // Install the actual npm package explicitly to separate resolution from absence.
+      await pod.packages.install('punycode', '2.3.1');
+      results.punycodeManifest = await pod.fs.readFile(
+        '/workspace/node_modules/punycode/package.json',
+        'utf8',
+      );
+      await run(
+        'punycode',
+        `import {createRequire} from 'node:module'; const req=createRequire(import.meta.url);
+      console.log('bare',req.resolve('punycode')); console.log('slash', req.resolve('punycode/'));
+      console.log(req('punycode/').toASCII('mañana.com'));`,
+      );
+      log('running unchanged starter validation');
+      const process = await pod.spawn('sh', ['-c', 'npm run validate']);
+      process.on('output', log);
+      process.on('error', log);
+      const timer = setTimeout(() => process.kill(), 180000);
+      try {
+        results.validation = await process.completion;
+      } finally {
+        clearTimeout(timer);
+      }
+      log('validation: ' + JSON.stringify(results.validation));
+      if (results.validation.exitCode === 0) {
+        results.buildArtifacts = {
+          clientAssets: await pod.fs.readdir('/workspace/build/client/assets'),
+          serverBytes: (await pod.fs.readFile('/workspace/build/server/index.js', 'utf8')).length,
+        };
+      }
+    } catch (error) {
+      results.error = String(error.stack || error);
+      log(results.error);
+    } finally {
+      await pod.teardown();
+      document.querySelector('#status').textContent = 'done';
+    }
+    return results;
+  };
+</script>

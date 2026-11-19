@@ -190,6 +190,9 @@ export class RequestProxy extends EventEmitter {
   private _reservedHostPaths = new Set<string>();
   /** guards pagehide/beforeunload listener registration so reinit doesn't stack them */
   private _farewellInstalled = false;
+  /** removes the navigator.serviceWorker / window listeners initServiceWorker added */
+  private _removeSwListeners: (() => void) | null = null;
+  private _disposed = false;
   /** server-registered etc. that fire before swReady; flushed once the port is up */
   private _pendingSwMessages: Array<{ type: string; data: unknown }> = [];
 
@@ -235,6 +238,51 @@ export class RequestProxy extends EventEmitter {
   /** True after a successful Service Worker registration. */
   get isServiceWorkerReady(): boolean {
     return this.swReady;
+  }
+
+  /** Stop everything this proxy keeps running for the page: the SW
+   *  heartbeat, the WebSocket BroadcastChannel, preview bridges, and the
+   *  service-worker / window listeners. The SW is told to drop this tab's
+   *  routing first. The proxy is unusable afterwards. */
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
+    this._removeSwListeners?.();
+    this._removeSwListeners = null;
+    if (this.channel) {
+      try {
+        this.channel.port1.postMessage({ type: "release-all" });
+      } catch {
+        /* already closed */
+      }
+      this.channel.port1.close();
+      this.channel = null;
+    }
+    if (this._wsBridge) {
+      this._wsBridge.onmessage = null;
+      this._wsBridge.close();
+      this._wsBridge = null;
+    }
+    for (const bridge of [...this._previewBridges.values()]) {
+      try { bridge.dispose("proxy disposed"); } catch { /* ignore */ }
+    }
+    this._previewBridges.clear();
+    for (const bridge of this._externalPreviewBridges.values()) {
+      for (const port of [bridge.requestPort, bridge.relayPort, bridge.statusPort]) {
+        try { port?.close(); } catch { /* ignore */ }
+      }
+    }
+    this._externalPreviewBridges.clear();
+    this._pendingSwMessages.length = 0;
+    this.swReady = false;
+    this._swInitPromise = null;
+    setServerListenCallback(null);
+    setServerCloseCallback(null);
+    this.removeAllListeners();
   }
 
   private _getOrCreateInstance(instanceId: string): InstanceState {
@@ -1312,6 +1360,9 @@ export class RequestProxy extends EventEmitter {
         "Service Worker registration has no active worker after ready",
       );
     }
+    // the last Nodepod tore down while we waited: don't start the heartbeat,
+    // channel and listeners for a proxy nobody uses any more
+    if (this._disposed) return;
 
     this._swAuthToken = crypto.randomUUID();
 
@@ -1369,8 +1420,7 @@ export class RequestProxy extends EventEmitter {
       this._flushPendingSwMessages();
       this._replayServerRegistrationsToSW();
     };
-    navigator.serviceWorker.addEventListener("controllerchange", reinit);
-    navigator.serviceWorker.addEventListener("message", (ev) => {
+    const onSwMessage = (ev: MessageEvent) => {
       if (ev.data?.type === "sw-needs-init") {
         reinit();
         return;
@@ -1385,7 +1435,13 @@ export class RequestProxy extends EventEmitter {
           statusPort: ev.data.statusPort,
         });
       }
-    });
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", reinit);
+    navigator.serviceWorker.addEventListener("message", onSwMessage);
+    const removers: Array<() => void> = [
+      () => navigator.serviceWorker.removeEventListener("controllerchange", reinit),
+      () => navigator.serviceWorker.removeEventListener("message", onSwMessage),
+    ];
 
     // tell the SW to drop this tab's port + instance claims when the page
     // goes away. without this a closed tab leaves stale routing entries and
@@ -1402,7 +1458,17 @@ export class RequestProxy extends EventEmitter {
       window.addEventListener("pagehide", farewell);
       window.addEventListener("beforeunload", farewell);
       this._farewellInstalled = true;
+      removers.push(() => {
+        window.removeEventListener("pagehide", farewell);
+        window.removeEventListener("beforeunload", farewell);
+        this._farewellInstalled = false;
+      });
     }
+    this._removeSwListeners = () => {
+      for (const remove of removers) {
+        try { remove(); } catch { /* ignore */ }
+      }
+    };
 
     this.heartbeat = setInterval(() => {
       this.channel?.port1.postMessage({ type: "keepalive" });
@@ -2153,6 +2219,15 @@ export function getProxyInstance(opts?: ProxyOptions): RequestProxy {
 
 export function resetProxy(): void {
   instance = null;
+}
+
+/** Dispose the page's proxy (if any) and forget it; the next
+ *  getProxyInstance() builds a fresh one. Called when the last Nodepod
+ *  instance tears down. */
+export function disposeProxy(): void {
+  const current = instance;
+  instance = null;
+  current?.dispose();
 }
 
 export default RequestProxy;

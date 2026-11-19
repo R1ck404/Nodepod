@@ -153,6 +153,10 @@ export function resolve(base: string, target: string): string {
 // node, per WHATWG, keeps it all path: file:///home/a.
 export function toNodeFileUrl<T>(input: T): T | string {
   if (typeof input !== "string") return input;
+  // Chromium on Windows treats file:////workspace/... as a UNC host and
+  // drops /workspace from pathname. Guest paths are POSIX, so retain that
+  // segment by canonicalizing redundant leading slashes before parsing.
+  if (/^file:\/{4,}/i.test(input)) return input.replace(/^file:\/{4,}/i, "file:///");
   const m = /^file:(?!\/\/)\/?/i.exec(input);
   return m ? "file:///" + input.slice(m[0].length) : input;
 }

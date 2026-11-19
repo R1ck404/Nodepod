@@ -41,7 +41,13 @@ export interface SpawnEngineConfig extends EngineConfig {
   allowUnsafeEval?: boolean;
 
   // false (default) = main thread, true = Worker, 'auto' = Worker if available
+  // (falls back to the main thread when the worker can't start)
   useWorker?: boolean | 'auto';
+
+  // URL of the WorkerSandbox module worker. Defaults to the
+  // __engine_worker__.js shipped next to the library in dist/; set it when
+  // your bundler doesn't serve that file (copy it into your public assets).
+  workerUrl?: string | URL;
 }
 
 // serialized MemoryVolume for transfer across boundaries

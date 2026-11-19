@@ -6,6 +6,76 @@ import { EventEmitter } from "./events.js";
 import { PassThrough } from "./stream.js";
 import { getRegistry, type Handle } from "../helpers/event-loop.js";
 
+const uncloneable = new WeakSet<object>();
+
+export function markAsUncloneable(value: unknown): void {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return;
+  }
+  if (
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value) ||
+    (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer)
+  ) {
+    return;
+  }
+  uncloneable.add(value);
+}
+
+// Snapshot enumerable properties while checking marks, so the transport's
+// structured clone does not invoke message getters a second time. Leave
+// native cloneable types (buffers, dates, ports, etc.) to the transport.
+export function prepareWorkerMessage(
+  value: unknown,
+  seen = new Map<object, unknown>(),
+): unknown {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return value;
+  }
+  if (uncloneable.has(value)) {
+    throw new DOMException("Cannot clone a marked object", "DataCloneError");
+  }
+  if (seen.has(value)) return seen.get(value);
+  // a transferable port must reach encodeTransfer as the same object
+  if (value instanceof MessagePort) return value;
+  if (value instanceof Map) {
+    const copy = new Map();
+    seen.set(value, copy);
+    for (const [key, item] of value) {
+      copy.set(prepareWorkerMessage(key, seen), prepareWorkerMessage(item, seen));
+    }
+    return copy;
+  }
+  if (value instanceof Set) {
+    const copy = new Set();
+    seen.set(value, copy);
+    for (const item of value) copy.add(prepareWorkerMessage(item, seen));
+    return copy;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (
+    Array.isArray(value) ||
+    prototype === Object.prototype ||
+    prototype === null ||
+    Object.prototype.toString.call(value) === "[object Object]"
+  ) {
+    const copy: Record<string, unknown> | unknown[] = Array.isArray(value)
+      ? new Array(value.length)
+      : {};
+    seen.set(value, copy);
+    for (const key of Object.keys(value)) {
+      Object.defineProperty(copy, key, {
+        value: prepareWorkerMessage((value as Record<string, unknown>)[key], seen),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return copy;
+  }
+  return value;
+}
+
 // shared defaults for main thread; child workers get per-engine overrides via buildResolver
 export let isMainThread = true;
 export let parentPort: MessagePort | null = null;
@@ -240,7 +310,7 @@ MessagePort.prototype.postMessage = function postMessage(
 ): void {
   const host = this._host as HostPort | null;
   if (!host || this._closed) return;
-  const { data, ports } = encodeTransfer(val, transfer);
+  const { data, ports } = encodeTransfer(prepareWorkerMessage(val), transfer);
   host.postMessage({ data, ports }, ports as unknown as Transferable[]);
 };
 MessagePort.prototype.start = function start(this: any): void {
@@ -412,10 +482,12 @@ export const MessageChannel = function MessageChannel(this: any) {
   const p1 = this.port1;
   const p2 = this.port2;
   p1.postMessage = (val: unknown) => {
-    queueMicrotask(() => p2.emit("message", val));
+    const message = prepareWorkerMessage(val);
+    queueMicrotask(() => p2.emit("message", message));
   };
   p2.postMessage = (val: unknown) => {
-    queueMicrotask(() => p1.emit("message", val));
+    const message = prepareWorkerMessage(val);
+    queueMicrotask(() => p1.emit("message", message));
   };
 } as unknown as MessageChannelConstructor;
 
@@ -485,6 +557,10 @@ export const Worker = function Worker(
   this.stdin = null;
   this.stdout = new PassThrough();
   this.stderr = new PassThrough();
+
+  if (opts && "workerData" in opts) {
+    opts = { ...opts, workerData: prepareWorkerMessage(opts.workerData) };
+  }
 
   // if override is installed (napi-rs WASI worker factory), delegate — it handles both WASI workers and fork-based fallback
   if (_workerConstructorOverride) {
@@ -579,7 +655,7 @@ Object.setPrototypeOf(Worker.prototype, EventEmitter.prototype);
 
 Worker.prototype.postMessage = function postMessage(this: any, value: unknown, transferListOrOptions?: unknown): void {
   if (this._handle && !this._terminated) {
-    this._handle.postMessage(value, transferListOrOptions);
+    this._handle.postMessage(prepareWorkerMessage(value), transferListOrOptions);
   }
 };
 
@@ -712,6 +788,7 @@ export function setEnvironmentData(_key: unknown, _val: unknown): void {}
 
 
 export default {
+  markAsUncloneable,
   isMainThread,
   parentPort,
   workerData,

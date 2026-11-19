@@ -46,6 +46,7 @@ export function disposeAllTimers(): void {
     }
     timer._handle.close();
     timer._fired = true;
+    if (timer instanceof Timeout) timer._cleared = true;
   }
   _activeTimers.clear();
 }
@@ -81,6 +82,12 @@ class Timeout implements TimeoutLike {
   _handle: Handle;
   _isInterval: boolean;
   _fired = false;
+  // set by clearTimeout/clearInterval: a cleared timer stays dead, even on
+  // refresh(); a timer that merely fired can be re-armed
+  _cleared = false;
+  // the ref state the user asked for, kept across a refresh() re-arm (a
+  // closed handle always reads as unrefed)
+  _wantRef = true;
   _callback: (...args: unknown[]) => void;
   _args: unknown[];
   _ms: number;
@@ -100,11 +107,13 @@ class Timeout implements TimeoutLike {
   }
 
   ref(): this {
+    this._wantRef = true;
     if (!this._fired) this._handle.ref();
     return this;
   }
 
   unref(): this {
+    this._wantRef = false;
     this._handle.unref();
     return this;
   }
@@ -117,17 +126,21 @@ class Timeout implements TimeoutLike {
   // any pending fire. undici, ws heartbeats, node-fetch, socket.io and many
   // others rely on this; a no-op here breaks those libraries silently.
   refresh(): this {
-    if (this._handle.closed) return this;
+    if (this._cleared) return this;
     if (this._isInterval) {
+      if (this._handle.closed) return this;
       _rawClearInterval(this._id);
       this._id = _rawSetInterval(fireTimeout, this._ms, this);
     } else {
       _rawClearTimeout(this._id);
-      // refresh resurrects a one-shot Timeout: if it already fired we need
-      // to re-register the handle so the loop counts it again.
-      if (this._fired) {
+      // refresh resurrects a one-shot Timeout that already fired (common:
+      // a heartbeat calling this.refresh() from its own callback). Firing
+      // closed its handle, so register a fresh one for the loop to count.
+      if (this._fired || this._handle.closed) {
         this._fired = false;
-        this._handle.ref();
+        this._handle = getRegistry().register(this._handle.type);
+        if (!this._wantRef) this._handle.unref();
+        trackTimer(this);
       }
       this._id = _rawSetTimeout(fireTimeout, this._ms, this);
     }
@@ -214,8 +227,20 @@ let _immediateScheduled = false;
 let _scheduleCheck: () => void;
 if (typeof MessageChannel !== "undefined") {
   const _mc = new MessageChannel();
-  _mc.port1.onmessage = () => _flushImmediates();
-  _scheduleCheck = () => _mc.port2.postMessage(0);
+  const port = _mc.port1 as MessagePort & { ref?(): void; unref?(): void };
+  // Capture native Node methods before browser ports receive guest shims.
+  // The trampoline must not keep a headless host alive while its queue is idle.
+  const ref = port.ref?.bind(port);
+  const unref = port.unref?.bind(port);
+  port.onmessage = () => {
+    _flushImmediates();
+    if (!_immediateScheduled) unref?.();
+  };
+  unref?.();
+  _scheduleCheck = () => {
+    ref?.();
+    _mc.port2.postMessage(0);
+  };
 } else {
   _scheduleCheck = () => queueMicrotask(_flushImmediates);
 }
@@ -308,6 +333,7 @@ export function clearTimeout(t: unknown): void {
   if (t && typeof t === "object" && "_id" in t && "_handle" in t) {
     const timer = t as TimeoutLike;
     untrackTimer(timer);
+    if (timer instanceof Timeout) timer._cleared = true;
     // setImmediate handles use the ImmediateEntry as _id; detect and mark
     const id = timer._id as unknown;
     if (id && typeof id === "object" && "cleared" in (id as object)) {
@@ -326,6 +352,7 @@ export function clearInterval(t: unknown): void {
   if (t && typeof t === "object" && "_id" in t && "_handle" in t) {
     const timer = t as TimeoutLike;
     untrackTimer(timer);
+    if (timer instanceof Timeout) timer._cleared = true;
     _rawClearInterval(timer._id);
     timer._handle.close();
     return;
@@ -477,6 +504,11 @@ export const promises = {
       }),
   },
 };
+
+// util.promisify(setTimeout)(ms, value) resolves with value, like Node
+const kPromisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+(setTimeout as any)[kPromisifyCustom] = promises.setTimeout;
+(setImmediate as any)[kPromisifyCustom] = promises.setImmediate;
 
 export default {
   setTimeout,

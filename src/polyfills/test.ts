@@ -223,7 +223,7 @@ export const mock = {
   },
 };
 
-export default {
+export default Object.assign(it, {
   describe,
   it,
   test: it,
@@ -235,4 +235,4 @@ export default {
   todo,
   mock,
   TestContext,
-};
+});

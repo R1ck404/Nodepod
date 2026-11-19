@@ -391,6 +391,10 @@ interface FsPromisesShape {
   stat(target: PathArg, opts?: StatOptions): Promise<FileStat | undefined>;
   lstat(target: PathArg, opts?: StatOptions): Promise<FileStat | undefined>;
   readdir(target: PathArg): Promise<string[]>;
+  readdir(
+    target: PathArg,
+    opts?: { withFileTypes?: boolean; encoding?: string; recursive?: boolean } | string,
+  ): Promise<string[] | Buffer[] | Dirent[]>;
   mkdir(
     target: PathArg,
     opts?: { recursive?: boolean; mode?: number },
@@ -441,10 +445,10 @@ export interface FsBridge {
     opts?: { recursive?: boolean; mode?: number },
   ): string | undefined;
   readdirSync(target: PathArg): string[];
-  readdirSync(target: PathArg, opts: { withFileTypes: true }): Dirent[];
+  readdirSync(target: PathArg, opts: { withFileTypes: true; recursive?: boolean }): Dirent[];
   readdirSync(
     target: PathArg,
-    opts?: { withFileTypes?: boolean; encoding?: string } | string,
+    opts?: { withFileTypes?: boolean; encoding?: string; recursive?: boolean } | string,
   ): string[] | Buffer[] | Dirent[];
   statSync(target: PathArg, opts?: StatOptions): FileStat | undefined;
   lstatSync(target: PathArg, opts?: StatOptions): FileStat | undefined;
@@ -532,7 +536,7 @@ export interface FsBridge {
   ): void;
   readdir(
     target: string,
-    opts: { withFileTypes?: boolean; encoding?: string } | string,
+    opts: { withFileTypes?: boolean; encoding?: string; recursive?: boolean } | string,
     cb: (err: Error | null, entries?: string[] | Buffer[] | Dirent[]) => void,
   ): void;
   mkdir(
@@ -940,6 +944,34 @@ export function buildFileSystemBridge(
       return Uint8Array.from(data as ArrayLike<number>);
     }
     return new Uint8Array(0);
+  }
+
+  // readdir's result for every API form. With `recursive` (Node 20+), names
+  // are paths relative to dirPath in breadth-first order and Dirents carry
+  // their own parentPath; symlinked directories are listed, not followed.
+  function readdirResult(
+    dirPath: string,
+    o?: { withFileTypes?: boolean; encoding?: string; recursive?: boolean },
+  ): string[] | Buffer[] | Dirent[] {
+    if (!o?.recursive) {
+      const names = volume.readdirSync(dirPath);
+      return o?.withFileTypes ? toDirents(dirPath, names) : encodeReaddirNames(names, o?.encoding);
+    }
+    const dirents: Dirent[] = [];
+    const relNames: string[] = [];
+    const queue: Array<[string, string]> = [[dirPath, ""]];
+    for (let i = 0; i < queue.length; i++) {
+      const [dir, rel] = queue[i];
+      for (const d of toDirents(dir, volume.readdirSync(dir))) {
+        const relName = rel ? rel + "/" + d.name : d.name;
+        if (o.withFileTypes) dirents.push(d);
+        else relNames.push(relName);
+        if (d.isDirectory()) {
+          queue.push([dir.endsWith("/") ? dir + d.name : dir + "/" + d.name, relName]);
+        }
+      }
+    }
+    return o.withFileTypes ? dirents : encodeReaddirNames(relNames, o.encoding);
   }
 
   function encodeReaddirNames(names: string[], encoding?: string): string[] | Buffer[] {
@@ -1674,16 +1706,12 @@ export function buildFileSystemBridge(
     },
     readdir(
       target: unknown,
-      opts?: { withFileTypes?: boolean; encoding?: string } | string,
+      opts?: { withFileTypes?: boolean; encoding?: string; recursive?: boolean } | string,
     ): Promise<string[] | Buffer[] | Dirent[]> {
       try {
         const p = abs(target);
-        const names = volume.readdirSync(p);
         const o = typeof opts === "string" ? { encoding: opts } : opts;
-        if (o?.withFileTypes) {
-          return settledResolve(toDirents(p, names));
-        }
-        return settledResolve(encodeReaddirNames(names, o?.encoding));
+        return settledResolve(readdirResult(p, o));
       } catch (e) {
         return settledReject(e);
       }
@@ -1895,15 +1923,11 @@ export function buildFileSystemBridge(
 
     readdirSync(
       target: unknown,
-      opts?: { withFileTypes?: boolean; encoding?: string } | string,
+      opts?: { withFileTypes?: boolean; encoding?: string; recursive?: boolean } | string,
     ): string[] | Buffer[] | Dirent[] {
       const p = abs(target);
-      const names = volume.readdirSync(p);
       const o = typeof opts === "string" ? { encoding: opts } : opts;
-      if (o?.withFileTypes) {
-        return toDirents(p, names);
-      }
-      return encodeReaddirNames(names, o?.encoding);
+      return readdirResult(p, o);
     },
 
     statSync(target: unknown, opts?: StatOptions): FileStat | undefined {
@@ -2486,7 +2510,7 @@ export function buildFileSystemBridge(
     readdir(
       target: unknown,
       optsOrCb?:
-        | { withFileTypes?: boolean; encoding?: string }
+        | { withFileTypes?: boolean; encoding?: string; recursive?: boolean }
         | string
         | ((err: Error | null, files?: string[] | Buffer[] | Dirent[]) => void),
       cb?: (err: Error | null, files?: string[] | Buffer[] | Dirent[]) => void,
@@ -2503,10 +2527,7 @@ export function buildFileSystemBridge(
       // a synchronous readdir callback can resolve the crawl with an empty
       // file map before any lstat callbacks run.
       try {
-        const names = volume.readdirSync(p);
-        const files = opts?.withFileTypes
-          ? toDirents(p, names)
-          : encodeReaddirNames(names, opts?.encoding);
+        const files = readdirResult(p, opts);
         if (actualCb) deferCallback(() => actualCb(null, files));
       } catch (e) {
         if (actualCb) deferCallback(() => actualCb(e as Error));

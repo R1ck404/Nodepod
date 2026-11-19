@@ -4,6 +4,7 @@ import {
   MessagePort,
   decodeTransfer,
   encodeTransfer,
+  prepareWorkerMessage,
 } from "../polyfills/worker_threads";
 
 // tinypool (Vitest's threads pool) posts a MessagePort to each worker thread.
@@ -82,5 +83,24 @@ describe("worker_threads MessagePort transfer", () => {
     port2.on("message", () => {});
     port1.close();
     await closed;
+  });
+
+  // prepareWorkerMessage snapshots a message before it is posted; it must hand a
+  // port to encodeTransfer as the same object, not as a plain-object copy
+  it("keeps a port's identity through prepareWorkerMessage so it can still be transferred", async () => {
+    const outer = channel();
+    const inner = channel();
+    const message = { port: inner.port2, label: "task", table: new Map([["k", { n: 1 }]]) };
+    const prepared = prepareWorkerMessage(message) as typeof message;
+    expect(prepared.port).toBe(inner.port2);
+    expect(prepared.table).toBeInstanceOf(Map);
+    expect(prepared.table).not.toBe(message.table);
+    outer.port1.postMessage(message, [inner.port2]);
+    const got = (await next(outer.port2)) as { port: MessagePort; label: string; table: Map<string, unknown> };
+    open.push(got.port);
+    expect(got.label).toBe("task");
+    expect(got.table.get("k")).toEqual({ n: 1 });
+    got.port.postMessage("ping");
+    expect(await next(inner.port1)).toBe("ping");
   });
 });

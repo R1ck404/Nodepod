@@ -127,7 +127,7 @@ describe("util", () => {
   it("isBuiltin", () => {
     expect(isBuiltin("fs")).toBe(true);
     expect(isBuiltin("node:fs/promises")).toBe(true);
-    expect(isBuiltin("fs/whatever")).toBe(true);
+    expect(isBuiltin("fs/whatever")).toBe(false);
     expect(isBuiltin("./fs")).toBe(false);
     expect(isBuiltin("/fs")).toBe(false);
     expect(isBuiltin("lodash/debounce")).toBe(false);
@@ -143,17 +143,18 @@ describe("timers", () => {
     t.unref();
     expect(t.hasRef()).toBe(false);
     t.ref();
-    // refresh before it fires re-arms it (after, the one-shot is closed)
+    // refresh before it fires re-arms it; after it fired, refresh runs it
+    // again (real Node prints [1, 2, 1, 2] for this sequence)
     t.refresh();
     await new Promise((r) => setTimeout(r, 30));
     expect(seen).toEqual([1, 2]);
     t.refresh();
     await new Promise((r) => setTimeout(r, 30));
-    expect(seen).toEqual([1, 2]);
+    expect(seen).toEqual([1, 2, 1, 2]);
     const c = nodeSetTimeout(() => seen.push("no"), 5);
     nodeClearTimeout(c);
     await new Promise((r) => setTimeout(r, 20));
-    expect(seen).toEqual([1, 2]);
+    expect(seen).toEqual([1, 2, 1, 2]);
   });
 });
 

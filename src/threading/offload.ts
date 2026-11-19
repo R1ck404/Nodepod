@@ -1,7 +1,7 @@
 // Offload API — routes CPU-heavy tasks (esbuild, tarball extraction, bundling)
 // to a Web Worker pool. Falls back to main-thread if Workers aren't available.
 
-import { WorkerPool } from "./worker-pool.js";
+import { WorkerPool, PoolUnavailableError } from "./worker-pool.js";
 import { TaskQueue } from "./task-queue.js";
 import type {
   OffloadTask,
@@ -61,7 +61,7 @@ function ensurePool(): TaskQueue {
 
   if (!canUseWorkers()) {
     fallbackMode = true;
-    throw new Error("Workers not available");
+    throw new PoolUnavailableError("Workers not available");
   }
 
   pool = new WorkerPool(storedConfig);
@@ -124,6 +124,21 @@ async function gunzip(compressed: Uint8Array): Promise<Uint8Array> {
   return pako.inflate(compressed);
 }
 
+// Same check the extract worker runs: the main-thread path must not accept a
+// tarball the worker just rejected.
+async function verifyShasum(bytes: Uint8Array, expected: string, url: string): Promise<void> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error(`Integrity check failed for ${url}: SHA-1 is unavailable (no crypto.subtle)`);
+  }
+  const hash = new Uint8Array(await subtle.digest("SHA-1", bytes as BufferSource));
+  let hex = "";
+  for (let i = 0; i < hash.length; i++) hex += hash[i].toString(16).padStart(2, "0");
+  if (hex !== expected.toLowerCase()) {
+    throw new Error(`Integrity check failed for ${url}: expected shasum ${expected}, got ${hex}`);
+  }
+}
+
 async function mainThreadExtract(
   task: ExtractTask,
 ): Promise<ExtractResult> {
@@ -141,6 +156,7 @@ async function mainThreadExtract(
     }
     compressed = new Uint8Array(await response.arrayBuffer());
   }
+  if (task.expectedShasum) await verifyShasum(compressed, task.expectedShasum, task.tarballUrl);
   const tarBytes = await gunzip(compressed);
 
   const files: ExtractResult["files"] = [];
@@ -251,11 +267,17 @@ export async function offload<T extends OffloadTask>(
     const q = ensurePool();
     return await q.submit(task) as any;
   } catch (err) {
+    if (!(err instanceof PoolUnavailableError)) {
+      // The task itself failed in the worker. Retry it on the main thread
+      // (which repeats every check, integrity included) but keep the pool:
+      // one bad tarball must not move all later work onto the main thread.
+      return runFallback(task) as any;
+    }
     // Log once so consumers know fallback is active
     if (!fallbackMode) {
       console.debug(
         "[offload] Falling back to main thread:",
-        err instanceof Error ? err.message : err,
+        err.message,
       );
     }
     switchToFallback();
@@ -333,8 +355,8 @@ export async function offloadBatch(
   try {
     const q = ensurePool();
     return await q.submitBatch(tasks);
-  } catch {
-    switchToFallback();
+  } catch (err) {
+    if (err instanceof PoolUnavailableError) switchToFallback();
     return Promise.all(tasks.map((t) => runFallback(t)));
   }
 }

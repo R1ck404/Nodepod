@@ -12,7 +12,13 @@ const pkg = JSON.parse(
 // Identifies this build in persisted caches (see transformSalt in
 // script-engine.ts): one value for the library and the worker bundle.
 const BUILD_ID = `${pkg.version}+${Date.now().toString(36)}`;
-const buildDefines = { __NODEPOD_BUILD_ID__: JSON.stringify(BUILD_ID) };
+// WorkerSandbox's worker, emitted next to the library chunks (relative to
+// the chunk that holds worker-sandbox.ts, which lives in dist/)
+const ENGINE_WORKER_FILE = "__engine_worker__.js";
+const buildDefines = {
+  __NODEPOD_BUILD_ID__: JSON.stringify(BUILD_ID),
+  __NODEPOD_ENGINE_WORKER_FILE__: JSON.stringify("./" + ENGINE_WORKER_FILE),
+};
 // Only peer deps and Node.js builtins are external.
 // Runtime deps (pako, acorn, etc.) are inlined so the bundle is self-contained
 // and works in any environment (bundler, browser, etc.) without extra config.
@@ -40,10 +46,27 @@ function inlineProcessWorkerPlugin() {
   const VIRTUAL_ID = "virtual:process-worker-bundle";
   const RESOLVED_ID = "\0" + VIRTUAL_ID;
   let workerBundle = "";
+  let engineWorkerBundle = "";
 
   return {
     name: "inline-process-worker",
     async buildStart() {
+      // WorkerSandbox (spawnEngine({ useWorker })) loads this as a module
+      // worker; without it the published package had no worker to start
+      const engine = await esbuild({
+        entryPoints: [resolve(__dirname, "src/threading/engine-worker.ts")],
+        bundle: true,
+        format: "esm",
+        platform: "browser",
+        target: "esnext",
+        write: false,
+        minify: process.env.NODEPOD_UNMINIFIED !== "1",
+        define: buildDefines,
+        legalComments: "none",
+        sourcemap: false,
+      });
+      engineWorkerBundle = engine.outputFiles[0].text;
+
       const result = await esbuild({
         entryPoints: [resolve(__dirname, "src/threading/process-worker-entry.ts")],
         bundle: true,
@@ -73,6 +96,11 @@ function inlineProcessWorkerPlugin() {
         type: "asset",
         fileName: "__worker__.js",
         source: workerBundle,
+      });
+      this.emitFile({
+        type: "asset",
+        fileName: ENGINE_WORKER_FILE,
+        source: engineWorkerBundle,
       });
     },
   };

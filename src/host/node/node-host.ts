@@ -30,12 +30,13 @@ export interface NodeHostOptions {
 function resolveDefaultWorkerPath(): string | null {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
-    // dist/host/node/node-host.mjs → dist/__worker__.js
-    // or src/host/node during vitest → walk up to package dist
+    // Only paths inside this package: never the consumer's cwd, whose own
+    // dist/__worker__.js is an unrelated file.
     const candidates = [
-      join(here, "..", "..", "__worker__.js"),
+      // built package: this module is bundled into a chunk in dist/
+      join(here, "__worker__.js"),
+      // src/host/node during vitest → the package's dist
       join(here, "..", "..", "..", "dist", "__worker__.js"),
-      join(process.cwd(), "dist", "__worker__.js"),
     ];
     for (const p of candidates) {
       if (existsSync(p)) return p;
@@ -60,10 +61,12 @@ function loadProcessSource(workerPath: string | null, embedded: boolean): string
   if (!embedded && workerPath && existsSync(workerPath)) {
     return readFileSync(workerPath, "utf8");
   }
-  if (workerPath && existsSync(workerPath)) {
-    return readFileSync(workerPath, "utf8");
+  // embedded requested, or no file: the bundle compiled into the library
+  if (PROCESS_WORKER_BUNDLE_GZIP_BASE64 || !workerPath || !existsSync(workerPath)) {
+    return loadEmbeddedProcessSource();
   }
-  return loadEmbeddedProcessSource();
+  // unbuilt source (vitest) has no embedded copy: the file is all there is
+  return readFileSync(workerPath, "utf8");
 }
 
 export function createNodeHost(opts: NodeHostOptions = {}): RuntimeHost {

@@ -600,6 +600,12 @@ function demoteLexicalRequire(code: string): string {
   return code.replace(/\b(const|let)\s+(require)\s*=/g, "require =");
 }
 
+// A host DOM must stay hidden from Node guest modules. Workers and headless
+// hosts have none: leave those names unbound so a guest-created jsdom remains
+// visible even to functions defined before globalThis.document was assigned.
+const HOST_HAS_BROWSER_GLOBALS =
+  typeof globalThis.window !== "undefined" || typeof globalThis.document !== "undefined";
+
 // Builds the IIFE wrapper that sandboxes user code with shimmed globals
 function buildModuleWrapper(
   code: string,
@@ -616,7 +622,7 @@ function buildModuleWrapper(
     async: isAsync = false,
     useNativePromise = false,
     includeViteVars = true,
-    hideBrowserGlobals = true,
+    hideBrowserGlobals = HOST_HAS_BROWSER_GLOBALS,
     wasmHelpers = false,
     moduleExportName,
   } = opts;
@@ -1736,7 +1742,8 @@ function makeDynamicLoader(resolver: ResolverFn): DynamicLoader {
       if (pending) return pending.then(() => toImportNamespace(record!.exports));
       return new SyncThenable(toImportNamespace(exports));
     }
-    return new SyncThenable(toImportNamespace(resolver(specifier)));
+    const exports = resolver.importSync ? resolver.importSync(specifier) : resolver(specifier);
+    return new SyncThenable(toImportNamespace(exports));
   };
   return Object.assign(load, { Function: makeScopedFunction(load) });
 }
@@ -1818,9 +1825,12 @@ export interface ResolverFn {
   preloadImports: (specifiers: string[]) => Promise<void> | null;
   /**
    * A static import from a module whose body can wait: throws ImportPending
-   * for a module still evaluating. Absent where imports load like require().
+   * for a module still evaluating. Synchronous loaders keep import export
+   * conditions while evaluating the module without an asynchronous wait.
    */
   esm?: (id: string) => unknown;
+  /** Import conditions with synchronous evaluation (de-asynced modules). */
+  importSync?: (id: string) => unknown;
   /**
    * import(): loads `id` like a static import, so top-level await in its
    * graph runs natively. `pending` is set while it is still evaluating.
@@ -1919,7 +1929,7 @@ const CORE_MODULES: Record<string, unknown> = {
   diagnostics_channel: tracePolyfill,
   console: { ...console, Console: consolePolyfill.Console },
   repl: replPolyfill,
-  test: testPolyfill,
+  test: testPolyfill.default,
   trace_events: traceEventsPolyfill,
   wasi: wasiPolyfill,
   sea: seaPolyfill,
@@ -2004,7 +2014,8 @@ const CORE_MODULES: Record<string, unknown> = {
     },
   },
   "dns/promises": dnsPromises,
-  "assert/strict": assertPolyfill,
+  // the strict variant: equal() is ===, deepEqual() is deepStrictEqual()
+  "assert/strict": (assertPolyfill as any).strict,
   "readline/promises": readlinePromises,
   _stream_readable: Readable,
   _stream_writable: Writable,
@@ -2341,7 +2352,9 @@ function buildResolver(
       return stubPath;
     }
 
-    const cacheKey = `${fromDir}|${id}`;
+    // Conditional exports may point import and require at different files.
+    // Share paths across module resolvers, but never across loading modes.
+    const cacheKey = `${fromDir}|${id}|${preferEsm ? "import" : "require"}`;
     const cached = resolveCache.get(cacheKey);
     if (cached !== undefined) {
       if (cached === null) {
@@ -3000,7 +3013,7 @@ function buildResolver(
   // (see loadModule). `resolver` below is typed as ResolverFn only after
   // resolve/cache/extensions/main are attached — defineProperty(main) is
   // invisible to the checker at declaration.
-  const requireFrom = (id: string, viaImport: boolean): unknown => {
+  const requireFrom = (id: string, viaImport: boolean, preferEsm = viaImport): unknown => {
     if (typeof id !== "string") {
       // Match real Node.js error: TypeError with ERR_INVALID_ARG_TYPE code
       const err: any = new TypeError(
@@ -3163,7 +3176,7 @@ function buildResolver(
 
     let resolved: string;
     try {
-      resolved = resolveId(id, baseDir);
+      resolved = resolveId(id, baseDir, preferEsm);
     } catch (resolveErr: any) {
       if (
         resolveErr?.code === "MODULE_NOT_FOUND" &&
@@ -3192,9 +3205,9 @@ function buildResolver(
 
         // Try resolving any of the WASM alternatives (already installed)
         for (const alt of wasmAlts) {
-          resolveCache.delete(`${baseDir}|${alt}`);
+          resolveCache.delete(`${baseDir}|${alt}|${preferEsm ? "import" : "require"}`);
           try {
-            const altResolved = resolveId(alt, baseDir);
+            const altResolved = resolveId(alt, baseDir, preferEsm);
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
           } catch (altErr: any) {
@@ -3235,8 +3248,8 @@ function buildResolver(
         const wasmAlts = [id + "-wasm32-wasi", id + "-wasm"];
         for (const alt of wasmAlts) {
           try {
-            resolveCache.delete(`${baseDir}|${alt}`);
-            const altResolved = resolveId(alt, baseDir);
+            resolveCache.delete(`${baseDir}|${alt}|${preferEsm ? "import" : "require"}`);
+            const altResolved = resolveId(alt, baseDir, preferEsm);
             const altRec = loadModule(altResolved, resolver._ownerRecord);
             return altRec.exports;
           } catch (altErr: any) {
@@ -3309,6 +3322,7 @@ function buildResolver(
   };
 
   const resolver = ((id: string): unknown => requireFrom(id, false)) as ResolverFn;
+  resolver.importSync = (id: string): unknown => requireFrom(id, false, true);
 
   resolver.preloadImports = (specifiers: string[]): Promise<void> | null => {
     let waits: Promise<void>[] | null = null;
@@ -3325,6 +3339,8 @@ function buildResolver(
       if (pending) throw new ImportPending(pending);
       return exports;
     };
+  } else {
+    resolver.esm = resolver.importSync;
   }
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {

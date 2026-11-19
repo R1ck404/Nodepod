@@ -632,7 +632,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     } | undefined;
 
     if (msg.isWorkerThread) {
-      const { MessagePort } = await import("../polyfills/worker_threads.js");
+      const { MessagePort, prepareWorkerMessage } = await import("../polyfills/worker_threads.js");
       const pp = new MessagePort();
       const pendingParentMessages: unknown[] = [];
       const flushParentMessages = () => {
@@ -676,7 +676,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
         return pp;
       }) as typeof pp.prependOnceListener;
       pp.postMessage = (value: unknown, transferList?: readonly unknown[]) => {
-        const { data, ports } = encodeTransfer(value, transferList);
+        const { data, ports } = encodeTransfer(prepareWorkerMessage(value), transferList);
         post({ type: "ipc-message", data, ports: ports as unknown as MessagePort[] }, ports as unknown as Transferable[]);
       };
 

@@ -81,6 +81,12 @@ export function inspect(
     }
     if (kind !== "object") return String(val);
 
+    const customInspect = (val as any)[kInspectCustom];
+    if (typeof customInspect === "function" && customInspect !== inspect) {
+      const out = customInspect.call(val, maxDepth - level, { ...opts, depth: maxDepth - level }, inspect);
+      if (out !== val) return typeof out === "string" ? out : render(out, level);
+    }
+
     if (visited.has(val as object)) return "[Circular]";
     visited.add(val as object);
 
@@ -121,6 +127,8 @@ export function inspect(
 
   return render(target, 0);
 }
+const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+inspect.custom = kInspectCustom;
 
 export function inherits(child: Function, parent: Function): void {
   if (child === undefined || child === null) {
@@ -158,17 +166,39 @@ export function deprecate<T extends Function>(
   return wrapper as unknown as T;
 }
 
+const kPromisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+
 export function promisify<T>(
   fn: (...args: any[]) => void,
 ): (...args: any[]) => Promise<T> {
-  return (...args: any[]) =>
-    new Promise((ok, fail) => {
-      fn(...args, (err: Error | null, result: T) => {
+  if (typeof fn !== "function") {
+    const err = new TypeError('The "original" argument must be of type function');
+    (err as any).code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  // a function can provide its own promise form (exec, setTimeout, ...)
+  const custom = (fn as any)[kPromisifyCustom];
+  if (custom !== undefined) {
+    if (typeof custom !== "function") {
+      const err = new TypeError('The "util.promisify.custom" argument must be of type function');
+      (err as any).code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    return custom;
+  }
+  const promisified = function (this: unknown, ...args: any[]): Promise<T> {
+    return new Promise((ok, fail) => {
+      fn.call(this, ...args, (err: Error | null, result: T) => {
         if (err) fail(err);
         else ok(result);
       });
     });
+  };
+  Object.setPrototypeOf(promisified, Object.getPrototypeOf(fn));
+  Object.defineProperty(promisified, kPromisifyCustom, { value: promisified, configurable: true });
+  return promisified;
 }
+promisify.custom = kPromisifyCustom;
 
 export function callbackify<T>(
   fn: (...args: any[]) => Promise<T>,

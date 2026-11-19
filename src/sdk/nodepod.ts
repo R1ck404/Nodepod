@@ -4,6 +4,7 @@ import { collectBinarySnapshotParts, saveSnapshotParts } from "../persistence/bi
 import {
   RequestProxy,
   getProxyInstance,
+  disposeProxy,
   NodepodSWSetupError,
   markTransferable,
   type IVirtualServer,
@@ -1245,6 +1246,9 @@ export class Nodepod {
       disposeEsbuild();
       getWorkerTransformCache().clear();
       ProcessManager.disposeGlobalResources();
+      // the SW heartbeat, WS BroadcastChannel and SW listeners outlive every
+      // instance otherwise; the next boot() builds a fresh proxy
+      disposeProxy();
     }
     await ingressStopped?.catch(() => {});
     await persistenceClosed;

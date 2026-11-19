@@ -17,6 +17,7 @@ import {
   ProcessExitSentinel,
   type Handle,
 } from "./../helpers/event-loop.js";
+import { constants as osConstants } from "./os.js";
 
 // capture before engine wrapper overrides globalThis.console
 const _nativeConsole = console;
@@ -572,6 +573,29 @@ export function setStreamDimensions(
   return stream._setSize(cols, rows);
 }
 
+// process.kill(pid) for a pid other than our own. child_process registers a
+// router for the children it spawned; it returns null for a pid it doesn't
+// know, which process.kill reports as ESRCH like Node.
+type KillRouter = (pid: number, signal: string | 0) => boolean | null;
+let _killRouter: KillRouter | null = null;
+export function setProcessKillRouter(router: KillRouter | null): void {
+  _killRouter = router;
+}
+
+function normalizeKillSignal(signal: string | number | undefined): string | 0 {
+  if (signal === undefined) return "SIGTERM";
+  if (signal === 0) return 0;
+  const signals = osConstants.signals as Record<string, number>;
+  if (typeof signal === "number") {
+    for (const name in signals) if (signals[name] === signal) return name;
+  } else if (typeof signal === "string" && signal in signals) {
+    return signal;
+  }
+  const err = new TypeError(`Unknown signal: ${String(signal)}`);
+  (err as any).code = "ERR_UNKNOWN_SIGNAL";
+  throw err;
+}
+
 export function buildProcessEnv(config?: {
   cwd?: string;
   env?: ProcessEnvVars;
@@ -790,12 +814,31 @@ export function buildProcessEnv(config?: {
       throw new Error("process.abort() called");
     },
 
-    kill(_pid: number, _signal?: string | number) {
-      // Emit the signal on this process so listeners (e.g. nodemon) can
-      // react to SIGINT / SIGUSR2 etc. just like real Node.js.
-      const sig = typeof _signal === "string" ? _signal : "SIGTERM";
-      bus.emit(sig);
-      return true;
+    kill(pid: number, signal?: string | number) {
+      const target = Number(pid);
+      if (typeof pid !== "number" && typeof pid !== "string" || !Number.isInteger(target)) {
+        const err = new TypeError(`The "pid" argument must be of type number. Received ${String(pid)}`);
+        (err as any).code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
+      // 0 is the "does it exist" probe: checks only, delivers nothing
+      const sig = normalizeKillSignal(signal);
+      const self = Number(proc.pid);
+      if (target === self || target === 0 || target === -self) {
+        // Emit the signal on this process so listeners (e.g. nodemon) can
+        // react to SIGINT / SIGUSR2 etc. just like real Node.js.
+        if (sig !== 0) bus.emit(sig);
+        return true;
+      }
+      const routed = _killRouter?.(target, sig);
+      if (routed == null) {
+        const err = new Error(`kill ESRCH`) as Error & { code: string; errno: number; syscall: string };
+        err.code = "ESRCH";
+        err.errno = -3;
+        err.syscall = "kill";
+        throw err;
+      }
+      return routed;
     },
 
     umask(mask?: number) {

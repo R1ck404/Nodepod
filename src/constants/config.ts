@@ -5,8 +5,10 @@
 // ---------------------------------------------------------------------------
 
 export const VERSIONS = {
-  NODE: "v22.12.0",
-  NODE_BARE: "22.12.0",
+  // Guest JavaScript compatibility target; the browser supplies the actual
+  // engine. Keep both forms aligned for framework and package-manager checks.
+  NODE: "v22.22.0",
+  NODE_BARE: "22.22.0",
   NPM: "10.0.0",
   PNPM: "9.15.4",
   YARN: "4.6.0",
@@ -66,6 +68,7 @@ export const MAIN_FIELD_EXTENSIONS = [
 
 export const INDEX_FILES = [
   "index.js",
+  "index.json",
   "index.ts",
   "index.tsx",
   "index.mjs",

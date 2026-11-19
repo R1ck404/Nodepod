@@ -100,61 +100,154 @@ export async function preloadBrotli(): Promise<boolean> {
 
 type CompressCallback = (err: Error | null, result: Buffer) => void;
 
-export function gzip(input: Buffer | string, cb: CompressCallback): void {
+// Node zlib options that pako understands under the same names
+interface ZlibOptions {
+  level?: number;
+  windowBits?: number;
+  memLevel?: number;
+  strategy?: number;
+  dictionary?: ArrayBufferView | ArrayBuffer;
+  chunkSize?: number;
+}
+
+function toBytes(input: unknown): Uint8Array {
+  if (typeof input === "string") return Buffer.from(input);
+  if (input instanceof Uint8Array) return input;
+  if (input instanceof ArrayBuffer) return new Uint8Array(input);
+  if (ArrayBuffer.isView(input)) {
+    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
+  const err = new TypeError(
+    'The "buffer" argument must be of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer.',
+  ) as TypeError & { code: string };
+  err.code = "ERR_INVALID_ARG_TYPE";
+  throw err;
+}
+
+function pakoOptions(opts: unknown): Record<string, unknown> | undefined {
+  if (!opts || typeof opts !== "object") return undefined;
+  const o = opts as ZlibOptions;
+  const out: Record<string, unknown> = {};
+  if (o.level !== undefined) out.level = o.level;
+  if (o.windowBits !== undefined) out.windowBits = o.windowBits;
+  if (o.memLevel !== undefined) out.memLevel = o.memLevel;
+  if (o.strategy !== undefined) out.strategy = o.strategy;
+  if (o.chunkSize !== undefined) out.chunkSize = o.chunkSize;
+  if (o.dictionary !== undefined) out.dictionary = toBytes(o.dictionary);
+  return out;
+}
+
+// pako throws message strings for corrupt input; Node throws Errors with a
+// zlib code
+function zlibError(e: unknown): Error {
+  if (e instanceof Error) return e;
+  const err = new Error(String(e)) as Error & { code: string; errno: number };
+  err.code = "Z_DATA_ERROR";
+  err.errno = -3;
+  return err;
+}
+
+// gzip or zlib-wrapped deflate, by the header (zlib.unzip)
+function unzipBytes(data: Uint8Array, opts?: Record<string, unknown>): Uint8Array {
+  return data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b
+    ? pako.ungzip(data, opts)
+    : pako.inflate(data, opts);
+}
+
+type PakoOp = (data: Uint8Array, opts?: Record<string, unknown>) => Uint8Array;
+
+function runSync(op: PakoOp, input: unknown, opts: unknown): Buffer {
+  const data = toBytes(input);
   try {
-    const data = typeof input === "string" ? Buffer.from(input) : input;
-    const compressed = pako.gzip(data);
-    cb(null, Buffer.from(compressed));
+    return Buffer.from(op(data, pakoOptions(opts)));
   } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
+    throw zlibError(e);
   }
 }
 
-export function gunzip(input: Buffer, cb: CompressCallback): void {
-  try {
-    const decompressed = pako.ungzip(input);
-    cb(null, Buffer.from(decompressed));
-  } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
+// Node's one-shot callback APIs: (input[, options], callback), and the
+// callback always runs asynchronously, never inside the call
+function runAsync(op: PakoOp, input: unknown, optsOrCb: unknown, cb: unknown): void {
+  const callback = (typeof optsOrCb === "function" ? optsOrCb : cb) as CompressCallback | undefined;
+  if (typeof callback !== "function") {
+    const err = new TypeError('The "callback" argument must be of type function') as TypeError & { code: string };
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
   }
+  const opts = typeof optsOrCb === "function" ? undefined : optsOrCb;
+  let result: Buffer | null = null;
+  let error: Error | null = null;
+  try {
+    result = runSync(op, input, opts);
+  } catch (e) {
+    error = zlibError(e);
+  }
+  const opHandle = getRegistry().register("WASMWork");
+  queueMicrotask(() => {
+    try {
+      if (error) callback(error, undefined as unknown as Buffer);
+      else callback(null, result!);
+    } finally {
+      opHandle.close();
+    }
+  });
 }
 
-export function deflate(input: Buffer | string, cb: CompressCallback): void {
-  try {
-    const data = typeof input === "string" ? Buffer.from(input) : input;
-    const compressed = pako.deflate(data);
-    cb(null, Buffer.from(compressed));
-  } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
-  }
+const opGzip: PakoOp = (d, o) => pako.gzip(d, o);
+const opGunzip: PakoOp = (d, o) => pako.ungzip(d, o);
+const opDeflate: PakoOp = (d, o) => pako.deflate(d, o);
+const opInflate: PakoOp = (d, o) => pako.inflate(d, o);
+const opDeflateRaw: PakoOp = (d, o) => pako.deflateRaw(d, o);
+const opInflateRaw: PakoOp = (d, o) => pako.inflateRaw(d, o);
+const opUnzip: PakoOp = (d, o) => unzipBytes(d, o);
+
+export function gzip(input: Buffer | string, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opGzip, input, optsOrCb, cb);
 }
 
-export function inflate(input: Buffer, cb: CompressCallback): void {
-  try {
-    const decompressed = pako.inflate(input);
-    cb(null, Buffer.from(decompressed));
-  } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
-  }
+export function gunzip(input: Buffer, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opGunzip, input, optsOrCb, cb);
 }
 
-export function deflateRaw(input: Buffer | string, cb: CompressCallback): void {
-  try {
-    const data = typeof input === "string" ? Buffer.from(input) : input;
-    const compressed = pako.deflateRaw(data);
-    cb(null, Buffer.from(compressed));
-  } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
-  }
+export function deflate(input: Buffer | string, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opDeflate, input, optsOrCb, cb);
 }
 
-export function inflateRaw(input: Buffer, cb: CompressCallback): void {
-  try {
-    const decompressed = pako.inflateRaw(input);
-    cb(null, Buffer.from(decompressed));
-  } catch (e) {
-    cb(e as Error, Buffer.alloc(0));
+export function inflate(input: Buffer, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opInflate, input, optsOrCb, cb);
+}
+
+export function deflateRaw(input: Buffer | string, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opDeflateRaw, input, optsOrCb, cb);
+}
+
+export function inflateRaw(input: Buffer, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opInflateRaw, input, optsOrCb, cb);
+}
+
+export function unzip(input: Buffer, optsOrCb?: ZlibOptions | CompressCallback, cb?: CompressCallback): void {
+  runAsync(opUnzip, input, optsOrCb, cb);
+}
+
+export function unzipSync(input: Buffer, opts?: ZlibOptions): Buffer {
+  return runSync(opUnzip, input, opts);
+}
+
+// zlib.crc32(data[, value]): CRC-32 (IEEE), continuing from `value`
+let crcTable: Uint32Array | null = null;
+export function crc32(data: string | ArrayBufferView, value = 0): number {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
   }
+  const bytes = toBytes(data);
+  let crc = (value ^ 0xffffffff) >>> 0;
+  for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 
@@ -222,31 +315,28 @@ export function brotliDecompress(
 }
 
 
-export function gzipSync(input: Buffer | string): Buffer {
-  const data = typeof input === "string" ? Buffer.from(input) : input;
-  return Buffer.from(pako.gzip(data));
+export function gzipSync(input: Buffer | string, opts?: ZlibOptions): Buffer {
+  return runSync(opGzip, input, opts);
 }
 
-export function gunzipSync(input: Buffer): Buffer {
-  return Buffer.from(pako.ungzip(input));
+export function gunzipSync(input: Buffer, opts?: ZlibOptions): Buffer {
+  return runSync(opGunzip, input, opts);
 }
 
-export function deflateSync(input: Buffer | string): Buffer {
-  const data = typeof input === "string" ? Buffer.from(input) : input;
-  return Buffer.from(pako.deflate(data));
+export function deflateSync(input: Buffer | string, opts?: ZlibOptions): Buffer {
+  return runSync(opDeflate, input, opts);
 }
 
-export function inflateSync(input: Buffer): Buffer {
-  return Buffer.from(pako.inflate(input));
+export function inflateSync(input: Buffer, opts?: ZlibOptions): Buffer {
+  return runSync(opInflate, input, opts);
 }
 
-export function deflateRawSync(input: Buffer | string): Buffer {
-  const data = typeof input === "string" ? Buffer.from(input) : input;
-  return Buffer.from(pako.deflateRaw(data));
+export function deflateRawSync(input: Buffer | string, opts?: ZlibOptions): Buffer {
+  return runSync(opDeflateRaw, input, opts);
 }
 
-export function inflateRawSync(input: Buffer): Buffer {
-  return Buffer.from(pako.inflateRaw(input));
+export function inflateRawSync(input: Buffer, opts?: ZlibOptions): Buffer {
+  return runSync(opInflateRaw, input, opts);
 }
 
 export function brotliCompressSync(
@@ -987,11 +1077,11 @@ export const constants = {
 };
 
 function promisifyZlib(
-  fn: (input: any, cb: CompressCallback) => void,
-): (input: Buffer | string) => Promise<Buffer> {
-  return (input: Buffer | string) =>
+  fn: (input: any, optsOrCb: any, cb?: CompressCallback) => void,
+): (input: Buffer | string, opts?: unknown) => Promise<Buffer> {
+  return (input: Buffer | string, opts?: unknown) =>
     new Promise((resolve, reject) => {
-      fn(input, (err, result) => {
+      fn(input, opts ?? {}, (err, result) => {
         if (err) reject(err);
         else resolve(result);
       });
@@ -1000,15 +1090,14 @@ function promisifyZlib(
 
 export const promises = {
   gzip: promisifyZlib(gzip),
-  gunzip: promisifyZlib(gunzip as (input: any, cb: CompressCallback) => void),
+  gunzip: promisifyZlib(gunzip),
   deflate: promisifyZlib(deflate),
-  inflate: promisifyZlib(inflate as (input: any, cb: CompressCallback) => void),
+  inflate: promisifyZlib(inflate),
   deflateRaw: promisifyZlib(deflateRaw),
-  inflateRaw: promisifyZlib(inflateRaw as (input: any, cb: CompressCallback) => void),
+  inflateRaw: promisifyZlib(inflateRaw),
+  unzip: promisifyZlib(unzip),
   brotliCompress: promisifyZlib(brotliCompress),
-  brotliDecompress: promisifyZlib(
-    brotliDecompress as (input: any, cb: CompressCallback) => void,
-  ),
+  brotliDecompress: promisifyZlib(brotliDecompress),
 };
 
 export default {
@@ -1018,6 +1107,7 @@ export default {
   inflate,
   deflateRaw,
   inflateRaw,
+  unzip,
   brotliCompress,
   brotliDecompress,
   gzipSync,
@@ -1026,6 +1116,8 @@ export default {
   inflateSync,
   deflateRawSync,
   inflateRawSync,
+  unzipSync,
+  crc32,
   brotliCompressSync,
   brotliDecompressSync,
   preloadBrotli,

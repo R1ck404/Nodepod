@@ -68,11 +68,18 @@ export async function spawnEngine(
 
   if (shouldUseWorker) {
     const worker = new WorkerSandbox(vol, engineCfg);
-    await worker.execute('/* worker ready check */', '/__worker_init__.js');
-    return worker;
+    try {
+      await worker.execute('/* worker ready check */', '/__worker_init__.js');
+      return worker;
+    } catch (err) {
+      worker.terminate();
+      // 'auto' means "a worker if one can run here": use the main thread
+      if (useWorker !== 'auto') throw err;
+    }
   }
 
-  return new SyncEngineAdapter(vol, engineCfg);
+  const { workerUrl: _workerUrl, ...mainThreadCfg } = engineCfg;
+  return new SyncEngineAdapter(vol, mainThreadCfg);
 }
 
 // ---- Process-worker engine adapter ----

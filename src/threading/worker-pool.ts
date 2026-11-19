@@ -16,6 +16,8 @@ interface PooledWorker {
   busy: boolean;
   initialized: boolean;
   initPromise: Promise<void> | null;
+  initTimer: ReturnType<typeof setTimeout> | null;
+  cancelInit: ((error: Error) => void) | null;
   lastUsed: number;
   id: number;
 }
@@ -23,6 +25,16 @@ interface PooledWorker {
 interface WaitEntry {
   resolve: (result: { worker: PooledWorker; release: () => void }) => void;
   reject: (err: Error) => void;
+}
+
+// Thrown when the pool cannot run tasks at all (no Worker support, CSP, init
+// failure, disposed). Callers fall back to the main thread for good only on
+// this error; a task's own failure (bad tarball, HTTP error) is not one.
+export class PoolUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolUnavailableError";
+  }
 }
 
 // --- WorkerPool ---
@@ -57,8 +69,8 @@ export class WorkerPool {
 
   // Returns a worker + release callback. Caller MUST call release() when done.
   async acquire(): Promise<{ worker: PooledWorker; release: () => void }> {
-    if (this.disposed) throw new Error("WorkerPool is disposed");
-    if (this.broken) throw new Error("WorkerPool is broken — Workers unavailable");
+    if (this.disposed) throw new PoolUnavailableError("WorkerPool is disposed");
+    if (this.broken) throw new PoolUnavailableError("WorkerPool is broken — Workers unavailable");
 
     // Try idle initialized worker first
     const idle = this.workers.find((w) => !w.busy && w.initialized);
@@ -75,7 +87,7 @@ export class WorkerPool {
         // Construction failed — mark pool as broken
         this.broken = true;
         this.rejectAllWaiters();
-        throw new Error("WorkerPool is broken — Worker construction failed");
+        throw new PoolUnavailableError("WorkerPool is broken — Worker construction failed");
       }
 
       pooled.busy = true;
@@ -89,7 +101,7 @@ export class WorkerPool {
           this.terminateWorker(pooled);
           this.broken = true;
           this.rejectAllWaiters();
-          throw new Error(
+          throw new PoolUnavailableError(
             `WorkerPool is broken — Worker init failed: ${err instanceof Error ? err.message : err}`,
           );
         }
@@ -138,7 +150,7 @@ export class WorkerPool {
 
   private rejectAllWaiters(): void {
     for (const entry of this.waitQueue) {
-      entry.reject(new Error("WorkerPool is no longer available"));
+      entry.reject(new PoolUnavailableError("WorkerPool is no longer available"));
     }
     this.waitQueue.length = 0;
   }
@@ -171,6 +183,8 @@ export class WorkerPool {
         busy: false,
         initialized: false,
         initPromise: null,
+        initTimer: null,
+        cancelInit: null,
         lastUsed: Date.now(),
         id,
       };
@@ -180,10 +194,19 @@ export class WorkerPool {
       if (this.config.warmUpOnCreate) {
         const INIT_TIMEOUT = TIMEOUTS.WORKER_INIT_TIMEOUT;
         const initCall = endpoint.init();
-        const timeout = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Worker init timed out")), INIT_TIMEOUT),
-        );
+        const timeout = new Promise<never>((_, reject) => {
+          pooled.cancelInit = reject;
+          pooled.initTimer = setTimeout(
+            () => reject(new Error("Worker init timed out")),
+            INIT_TIMEOUT,
+          );
+        });
         pooled.initPromise = Promise.race([initCall, timeout])
+          .finally(() => {
+            if (pooled.initTimer !== null) clearTimeout(pooled.initTimer);
+            pooled.initTimer = null;
+            pooled.cancelInit = null;
+          })
           .then(() => {
             pooled.initialized = true;
             pooled.initPromise = null;
@@ -225,7 +248,13 @@ export class WorkerPool {
 
   private terminateWorker(pooled: PooledWorker): void {
     const idx = this.workers.indexOf(pooled);
-    if (idx >= 0) this.workers.splice(idx, 1);
+    if (idx < 0) return;
+    if (pooled.initTimer !== null) clearTimeout(pooled.initTimer);
+    pooled.initTimer = null;
+    const cancelInit = pooled.cancelInit;
+    pooled.cancelInit = null;
+    cancelInit?.(new Error("Worker terminated during initialization"));
+    this.workers.splice(idx, 1);
     try {
       pooled.thread.terminate();
     } catch {

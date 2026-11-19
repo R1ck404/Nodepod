@@ -33,6 +33,7 @@ import { format as utilFormat, stripVTControlCharacters } from "./util.js";
 import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config.js";
 import { closeAllServers, getAllServers } from "./http.js";
 import { disposeAllTimers } from "./timers.js";
+import { setProcessKillRouter } from "./process.js";
 import type { SyncChannelWorker } from "../threading/sync-channel.js";
 import {
   hasGlobalFlag,
@@ -3005,6 +3006,10 @@ export const promises = {
   },
 };
 
+// util.promisify(exec)/(execFile) resolve with { stdout, stderr }, like Node
+(exec as any)[Symbol.for("nodejs.util.promisify.custom")] = promises.exec;
+(execFile as any)[Symbol.for("nodejs.util.promisify.custom")] = promises.execFile;
+
 export function fork(
   modulePath: string,
   argsOrOpts?: string[] | Record<string, unknown>,
@@ -3134,10 +3139,27 @@ interface ShellProcessConstructor {
   prototype: any;
 }
 
+// children this process spawned that are still running, by the pid their
+// ChildProcess reports, so process.kill(child.pid, sig) reaches them
+const _liveChildren = new Map<number, ShellProcess>();
+setProcessKillRouter((pid, signal) => {
+  const child = _liveChildren.get(pid);
+  if (!child || child.exitCode !== null) return null;
+  if (signal === 0) return true;
+  return child.kill(signal);
+});
+
 export const ShellProcess = function ShellProcess(this: any) {
   if (!this) return;
   EventEmitter.call(this);
   this.pid = MOCK_PID.BASE + Math.floor(Math.random() * MOCK_PID.RANGE);
+  const registeredPid = this.pid;
+  _liveChildren.set(registeredPid, this);
+  const forget = () => {
+    if (_liveChildren.get(registeredPid) === this) _liveChildren.delete(registeredPid);
+  };
+  this.once("exit", forget);
+  this.once("close", forget);
   this.connected = false;
   this.killed = false;
   this.exitCode = null;
