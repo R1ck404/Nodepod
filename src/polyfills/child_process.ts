@@ -2207,7 +2207,10 @@ export function exec(
   const cwd = options.cwd ?? getShellCwd();
   const env = (options.env as Record<string, string>) ?? undefined;
 
-  // run inline via NodepodShell -- only fork() gets a dedicated worker
+  // run inline via NodepodShell -- only fork() gets a dedicated worker. A
+  // ChildProcess handle keeps the process alive until the callback has run,
+  // as in Node; without it a command that waits on I/O lost its callback.
+  const handle = getRegistry().register("ChildProcess");
   _shell.exec(command, { cwd, env }).then(
     (result) => {
       const { stdout, stderr, exitCode } = result;
@@ -2232,7 +2235,7 @@ export function exec(
       child.emit("error", e instanceof Error ? e : new Error(String(e)));
       if (done) done(e instanceof Error ? e : new Error(String(e)), "", "");
     },
-  );
+  ).finally(() => handle.close());
 
   return child;
 }
