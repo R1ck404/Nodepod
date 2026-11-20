@@ -7,14 +7,20 @@
 // killed slow async startups. the Handle-Registry rework (event-loop.ts)
 // swapped that out for a libuv-parity drain-promise model; these guard it.
 
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeAll, describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as nativeTimers from "node:timers";
 import { spawnSync as nativeSpawnSync } from "node:child_process";
 import { MemoryVolume } from "../memory-volume";
 import {
   executeNodeBinary,
   initShellExec,
+  setSpawnChildCallback,
 } from "../polyfills/child_process";
 import type { ShellContext } from "../shell/shell-types";
+import { setChildProcessPolyfill } from "../script-engine";
 
 function setup(files: Record<string, string>, opts: { cwd?: string; env?: Record<string, string> } = {}) {
   const vol = new MemoryVolume();
@@ -135,6 +141,30 @@ describe("exit semantics - libuv-parity", () => {
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("bye");
       expect(elapsed).toBeLessThan(200);
+    });
+  });
+
+  describe("child processes keep the loop alive", () => {
+    // scripts get the child_process polyfill, as in a process worker
+    beforeAll(async () => setChildProcessPolyfill(await import("../polyfills/child_process")));
+    afterEach(() => setSpawnChildCallback(null));
+
+    it("runs the exec callback of a node child before exiting, as in Node", async () => {
+      const source = `require('child_process').exec('node child.js', (err, out) => console.log(err ? 'error' : 'got ' + out.trim()));`;
+      const dir = mkdtempSync(join(tmpdir(), "nodepod-exec-"));
+      writeFileSync(join(dir, "child.js"), "setTimeout(() => console.log('done'), 200);");
+      const native = nativeSpawnSync(process.execPath, ["-e", source], { cwd: dir, encoding: "utf8" });
+      rmSync(dir, { recursive: true, force: true });
+      expect(native.stdout).toBe("got done\n");
+
+      // the child runs in another worker: nothing in this process's loop waits for it
+      setSpawnChildCallback(() =>
+        new Promise((resolve) => nativeTimers.setTimeout(() => resolve({ pid: 2, exitCode: 0, stdout: "done\n", stderr: "" }), 200)),
+      );
+      const { ctx } = setup({ "/exec.js": source, "/child.js": "" });
+      const r = await executeNodeBinary("/exec.js", [], ctx);
+      expect(r.stdout).toBe(native.stdout);
+      expect(r.exitCode).toBe(0);
     });
   });
 
