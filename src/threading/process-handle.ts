@@ -125,6 +125,9 @@ export class ProcessHandle extends EventEmitter {
   }
 
   endStdin(): void {
+    // Children that inherit this stdin see it end too
+    this.emit("stdin-end-forward");
+
     if (!this.workerExited && !this.syncBlocked) {
       this.postMessage({ type: "stdin", data: "", end: true });
     }

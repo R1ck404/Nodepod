@@ -169,6 +169,52 @@ describe("node headless host", () => {
     await pod.teardown();
   }, 60_000);
 
+  it("ends stdin with endStdin(), for the process and for a child that inherits it", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+
+    // Native Node prints "got a,b" and "ended" for `printf 'a\nb\n' | node read.js`.
+    const pod = await Nodepod.boot({
+      workdir: "/home",
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/home/app/read.js": [
+          "let text = '';",
+          "process.stdin.setEncoding('utf8');",
+          "process.stdin.on('data', (chunk) => (text += chunk));",
+          "process.stdin.on('end', () => console.log('got ' + text.trim().split('\\n').join(',') + '\\nended'));",
+        ].join("\n"),
+      },
+    });
+
+    const readAll = async (cmd: string, args: string[]) => {
+      const proc = await pod.spawn(cmd, args, { cwd: "/home/app" });
+      await new Promise((r) => setTimeout(r, 300));
+      proc.write("a\n");
+      proc.write("b\n");
+      proc.endStdin();
+      return Promise.race([
+        proc.completion,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${cmd} did not exit after endStdin()`)), 10_000)),
+      ]);
+    };
+
+    const direct = await readAll("node", ["read.js"]);
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdout).toBe("got a,b\nended\n");
+    // Through the shell: `node` is a child of `sh` that inherits its stdin.
+    const viaShell = await readAll("sh", ["-c", "node read.js"]);
+    expect(viaShell.exitCode).toBe(0);
+    expect(viaShell.stdout).toBe("got a,b\nended\n");
+    await pod.teardown();
+  }, 60_000);
+
   it("preserves compiled WASM memory requirements through workerData and return messages", async () => {
     setRuntimeHost(createNodeHost({ workerPath }));
     // env.memory: shared, 32-page minimum, 65536-page maximum.

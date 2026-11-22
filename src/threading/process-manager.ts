@@ -931,6 +931,14 @@ export class ProcessManager extends EventEmitter {
       }
     });
 
+    handle.on("stdin-end-forward", () => {
+      for (const childPid of this._childPids.get(handle.pid) ?? []) {
+        if (!this._inheritStdinChildren.has(childPid)) continue;
+        const childHandle = this._processes.get(childPid);
+        if (childHandle && childHandle.state !== "exited") childHandle.endStdin();
+      }
+    });
+
     handle.on("resize", (cols: number, rows: number) => {
       const children = this._childPids.get(handle.pid);
       if (!children) return;
