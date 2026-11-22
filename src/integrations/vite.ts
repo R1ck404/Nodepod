@@ -34,12 +34,20 @@ export default function nodepod(
   // Rollup asset names are relative to outDir, so drop the leading slash.
   const assetFileName = swPath.replace(/^\/+/, "");
 
-  return {
+  const plugin: Plugin = {
     name: "nodepod",
     configureServer(server) {
+      // `vite preview` runs this too. Vite applies the site's headers
+      // (COOP/COEP) only to files it serves itself, so set them here first:
+      // the preview bridge is framed by a cross-origin-isolated page.
+      const isDev = !!(server as { transformRequest?: unknown }).transformRequest;
+      const siteHeaders = (isDev ? server.config?.server.headers : server.config?.preview.headers) ?? {};
       // Match on the path alone so the SDK's `?v=${Date.now()}` cache-buster
       // still hits this handler.
       server.middlewares.use(async (req, res, next) => {
+        for (const [k, v] of Object.entries(siteHeaders)) {
+          if (v !== undefined) res.setHeader(k, v);
+        }
         const url = req.url?.split("?")[0];
         const hostname = String(req.headers?.host ?? "").replace(/:\d+$/, "");
         const isPreviewHost =
@@ -126,6 +134,11 @@ export default function nodepod(
         }
       });
     },
+    // The build's static copies of the bridge lack its headers (CORP) and the
+    // preview-host bootstrap, so `vite preview` uses the same handler.
+    configurePreviewServer(server) {
+      (plugin.configureServer as (server: unknown) => void)(server);
+    },
     async generateBundle() {
       const source = await readServiceWorkerSource(import.meta.url);
       this.emitFile({
@@ -153,6 +166,7 @@ export default function nodepod(
       }
     },
   };
+  return plugin;
 }
 
 // Also expose as named for `import { nodepod } from '@r1ck404/nodepod/vite'`.
