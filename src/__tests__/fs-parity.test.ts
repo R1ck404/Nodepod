@@ -15,6 +15,19 @@ describe("fs.statSync options", () => {
     expect(fs.lstatSync("/missing", { throwIfNoEntry: false })).toBeUndefined();
   });
 
+  it("includes the file-type bits in mode, as Node does", () => {
+    const { vol, fs } = makeFs();
+    vol.mkdirSync("/d");
+    vol.writeFileSync("/d/f.txt", "hi");
+    vol.symlinkSync("/d/f.txt", "/d/link");
+    const type = (stats: { mode: number } | undefined) => stats!.mode & 0o170000;
+    expect(type(fs.statSync("/d"))).toBe(0o040000);
+    expect(type(fs.statSync("/d/f.txt"))).toBe(0o100000);
+    expect(type(fs.lstatSync("/d/f.txt"))).toBe(0o100000);
+    expect(type(fs.lstatSync("/d/link"))).toBe(0o120000);
+    expect(fs.statSync("/d/f.txt")!.mode & 0o777).toBe(0o644);
+  });
+
   it("still throws ENOENT by default", () => {
     const { fs } = makeFs();
     expect(() => fs.statSync("/missing")).toThrow(/ENOENT/);

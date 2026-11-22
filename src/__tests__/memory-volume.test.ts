@@ -206,7 +206,7 @@ describe("MemoryVolume", () => {
 
     const restored = MemoryVolume.fromSnapshot(volume.toSnapshot());
     expect(restored.statSync("/root/original").ino).toBe(restored.statSync("/root/linked").ino);
-    expect(restored.statSync("/root/original").mode).toBe(0o750);
+    expect(restored.statSync("/root/original").mode & 0o7777).toBe(0o750);
     expect(restored.statSync("/root/original").mtimeMs).toBe(20_000);
     expect(restored.readlinkSync("/root/symlink")).toBe("original");
     restored.writeFileSync("/root/linked", "changed");
@@ -235,7 +235,7 @@ describe("MemoryVolume", () => {
     volume.chmodSync("/metadata", 0o750);
     volume.utimesSync("/metadata", 10, 20);
     const stat = volume.statSync("/metadata");
-    expect(stat.mode).toBe(0o750);
+    expect(stat.mode & 0o7777).toBe(0o750);
     expect(stat.atimeMs).toBe(10_000);
     expect(stat.mtimeMs).toBe(20_000);
   });
