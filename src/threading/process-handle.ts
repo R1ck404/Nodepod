@@ -115,21 +115,23 @@ export class ProcessHandle extends EventEmitter {
   }
 
   sendStdin(data: string): void {
-    // Forward to children via ProcessManager
-    this.emit("stdin-forward", data);
+    // Forward to children via ProcessManager, which counts the children reached
+    const reached = { children: 0 };
+    this.emit("stdin-forward", data, reached);
 
     // Skip postMessage if blocked on Atomics.wait() or already exited
     if (!this.workerExited && !this.syncBlocked) {
-      this.postMessage({ type: "stdin", data });
+      this.postMessage({ type: "stdin", data, forwarded: reached.children > 0 });
     }
   }
 
   endStdin(): void {
     // Children that inherit this stdin see it end too
-    this.emit("stdin-end-forward");
+    const reached = { children: 0 };
+    this.emit("stdin-end-forward", reached);
 
     if (!this.workerExited && !this.syncBlocked) {
-      this.postMessage({ type: "stdin", data: "", end: true });
+      this.postMessage({ type: "stdin", data: "", end: true, forwarded: reached.children > 0 });
     }
   }
 

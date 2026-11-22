@@ -91,6 +91,9 @@ export interface MainToWorker_Stdin {
   type: "stdin";
   data: string;
   end?: boolean;
+  // true when the main thread already gave this input to a child that
+  // inherits this process's stdin
+  forwarded?: boolean;
 }
 
 export interface MainToWorker_Signal {
@@ -334,6 +337,9 @@ export interface WorkerToMain_SpawnRequest {
   // legacy single-string form or node's [stdin, stdout, stderr] array.
   // main normalizes either shape via stdioInheritsStdin().
   stdio: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
+  // input typed before the child started, for a child that inherits stdin
+  stdin?: string[];
+  stdinEnded?: boolean;
 }
 
 export interface WorkerToMain_ChildSignal {

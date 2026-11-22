@@ -193,9 +193,9 @@ describe("node headless host", () => {
       },
     });
 
-    const readAll = async (cmd: string, args: string[]) => {
+    const readAll = async (cmd: string, args: string[], waitMs = 300) => {
       const proc = await pod.spawn(cmd, args, { cwd: "/home/app" });
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, waitMs));
       proc.write("a\n");
       proc.write("b\n");
       proc.endStdin();
@@ -212,6 +212,37 @@ describe("node headless host", () => {
     const viaShell = await readAll("sh", ["-c", "node read.js"]);
     expect(viaShell.exitCode).toBe(0);
     expect(viaShell.stdout).toBe("got a,b\nended\n");
+    // Typed ahead, before the program has started: kept until it reads, as a terminal keeps it.
+    const early = await readAll("node", ["read.js"], 0);
+    expect(early.stdout).toBe("got a,b\nended\n");
+    const earlyViaShell = await readAll("sh", ["-c", "node read.js"], 0);
+    expect(earlyViaShell.stdout).toBe("got a,b\nended\n");
+    // A launcher on PATH that runs node, as `#!/bin/sh` wrappers do.
+    await pod.fs.mkdir("/usr/local/bin", { recursive: true });
+    await pod.fs.writeFile("/usr/local/bin/readall", '#!/bin/sh\nnode "/home/app/read.js" "$@"\n');
+    const viaLauncher = await readAll("sh", ["-c", "readall"], 0);
+    expect(viaLauncher.stdout).toBe("got a,b\nended\n");
+
+    // Input a running child has read is not given again to the next command.
+    await pod.fs.writeFile(
+      "/home/app/line.js",
+      "process.stdin.once('data', (d) => { console.log('line ' + String(d).trim()); process.stdin.pause(); });",
+    );
+    const twice = await pod.spawn("sh", ["-c", "node line.js; node line.js"], { cwd: "/home/app" });
+    let shown = "";
+    twice.on("output", (chunk: string) => (shown += chunk));
+    const until = async (text: string) => {
+      for (const end = Date.now() + 10_000; !shown.includes(text); ) {
+        if (Date.now() > end) throw new Error(`never showed ${JSON.stringify(text)}: ${JSON.stringify(shown)}`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    await new Promise((r) => setTimeout(r, 500));
+    twice.write("x\n");
+    await until("line x\n");
+    await new Promise((r) => setTimeout(r, 500));
+    twice.write("y\n");
+    expect((await twice.completion).stdout).toBe("line x\nline y\n");
     await pod.teardown();
   }, 60_000);
 

@@ -340,9 +340,36 @@ export function isStdinRaw(): boolean {
   return !!(stdin as any).isRaw;
 }
 
+// Input that arrives while no script is reading (a shell still starting the
+// program, as `sh -c "node app.js"` does), kept for the next script's stdin as
+// a terminal keeps typed-ahead input for its next reader.
+const _stdinBacklog: string[] = [];
+let _stdinBacklogEnded = false;
+
+function _handOverStdinBacklog(stdin: { emit: (e: string, ...a: unknown[]) => void }): void {
+  for (const text of _stdinBacklog.splice(0)) stdin.emit("data", text);
+  if (_stdinBacklogEnded) {
+    _stdinBacklogEnded = false;
+    stdin.emit("end");
+  }
+}
+
+/** Whether a script in this worker is reading stdin now. */
+export function hasLiveStdin(): boolean {
+  return getLiveStdin() !== null;
+}
+
+/** Takes the input kept for the next reader, for a child that inherits stdin. */
+export function takeStdinBacklog(): { data: string[]; ended: boolean } {
+  const kept = { data: _stdinBacklog.splice(0), ended: _stdinBacklogEnded };
+  _stdinBacklogEnded = false;
+  return kept;
+}
+
 export function sendStdin(text: string): void {
   const stdin = getLiveStdin();
   if (!stdin) {
+    if (!_stdinBacklogEnded) _stdinBacklog.push(text);
     return;
   }
   // emit 'data' only -- readline.emitKeypressEvents() parses data into 'keypress' events
@@ -351,7 +378,9 @@ export function sendStdin(text: string): void {
 }
 
 export function endStdin(): void {
-  getLiveStdin()?.emit("end");
+  const stdin = getLiveStdin();
+  if (stdin) stdin.emit("end");
+  else _stdinBacklogEnded = true;
 }
 
 export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
@@ -1611,6 +1640,8 @@ export async function executeNodeBinary(
     // also update context's liveStdin
     const ctx = getActiveContext();
     if (ctx) ctx.liveStdin = proc.stdin;
+    // input typed before the script started; process.stdin queues it until a reader attaches
+    _handOverStdinBacklog(proc.stdin);
 
     // register with the resize broadcaster so live SIGWINCH-style updates
     // reach the running script's process.stdout / stderr / stdin
