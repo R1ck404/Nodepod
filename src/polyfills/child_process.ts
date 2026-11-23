@@ -340,9 +340,56 @@ export function isStdinRaw(): boolean {
   return !!(stdin as any).isRaw;
 }
 
+// Input that arrives while no script is reading (a shell still starting the
+// program, as `sh -c "node app.js"` does), kept for the next script's stdin as
+// a terminal keeps typed-ahead input for its next reader. Like a terminal's
+// typeahead buffer it is bounded: past STDIN_BACKLOG_LIMIT characters the
+// oldest input is dropped, so a long-running program that never reads stdin
+// doesn't hand the next reader everything typed meanwhile.
+export const STDIN_BACKLOG_LIMIT = 4096;
+const _stdinBacklog: string[] = [];
+let _stdinBacklogLength = 0;
+let _stdinBacklogEnded = false;
+
+function _keepStdin(text: string): void {
+  if (text.length > STDIN_BACKLOG_LIMIT) text = text.slice(-STDIN_BACKLOG_LIMIT);
+  _stdinBacklog.push(text);
+  _stdinBacklogLength += text.length;
+  // drop whole pieces, oldest first, so a key's escape sequence is never cut
+  while (_stdinBacklogLength > STDIN_BACKLOG_LIMIT) {
+    _stdinBacklogLength -= _stdinBacklog.shift()!.length;
+  }
+}
+
+function _takeStdinBacklogData(): string[] {
+  _stdinBacklogLength = 0;
+  return _stdinBacklog.splice(0);
+}
+
+function _handOverStdinBacklog(stdin: { emit: (e: string, ...a: unknown[]) => void }): void {
+  for (const text of _takeStdinBacklogData()) stdin.emit("data", text);
+  if (_stdinBacklogEnded) {
+    _stdinBacklogEnded = false;
+    stdin.emit("end");
+  }
+}
+
+/** Whether a script in this worker is reading stdin now. */
+export function hasLiveStdin(): boolean {
+  return getLiveStdin() !== null;
+}
+
+/** Takes the input kept for the next reader, for a child that inherits stdin. */
+export function takeStdinBacklog(): { data: string[]; ended: boolean } {
+  const kept = { data: _takeStdinBacklogData(), ended: _stdinBacklogEnded };
+  _stdinBacklogEnded = false;
+  return kept;
+}
+
 export function sendStdin(text: string): void {
   const stdin = getLiveStdin();
   if (!stdin) {
+    if (!_stdinBacklogEnded) _keepStdin(text);
     return;
   }
   // emit 'data' only -- readline.emitKeypressEvents() parses data into 'keypress' events
@@ -351,7 +398,9 @@ export function sendStdin(text: string): void {
 }
 
 export function endStdin(): void {
-  getLiveStdin()?.emit("end");
+  const stdin = getLiveStdin();
+  if (stdin) stdin.emit("end");
+  else _stdinBacklogEnded = true;
 }
 
 export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
@@ -1611,6 +1660,8 @@ export async function executeNodeBinary(
     // also update context's liveStdin
     const ctx = getActiveContext();
     if (ctx) ctx.liveStdin = proc.stdin;
+    // input typed before the script started; process.stdin queues it until a reader attaches
+    _handOverStdinBacklog(proc.stdin);
 
     // register with the resize broadcaster so live SIGWINCH-style updates
     // reach the running script's process.stdout / stderr / stdin

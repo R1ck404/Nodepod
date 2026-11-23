@@ -918,7 +918,7 @@ export class ProcessManager extends EventEmitter {
 
     // forward stdin to children even when parent is blocked on Atomics.wait.
     // only routes to stdio:'inherit' children; stdio:'pipe' kids are isolated.
-    handle.on("stdin-forward", (data: string) => {
+    handle.on("stdin-forward", (data: string, reached?: { children: number }) => {
       const children = this._childPids.get(handle.pid);
       if (children) {
         for (const childPid of children) {
@@ -926,16 +926,20 @@ export class ProcessManager extends EventEmitter {
           const childHandle = this._processes.get(childPid);
           if (childHandle && childHandle.state !== "exited") {
             childHandle.sendStdin(data);
+            if (reached) reached.children++;
           }
         }
       }
     });
 
-    handle.on("stdin-end-forward", () => {
+    handle.on("stdin-end-forward", (reached?: { children: number }) => {
       for (const childPid of this._childPids.get(handle.pid) ?? []) {
         if (!this._inheritStdinChildren.has(childPid)) continue;
         const childHandle = this._processes.get(childPid);
-        if (childHandle && childHandle.state !== "exited") childHandle.endStdin();
+        if (childHandle && childHandle.state !== "exited") {
+          childHandle.endStdin();
+          if (reached) reached.children++;
+        }
       }
     });
 
@@ -1049,7 +1053,12 @@ export class ProcessManager extends EventEmitter {
         // msg.stdio can be the legacy string or node's [stdin, stdout, stderr].
         const inheritsStdin = msg.stdio === "inherit"
           || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
-        if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+        if (inheritsStdin) {
+          this._inheritStdinChildren.add(childHandle.pid);
+          // input the parent held for its next reader: typed before this child started
+          for (const data of msg.stdin ?? []) childHandle.sendStdin(data);
+          if (msg.stdinEnded) childHandle.endStdin();
+        }
         if (msg.stdio === "inherit" || (Array.isArray(msg.stdio) && msg.stdio[1] === "inherit")) {
           this._shareTerminal(handle, childHandle);
         }
@@ -1143,8 +1152,18 @@ export class ProcessManager extends EventEmitter {
         };
         handle.on("child-signal", relayChildSignal);
 
+        // input the parent's worker received for this child before it was
+        // started here, so stdin-forward could not reach it
+        const relayStdinToChild = (stdinMsg: { requestId: number; data: string; end?: boolean }) => {
+          if (stdinMsg.requestId !== msg.requestId || childHandle.state === "exited") return;
+          if (stdinMsg.end) childHandle.endStdin();
+          else childHandle.sendStdin(stdinMsg.data);
+        };
+        handle.on("child-stdin", relayStdinToChild);
+
         childHandle.on("exit", (exitCode: number) => {
           handle.removeListener("child-signal", relayChildSignal);
+          handle.removeListener("child-stdin", relayStdinToChild);
           if (!handle.workerExited) {
             handle.postMessage({
               type: "child-exit",

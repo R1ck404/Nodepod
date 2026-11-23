@@ -238,7 +238,7 @@ self.addEventListener("message", (ev: MessageEvent) => {
       handleExec(msg);
       break;
     case "stdin":
-      handleStdin(msg.data, msg.end);
+      handleStdin(msg.data, msg.end, msg.forwarded);
       break;
     case "signal":
       handleSignal(msg);
@@ -464,6 +464,7 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process.
     _shellMod = await import("../polyfills/child_process.js");
     // must be eager — sync require('child_process') needs this before any microtask fires
     setChildProcessPolyfill(_shellMod);
+    for (const early of _earlyStdin.splice(0)) handleStdin(early.data, early.end, early.forwarded);
   }
   if (!_shellInitialized && _volume) {
     _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env, shell: _shellOptions });
@@ -744,9 +745,31 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
   }
 }
 
-function handleStdin(data: string, end = false): void {
-  if (!_shellMod) return;
+// stdin that arrives while the worker is still loading child_process
+const _earlyStdin: Array<{ data: string; end: boolean; forwarded: boolean }> = [];
+// children started with inherited stdin that haven't exited, by request id
+const _inheritStdinRequests = new Set<number>();
+
+// A script in this worker reads stdin directly. Otherwise the input belongs to
+// children that inherit it: the main thread forwards it to those it has
+// started (`forwarded`), this worker relays it to those it has asked for but
+// the main thread has not started yet, and with neither, child_process keeps
+// it for the next reader, as a terminal keeps typed-ahead input.
+function handleStdin(data: string, end = false, forwarded = false): void {
+  if (!_shellMod) {
+    _earlyStdin.push({ data, end, forwarded });
+    return;
+  }
   try {
+    if (!_shellMod.hasLiveStdin()) {
+      if (forwarded) return;
+      if (_inheritStdinRequests.size > 0) {
+        for (const requestId of _inheritStdinRequests) {
+          post({ type: "child-stdin", requestId, data, ...(end ? { end: true } : {}) });
+        }
+        return;
+      }
+    }
     if (end) _shellMod.endStdin();
     else _shellMod.sendStdin(data);
   } catch {
@@ -1274,6 +1297,7 @@ export function spawnChild(
 
     _spawnCallbacks.set(requestId, (result: any) => {
       if (result.error) {
+        _inheritStdinRequests.delete(requestId);
         reject(new Error(result.error));
         return;
       }
@@ -1289,6 +1313,7 @@ export function spawnChild(
       });
 
       _childExitCallbacks.set(requestId, (exitCode: number, fullStdout: string, fullStderr: string) => {
+        _inheritStdinRequests.delete(requestId);
         resolve({
           pid: result.pid,
           exitCode,
@@ -1298,6 +1323,11 @@ export function spawnChild(
       });
     });
 
+    const stdio = opts?.stdio || "pipe";
+    const inheritsStdin = stdio === "inherit" || (Array.isArray(stdio) && stdio[0] === "inherit");
+    // input typed before this child started goes with the request
+    const kept = inheritsStdin && _shellMod ? _shellMod.takeStdinBacklog() : { data: [], ended: false };
+    if (inheritsStdin) _inheritStdinRequests.add(requestId);
     post({
       type: "spawn-request",
       requestId,
@@ -1306,7 +1336,9 @@ export function spawnChild(
       cwd: opts?.cwd || _cwd,
       env: opts?.env || _env,
       shell: _shellOptions,
-      stdio: opts?.stdio || "pipe",
+      stdio,
+      ...(kept.data.length ? { stdin: kept.data } : {}),
+      ...(kept.ended ? { stdinEnded: true } : {}),
     });
   });
   return Object.assign(operation, {
