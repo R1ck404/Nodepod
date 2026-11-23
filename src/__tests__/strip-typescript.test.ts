@@ -107,7 +107,7 @@ const c = new Map<string, number>();
     expect(out).toContain("b > c");
   });
 
-  it("is fast on typical API route size (near regex cost)", () => {
+  it("strips a typical API route (timed in bench/strip-typescript.bench.ts)", () => {
     const src = `
 import type { ApiContext } from "./http";
 export async function PATCH(ctx: ApiContext) {
@@ -115,13 +115,11 @@ export async function PATCH(ctx: ApiContext) {
   return body.value ?? null;
 }
 `.repeat(20);
-    // Warm the JIT so cold-start / parallel-suite noise does not dominate.
-    for (let i = 0; i < 20; i++) stripTypeScript(src, "cells.ts");
-    const t0 = performance.now();
-    for (let i = 0; i < 200; i++) stripTypeScript(src, "cells.ts");
-    const ms = (performance.now() - t0) / 200;
-    // Stay well under Sucrase (~0.8ms on 4KB); allow headroom under load.
-    expect(ms).toBeLessThan(0.6);
+    const out = stripTypeScript(src, "cells.ts");
+    expect(out).not.toContain("ApiContext");
+    expect(out).not.toContain("readJson<");
+    expect(out).toContain("body.value ?? null");
+    assertParsesAsScript(out);
   });
 });
 
