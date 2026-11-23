@@ -1,5 +1,5 @@
 // Process handle returned by nodepod.spawn().
-// Emits 'output', 'error', 'exit'. Has write() for stdin and kill() to abort.
+// Emits 'output', 'error', 'exit'. Has write() and endStdin() for stdin and kill() to abort.
 
 import { EventEmitter } from "../polyfills/events.js";
 
@@ -14,6 +14,7 @@ export class NodepodProcess extends EventEmitter {
   private _stderr = "";
   private _exitCode: number | null = null;
   private _sendStdinFn: ((data: string) => void) | null = null;
+  private _endStdinFn: (() => void) | null = null;
   private _killFn: (() => void) | null = null;
   private _maxOutputBytes: number;
 
@@ -34,6 +35,10 @@ export class NodepodProcess extends EventEmitter {
 
   _setSendStdin(fn: (data: string) => void): void {
     this._sendStdinFn = fn;
+  }
+
+  _setEndStdin(fn: () => void): void {
+    this._endStdinFn = fn;
   }
 
   _setKillFn(fn: () => void): void {
@@ -89,6 +94,11 @@ export class NodepodProcess extends EventEmitter {
 
   write(data: string): void {
     if (this._sendStdinFn) this._sendStdinFn(data);
+  }
+
+  /** Ends the process's stdin, as `child.stdin.end()` does in Node: `process.stdin` emits 'end'. */
+  endStdin(): void {
+    if (this._endStdinFn) this._endStdinFn();
   }
 
   kill(): void {

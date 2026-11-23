@@ -44,6 +44,24 @@ afterEach(() => {
   FakeWorker.instances = [];
 });
 
+describe("stdin for child processes", () => {
+  it("ends the stdin of children that inherit it, not of piped ones", () => {
+    const manager = new ProcessManager(new MemoryVolume());
+    const shell = manager.spawn({ command: "sh", args: [], cwd: "/", env: {} });
+    const spawnChild = (requestId: number, stdio: unknown) => {
+      shell.emit("spawn-request", { type: "spawn-request", requestId, command: "node", args: ["a.js"], cwd: "/", env: {}, stdio });
+      return FakeWorker.instances.at(-1)!;
+    };
+    const inherited = spawnChild(1, "inherit");
+    const piped = spawnChild(2, "pipe");
+    const ends = (worker: FakeWorker) => worker.messages.filter((m) => m?.type === "stdin" && m.end).length;
+
+    shell.endStdin();
+    expect(ends(inherited)).toBe(1);
+    expect(ends(piped)).toBe(0);
+  });
+});
+
 describe("terminal size for child processes", () => {
   it("starts a child that shares the terminal at its size and relays resizes", () => {
     const manager = new ProcessManager(new MemoryVolume());

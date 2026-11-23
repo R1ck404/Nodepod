@@ -15,8 +15,10 @@ import * as nativeTimers from "node:timers";
 import { spawnSync as nativeSpawnSync } from "node:child_process";
 import { MemoryVolume } from "../memory-volume";
 import {
+  endStdin,
   executeNodeBinary,
   initShellExec,
+  sendStdin,
   setSpawnChildCallback,
 } from "../polyfills/child_process";
 import type { ShellContext } from "../shell/shell-types";
@@ -165,6 +167,24 @@ describe("exit semantics - libuv-parity", () => {
       const r = await executeNodeBinary("/exec.js", [], ctx);
       expect(r.stdout).toBe(native.stdout);
       expect(r.exitCode).toBe(0);
+    });
+  });
+
+  describe("stdin end", () => {
+    const cases = [
+      ["a reader attached before the input", `let text = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (c) => (text += c)); process.stdin.on('end', () => console.log('got ' + JSON.stringify(text)));`],
+      ["a reader attached after the input has ended", `setTimeout(() => { let text = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (c) => (text += c)); process.stdin.on('end', () => console.log('got ' + JSON.stringify(text))); }, 150);`],
+    ];
+    it.each(cases)("%s reads to 'end' and exits, as in Node", async (_name, source) => {
+      const native = nativeSpawnSync(process.execPath, ["-e", source], { input: "a\nb\n", encoding: "utf8" });
+      expect(native.stdout).toBe('got "a\\nb\\n"\n');
+      const { ctx } = setup({ "/read.js": source });
+      nativeTimers.setTimeout(() => {
+        sendStdin("a\nb\n");
+        endStdin();
+      }, 50);
+      const r = await executeNodeBinary("/read.js", [], ctx);
+      expect(r).toEqual({ stdout: native.stdout, stderr: native.stderr, exitCode: native.status });
     });
   });
 

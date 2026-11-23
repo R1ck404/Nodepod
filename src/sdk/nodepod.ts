@@ -748,6 +748,7 @@ export class Nodepod {
     });
 
     proc._setSendStdin((data: string) => handle.sendStdin(data));
+    proc._setEndStdin(() => handle.endStdin());
     // PM.kill() delivers SIGINT, escalates to SIGKILL (worker termination)
     // when the worker does not exit on its own, kills descendants and frees
     // server ports. A bare SIGINT is just a postMessage: if the worker's

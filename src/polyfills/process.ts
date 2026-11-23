@@ -238,8 +238,10 @@ function fabricateStream(
   // while another consumer still expects data.
   let _stdinHandle: Handle | null = null;
   let _stdinRefCount = 0;
+  // after 'end' (EOF), node's stdin handle is closed and no longer holds the loop
+  let _stdinEnded = false;
   const _stdinRef = () => {
-    if (isOutput) return;
+    if (isOutput || _stdinEnded) return;
     _stdinRefCount++;
     if (!_stdinHandle) _stdinHandle = getRegistry().register("TTYWrap");
   };
@@ -261,12 +263,17 @@ function fabricateStream(
   // ~3s gap between "ready" and bindCLIShortcuts attaching readline
   // eating every keystroke typed during the gap.
   const _pendingData: unknown[][] = [];
+  // 'end' that arrived before any 'data' listener: like a paused Readable,
+  // node emits it only after a consumer has read the data ahead of it
+  let _endPending = false;
 
   const _flushPendingData = () => {
-    if (isOutput || _pendingData.length === 0) return;
+    if (isOutput || (_pendingData.length === 0 && !_endPending)) return;
     // snapshot and clear sync so a handler that schedules another sendStdin
     // during replay doesn't get re-replayed here
     const pending = _pendingData.splice(0);
+    const ended = _endPending;
+    _endPending = false;
     // queueMicrotask so the just-added listener is definitely registered
     // (sync call sites expect .on('data', fn).something() chains to finish
     // before data fires), and it matches node's flush-on-next-tick feel
@@ -274,6 +281,7 @@ function fabricateStream(
       for (const args of pending) {
         bus.emit("data", ...(args as unknown[]));
       }
+      if (ended) bus.emit("end");
     });
   };
 
@@ -312,6 +320,19 @@ function fabricateStream(
         _pendingData.push(args);
         // EventEmitter.emit returns true iff a listener was called, none here
         return false;
+      }
+      if (!isOutput && evt === "end") {
+        _stdinEnded = true;
+        _stdinRefCount = 0;
+        _stdinHandle?.close();
+        _stdinHandle = null;
+        if (bus.listenerCount("data") === 0) {
+          _endPending = true;
+          return false;
+        }
+        // after any queued data still being replayed (a microtask)
+        queueMicrotask(() => bus.emit("end"));
+        return true;
       }
       return bus.emit(evt, ...args);
     },
