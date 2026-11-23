@@ -342,12 +342,32 @@ export function isStdinRaw(): boolean {
 
 // Input that arrives while no script is reading (a shell still starting the
 // program, as `sh -c "node app.js"` does), kept for the next script's stdin as
-// a terminal keeps typed-ahead input for its next reader.
+// a terminal keeps typed-ahead input for its next reader. Like a terminal's
+// typeahead buffer it is bounded: past STDIN_BACKLOG_LIMIT characters the
+// oldest input is dropped, so a long-running program that never reads stdin
+// doesn't hand the next reader everything typed meanwhile.
+export const STDIN_BACKLOG_LIMIT = 4096;
 const _stdinBacklog: string[] = [];
+let _stdinBacklogLength = 0;
 let _stdinBacklogEnded = false;
 
+function _keepStdin(text: string): void {
+  if (text.length > STDIN_BACKLOG_LIMIT) text = text.slice(-STDIN_BACKLOG_LIMIT);
+  _stdinBacklog.push(text);
+  _stdinBacklogLength += text.length;
+  // drop whole pieces, oldest first, so a key's escape sequence is never cut
+  while (_stdinBacklogLength > STDIN_BACKLOG_LIMIT) {
+    _stdinBacklogLength -= _stdinBacklog.shift()!.length;
+  }
+}
+
+function _takeStdinBacklogData(): string[] {
+  _stdinBacklogLength = 0;
+  return _stdinBacklog.splice(0);
+}
+
 function _handOverStdinBacklog(stdin: { emit: (e: string, ...a: unknown[]) => void }): void {
-  for (const text of _stdinBacklog.splice(0)) stdin.emit("data", text);
+  for (const text of _takeStdinBacklogData()) stdin.emit("data", text);
   if (_stdinBacklogEnded) {
     _stdinBacklogEnded = false;
     stdin.emit("end");
@@ -361,7 +381,7 @@ export function hasLiveStdin(): boolean {
 
 /** Takes the input kept for the next reader, for a child that inherits stdin. */
 export function takeStdinBacklog(): { data: string[]; ended: boolean } {
-  const kept = { data: _stdinBacklog.splice(0), ended: _stdinBacklogEnded };
+  const kept = { data: _takeStdinBacklogData(), ended: _stdinBacklogEnded };
   _stdinBacklogEnded = false;
   return kept;
 }
@@ -369,7 +389,7 @@ export function takeStdinBacklog(): { data: string[]; ended: boolean } {
 export function sendStdin(text: string): void {
   const stdin = getLiveStdin();
   if (!stdin) {
-    if (!_stdinBacklogEnded) _stdinBacklog.push(text);
+    if (!_stdinBacklogEnded) _keepStdin(text);
     return;
   }
   // emit 'data' only -- readline.emitKeypressEvents() parses data into 'keypress' events

@@ -243,6 +243,30 @@ describe("node headless host", () => {
     await new Promise((r) => setTimeout(r, 500));
     twice.write("y\n");
     expect((await twice.completion).stdout).toBe("line x\nline y\n");
+
+    // Typed-ahead input is bounded, as a terminal's typeahead buffer is: while `sh` runs `sleep`,
+    // nothing reads, and the next reader gets only the newest whole writes, at most 4096 characters.
+    await pod.fs.writeFile(
+      "/home/app/count.js",
+      [
+        "let text = '';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', (chunk) => (text += chunk));",
+        "process.stdin.on('end', () => { const lines = text.split('\\n').filter(Boolean); console.log(text.length, lines[0], lines[lines.length - 1]); });",
+      ].join("\n"),
+    );
+    const held = await pod.spawn("sh", ["-c", "sleep 1; node count.js"], { cwd: "/home/app" });
+    await new Promise((r) => setTimeout(r, 300));
+    // 1000 writes of 10 characters each: "key-00000\n" ... "key-00999\n"
+    for (let i = 0; i < 1000; i++) held.write(`key-${String(i).padStart(5, "0")}\n`);
+    held.endStdin();
+    const bounded = await Promise.race([
+      held.completion,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("count.js did not exit")), 10_000)),
+    ]);
+    expect(bounded.exitCode).toBe(0);
+    // 409 whole writes fit in 4096 characters: keys 591 to 999
+    expect(bounded.stdout).toBe("4090 key-00591 key-00999\n");
     await pod.teardown();
   }, 60_000);
 
