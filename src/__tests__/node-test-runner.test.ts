@@ -246,6 +246,34 @@ describe("node --test", () => {
     expect(passed(actual.stdout)).toEqual(["a"]);
   });
 
+  // A switch takes no value, so the file after it still runs.
+  it.each(["--test-force-exit", "--test-update-snapshots"])("runs the file after %s, as Node does", async (flag) => {
+    const files = { "/w/a.test.js": pass("a"), "/w/other.test.js": pass("other") };
+    const expected = native(files, ["--test", "--test-reporter=spec", flag, "a.test.js"]);
+    const actual = await nodepodShell(files, `cd /w && node --test ${flag} a.test.js`);
+    expect(actual.exitCode).toBe(expected.exitCode);
+    expect(passed(actual.stdout)).toEqual(passed(expected.stdout));
+    expect(passed(actual.stdout)).toEqual(["a"]);
+  });
+
+  // Nodepod accepts --test-only without filtering by `only`, so this checks only which file runs.
+  it("runs the file after --test-only", async () => {
+    const files = { "/w/a.test.js": pass("a"), "/w/other.test.js": pass("other") };
+    const actual = await nodepodShell(files, "cd /w && node --test --test-only a.test.js");
+    expect(actual.exitCode).toBe(0);
+    expect(passed(actual.stdout)).toEqual(["a"]);
+  });
+
+  it("skips the value of an option given as a separate word", async () => {
+    const files = { "/w/a.test.js": pass("a"), "/w/other.test.js": pass("other") };
+    const actual = await nodepodShell(
+      files,
+      "cd /w && node --test --test-name-pattern a --test-timeout 5000 --test-shard 1/1 a.test.js",
+    );
+    expect(actual.exitCode).toBe(0);
+    expect(passed(actual.stdout)).toEqual(["a"]);
+  });
+
   it("fails for a path that does not exist", async () => {
     const actual = await nodepodShell({ "/w/a.test.js": pass("a") }, "cd /w && node --test missing.test.js");
     expect(actual.exitCode).toBe(1);

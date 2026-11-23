@@ -37,9 +37,9 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
         } else if (params[i] === "--test") {
           testMode = true;
         } else if (testMode && params[i].startsWith("--test-")) {
-          // --test-reporter, --test-name-pattern, ... are accepted; values in the --flag=value form
-          // need no extra handling, and space-separated values are skipped.
-          if (!params[i].includes("=") && params[i + 1] && !params[i + 1].startsWith("-")) i++;
+          // --test-* options are accepted and ignored. Only those that take a value skip the
+          // next word; switches such as --test-only leave it, so a file after them still runs.
+          if (TEST_VALUE_OPTIONS.has(params[i]) && i + 1 < params.length) i++;
         } else if (testMode && !params[i].startsWith("-")) {
           testFiles.push(params[i]);
         } else if (params[i] === "--check" || params[i] === "-c") {
@@ -129,6 +129,22 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
     },
   };
 }
+
+/** The `--test-*` options that take a value (`--name value` or `--name=value`), as in Node 22. */
+const TEST_VALUE_OPTIONS = new Set([
+  "--test-concurrency",
+  "--test-coverage-branches",
+  "--test-coverage-exclude",
+  "--test-coverage-functions",
+  "--test-coverage-include",
+  "--test-coverage-lines",
+  "--test-name-pattern",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--test-shard",
+  "--test-skip-pattern",
+  "--test-timeout",
+]);
 
 /** Node's default test-file patterns: test.js, test-*.js, *.test.js, *-test.js, *_test.js and test/ folders. */
 const TEST_FILE = /(^|\/)(test|test-.+|.+[.\-_]test)\.(c|m)?js$/;
