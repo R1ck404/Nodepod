@@ -265,9 +265,9 @@ describe("MemoryVolume.mountEntries", () => {
       { path: "/d/l", kind: "symlink", target: "a", mtimeMs: 3000 },
     ]);
 
-    expect(vol.statSync("/d").mode).toBe(0o700);
+    expect(vol.statSync("/d").mode & 0o7777).toBe(0o700);
     expect(vol.statSync("/d").mtimeMs).toBe(1000);
-    expect(vol.statSync("/d/a").mode).toBe(0o640);
+    expect(vol.statSync("/d/a").mode & 0o7777).toBe(0o640);
     expect(vol.statSync("/d/a").mtimeMs).toBe(2000);
     expect(vol.inspectNode("/d/b")!.inode).toBe(vol.inspectNode("/d/a")!.inode);
     expect(Array.from(vol.readFileSync("/d/b"))).toEqual([1, 2]);

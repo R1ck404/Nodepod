@@ -2944,7 +2944,11 @@ export class MemoryVolume {
       isFIFO: STAT_FALSE,
       isSocket: STAT_FALSE,
       size: fileSize,
-      mode: node.kind === 'directory' ? (node.mode ?? 0o755) : (inode?.mode ?? 0o644),
+      // File-type bits as in Node (S_IFDIR / S_IFREG), so code that reads `mode` (tar, Emscripten's NODEFS) tells
+      // folders from files; lstat's symlinks carry S_IFLNK the same way.
+      mode: node.kind === 'directory'
+        ? 0o040000 | ((node.mode ?? 0o755) & 0o7777)
+        : 0o100000 | ((inode?.mode ?? 0o644) & 0o7777),
       mtime: new Date(ts),
       atime: new Date(atimeMs),
       ctime: new Date(ctimeMs),

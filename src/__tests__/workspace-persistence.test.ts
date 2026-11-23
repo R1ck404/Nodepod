@@ -59,9 +59,9 @@ describe("WorkspacePersistence", () => {
     const restored = second.volume;
     expect(text(restored, "/proj/src/index.js")).toBe("console.log(1)");
     expect(Array.from(restored.readFileSync("/proj/bin.dat"))).toEqual([0, 1, 2, 255]);
-    expect(restored.statSync("/proj/bin.dat").mode).toBe(0o600);
+    expect(restored.statSync("/proj/bin.dat").mode & 0o7777).toBe(0o600);
     expect(restored.statSync("/proj/bin.dat").mtimeMs).toBe(2_000_000);
-    expect(restored.statSync("/proj/src").mode).toBe(0o700);
+    expect(restored.statSync("/proj/src").mode & 0o7777).toBe(0o700);
     expect(restored.readlinkSync("/proj/main.js")).toBe("src/index.js");
   });
 
@@ -362,7 +362,7 @@ describe("WorkspacePersistence", () => {
     await persistence.flush();
 
     const again = await open(store);
-    expect(again.volume.statSync("/run.sh").mode).toBe(0o755);
+    expect(again.volume.statSync("/run.sh").mode & 0o7777).toBe(0o755);
   });
 
   it("persists bulk mounts of included paths", async () => {
