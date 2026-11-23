@@ -247,19 +247,20 @@ describe("node --test", () => {
   });
 
   // A switch takes no value, so the file after it still runs.
-  it.each(["--test-force-exit", "--test-update-snapshots"])("runs the file after %s, as Node does", async (flag) => {
+  it("runs the file after --test-force-exit, as Node does", async () => {
     const files = { "/w/a.test.js": pass("a"), "/w/other.test.js": pass("other") };
-    const expected = native(files, ["--test", "--test-reporter=spec", flag, "a.test.js"]);
-    const actual = await nodepodShell(files, `cd /w && node --test ${flag} a.test.js`);
+    const expected = native(files, ["--test", "--test-reporter=spec", "--test-force-exit", "a.test.js"]);
+    const actual = await nodepodShell(files, "cd /w && node --test --test-force-exit a.test.js");
     expect(actual.exitCode).toBe(expected.exitCode);
     expect(passed(actual.stdout)).toEqual(passed(expected.stdout));
     expect(passed(actual.stdout)).toEqual(["a"]);
   });
 
-  // Nodepod accepts --test-only without filtering by `only`, so this checks only which file runs.
-  it("runs the file after --test-only", async () => {
+  // Not compared with native Node: Nodepod accepts --test-only without filtering by `only`, and
+  // Node 20 has no --test-update-snapshots (added in 22.3). These check only which file runs.
+  it.each(["--test-only", "--test-update-snapshots"])("runs the file after %s", async (flag) => {
     const files = { "/w/a.test.js": pass("a"), "/w/other.test.js": pass("other") };
-    const actual = await nodepodShell(files, "cd /w && node --test --test-only a.test.js");
+    const actual = await nodepodShell(files, `cd /w && node --test ${flag} a.test.js`);
     expect(actual.exitCode).toBe(0);
     expect(passed(actual.stdout)).toEqual(["a"]);
   });
