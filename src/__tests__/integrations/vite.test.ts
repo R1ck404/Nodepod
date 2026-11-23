@@ -203,6 +203,38 @@ describe("integrations/vite", () => {
       expect(res.headers["Cross-Origin-Opener-Policy"]).toBe("unsafe-none");
     }
   });
+
+  it("configurePreviewServer serves the bridge with the site's preview headers", async () => {
+    const plugin = nodepod();
+    const middlewares: Array<(req: { url?: string }, res: MockRes, next: () => void) => void | Promise<void>> = [];
+    const mockServer = {
+      config: {
+        server: { headers: {} },
+        preview: {
+          headers: {
+            "Cross-Origin-Opener-Policy": "same-origin",
+            "Cross-Origin-Embedder-Policy": "require-corp",
+          },
+        },
+      },
+      middlewares: { use: (mw: (typeof middlewares)[number]) => void middlewares.push(mw) },
+    };
+    await (plugin.configurePreviewServer as unknown as (s: typeof mockServer) => void | Promise<void>)(mockServer);
+    expect(middlewares).toHaveLength(1);
+
+    const res = new MockRes();
+    await middlewares[0]({ url: "/__nodepod_bridge__.html" }, res, () => {
+      throw new Error("next() should not be called for the bridge");
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["Cross-Origin-Embedder-Policy"]).toBe("require-corp");
+    expect(res.headers["Cross-Origin-Resource-Policy"]).toBe("cross-origin");
+
+    // A parent-mode bridge still overrides the site's opener policy.
+    const parent = new MockRes();
+    await middlewares[0]({ url: "/__nodepod_bridge__.html?mode=parent" }, parent, () => undefined);
+    expect(parent.headers["Cross-Origin-Opener-Policy"]).toBe("unsafe-none");
+  });
 });
 
 interface BuildAsset {
