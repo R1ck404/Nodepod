@@ -13,6 +13,38 @@ import { Nodepod } from "../sdk/nodepod";
 const here = dirname(fileURLToPath(import.meta.url));
 const workerEntry = resolve(here, "../threading/process-worker-entry.ts");
 
+// an xterm stand-in that records what the terminal displays
+class InputTerminal {
+  static last: InputTerminal | null = null;
+  readonly writes: string[] = [];
+  constructor(_options: unknown) {
+    InputTerminal.last = this;
+  }
+  open(): void {}
+  loadAddon(): void {}
+  focus(): void {}
+  dispose(): void {}
+  write(text: string): void {
+    this.writes.push(text);
+  }
+  onData(): { dispose(): void } {
+    return { dispose() {} };
+  }
+  get output(): string {
+    return this.writes.join("");
+  }
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 20_000): Promise<void> {
+  const start = Date.now();
+  while (!check()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 describe("node headless host", () => {
   let workerPath = "";
   let tempDir = "";
@@ -473,6 +505,85 @@ describe("node headless host", () => {
     expect(stdoutChunks.join("")).toBe(stdout);
     expect(stderrChunks.join("")).toBe(stderr);
     expect(pod.port(5173)).toBeNull();
+    await pod.teardown();
+  }, 60_000);
+  it("keeps a terminal's shell, and its variables, through Ctrl-C", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: { "/spin.js": "console.log('spinning'); setInterval(() => {}, 1000);" },
+    });
+    const terminal = pod.createTerminal({ Terminal: InputTerminal, autoPrompt: false });
+    terminal.attach({} as HTMLElement);
+    const term = terminal as any; // typing a line runs _executeCommand
+    const display = InputTerminal.last!;
+
+    await term._executeCommand("NAME=kept");
+    const spinning = term._executeCommand("node /spin.js");
+    await waitFor(() => display.output.includes("spinning"));
+    term._handleInput("\x03");
+    await spinning;
+    await delay(500); // a user typing the next line
+
+    // bash prints "name=kept": Ctrl-C ends the foreground job, not the shell
+    await term._executeCommand("echo name=$NAME");
+    await waitFor(() => /name=\w*/.test(display.output.split("spinning")[1] ?? ""));
+    expect(display.output).toContain("name=kept");
+    await pod.teardown();
+  }, 60_000);
+  it("runs `cmd &` as a background job in a terminal, as bash does", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/server.js": `
+          require("http")
+            .createServer((_req, res) => res.end("up"))
+            .listen(4100, () => console.log("listening"));
+        `,
+        "/spin.js": "console.log('spinning'); setInterval(() => {}, 1000);",
+        "/once.js": "console.log('once-output');",
+      },
+    });
+    const terminal = pod.createTerminal({ Terminal: InputTerminal, autoPrompt: false });
+    terminal.attach({} as HTMLElement);
+    const term = terminal as any; // typing a line runs _executeCommand
+    const display = InputTerminal.last!;
+    const prompt = (line: Promise<void>) =>
+      Promise.race([line.then(() => "prompt"), delay(5_000).then(() => "held")]);
+
+    // the prompt returns while the server runs
+    expect(await prompt(term._executeCommand("node /server.js &"))).toBe("prompt");
+    await waitFor(() => display.output.includes("listening"));
+    expect((await pod.request(4100, { path: "/" })).statusCode).toBe(200);
+
+    // Ctrl-C ends the foreground job only
+    const spinning = term._executeCommand("node /spin.js");
+    await waitFor(() => display.output.includes("spinning"));
+    term._handleInput("\x03");
+    await spinning;
+    await delay(500);
+    expect((await pod.request(4100, { path: "/" })).statusCode).toBe(200);
+
+    // a job's output is printed once, as it is written, not again when it ends
+    expect(await prompt(term._executeCommand("node /once.js &"))).toBe("prompt");
+    await waitFor(() => display.output.includes("once-output"));
+    await delay(500);
+    expect(display.output.split("once-output").length - 1).toBe(1);
     await pod.teardown();
   }, 60_000);
 });

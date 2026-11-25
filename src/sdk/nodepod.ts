@@ -83,6 +83,11 @@ let activeNodepodCount = 0;
 // trees once build-tool WASM binaries are included.
 const DEFAULT_RUNTIME_SHARED_VFS_BUFFER_SIZE = 256 * 1024 * 1024;
 
+// how long a terminal's shell worker has to end a line after Ctrl-C before it
+// is killed. Its child processes are killed after 250 ms, so a line running
+// them ends well within this.
+const SHELL_INTERRUPT_GRACE_MS = 2_000;
+
 // short url-safe id. always starts with a letter so it can't be confused
 // with a port number in /__virtual__/{id}/{port}
 function makeInstanceId(): string {
@@ -863,6 +868,12 @@ export class Nodepod {
     // and we skip the ~1s worker creation overhead per command
     let shellHandle: ProcessHandle | null = null;
     let shellReady: Promise<void> | null = null;
+    // the last line sent to the shell worker; after Ctrl-C the next line
+    // waits for it to finish, since the worker runs one line at a time
+    let lineFinished: Promise<void> = Promise.resolve();
+    // whether a line is running: output between lines comes from background
+    // jobs (`cmd &`), and goes to the terminal through the shell's own stream
+    let lineRunning = false;
 
     const ensureShellWorker = (): Promise<void> => {
       if (shellHandle && shellHandle.state !== "exited") {
@@ -898,6 +909,19 @@ export class Nodepod {
         }
       });
 
+      const jobStdout = this._createTerminalUrlOutput((data) => {
+        terminal._writeOutput(data);
+      });
+      const jobStderr = this._createTerminalUrlOutput((data) => {
+        terminal._writeOutput(data, true);
+      });
+      shellHandle.on("stdout", (data: string) => {
+        if (!lineRunning) jobStdout.push(data);
+      });
+      shellHandle.on("stderr", (data: string) => {
+        if (!lineRunning) jobStderr.push(data);
+      });
+
       shellHandle.on("cwd-change", (cwd: string) => {
         this._cwd = cwd;
         terminal.setCwd(cwd);
@@ -909,6 +933,8 @@ export class Nodepod {
 
       // Worker died -- next command will spawn a fresh one
       shellHandle.on("exit", () => {
+        this._finishTerminalUrlOutput(jobStdout);
+        this._finishTerminalUrlOutput(jobStderr);
         shellHandle = null;
         shellReady = null;
       });
@@ -980,7 +1006,9 @@ export class Nodepod {
           return;
         }
 
-        // Ensure persistent shell worker is running
+        // Ensure persistent shell worker is running, and the previous line
+        // (still ending after Ctrl-C) has finished
+        await lineFinished;
         await ensureShellWorker();
         const handle = shellHandle!;
 
@@ -1012,11 +1040,20 @@ export class Nodepod {
 
         currentSendStdin = (data: string) => handle.sendStdin(data);
 
-        // PM.kill() recursively kills descendants + cleans up server ports
+        // Ctrl-C: SIGINT ends the line, and ProcessManager forwards it to the
+        // line's child processes (escalating to SIGKILL for those that don't
+        // exit). The shell worker itself stays, keeping its variables,
+        // functions and folder, as bash does. It is killed only when the line
+        // doesn't end, e.g. a wedged worker.
+        let finished = false;
+        let escalation: ReturnType<typeof setTimeout> | null = null;
         myAbort.signal.addEventListener(
           "abort",
           () => {
-            this._processManager.kill(handle.pid, "SIGINT");
+            handle.kill("SIGINT");
+            escalation = setTimeout(() => {
+              if (!finished) this._processManager.kill(handle.pid, "SIGKILL");
+            }, SHELL_INTERRUPT_GRACE_MS);
           },
           { once: true },
         );
@@ -1031,9 +1068,13 @@ export class Nodepod {
           persistent: true,
         });
         execSent = true;
+        lineRunning = true;
 
-        return new Promise<void>((resolve) => {
+        const line = new Promise<void>((resolve) => {
           const cleanup = () => {
+            finished = true;
+            lineRunning = false;
+            if (escalation) clearTimeout(escalation);
             handle.removeListener("shell-done", onDone);
             handle.removeListener("exit", onExit);
             handle.removeListener("stdout", onStdout);
@@ -1096,6 +1137,8 @@ export class Nodepod {
           handle.on("shell-done", onDone);
           handle.on("exit", onExit);
         });
+        lineFinished = line;
+        return line;
       },
 
       getSendStdin: () => currentSendStdin,

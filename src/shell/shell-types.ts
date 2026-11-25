@@ -17,6 +17,8 @@ export interface ShellContext {
   volume: MemoryVolume;
   signal?: AbortSignal;
   limits?: ShellLimits;
+  // true inside a background job (`cmd &`): its processes don't hold the prompt or read the terminal
+  background?: boolean;
   // run a sub-command through the shell (used by npm run, etc.)
   exec: (
     cmd: string,
