@@ -79,6 +79,67 @@ describe("ProcessHandle worker handshake", () => {
     ]);
   });
 
+  it("sends messages posted during the handshake after init, in order", () => {
+    const direct = new FakeWorker();
+    const config = {
+      command: "node",
+      args: [],
+      cwd: "/",
+      env: {},
+      snapshot: { manifest: [], data: new ArrayBuffer(0) },
+    };
+    const handle = new ProcessHandle(
+      direct as unknown as Worker,
+      config,
+      () => new FakeWorker() as unknown as Worker,
+    );
+    const init = { type: "init" as const, pid: 100, cwd: "/", env: {}, snapshot: config.snapshot };
+
+    handle.init(init);
+    // a file written on the main thread while the worker starts
+    handle.postMessage({ type: "vfs-sync", path: "/a.js", content: null, isDirectory: false });
+    handle.postMessage({ type: "vfs-sync", path: "/b.js", content: null, isDirectory: false });
+    expect(direct.sent).toEqual([{ type: "probe" }]);
+
+    direct.emit("message", { data: { type: "probe-ready" } });
+
+    expect(direct.sent).toEqual([
+      { type: "probe" },
+      init,
+      { type: "vfs-sync", path: "/a.js", content: null, isDirectory: false },
+      { type: "vfs-sync", path: "/b.js", content: null, isDirectory: false },
+    ]);
+  });
+
+  it("sends messages posted during the handshake to the fallback worker after init", () => {
+    vi.useFakeTimers();
+    const direct = new FakeWorker();
+    const embedded = new FakeWorker();
+    const config = {
+      command: "node",
+      args: [],
+      cwd: "/",
+      env: {},
+      snapshot: { manifest: [], data: new ArrayBuffer(0) },
+    };
+    const handle = new ProcessHandle(
+      direct as unknown as Worker,
+      config,
+      () => embedded as unknown as Worker,
+    );
+    const init = { type: "init" as const, pid: 100, cwd: "/", env: {}, snapshot: config.snapshot };
+
+    handle.init(init);
+    handle.postMessage({ type: "vfs-sync", path: "/a.js", content: null, isDirectory: false });
+    vi.advanceTimersByTime(2_000);
+
+    expect(direct.sent).toEqual([{ type: "probe" }]);
+    expect(embedded.sent).toEqual([
+      init,
+      { type: "vfs-sync", path: "/a.js", content: null, isDirectory: false },
+    ]);
+  });
+
   it("terminates a worker that never becomes ready", () => {
     vi.useFakeTimers();
     const worker = new FakeWorker();

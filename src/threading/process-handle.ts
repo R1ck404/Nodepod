@@ -34,6 +34,9 @@ export class ProcessHandle extends EventEmitter {
   private _stderr = "";
   private _fallbackWorker: (() => HostWorker) | null;
   private _pendingInit: { msg: MainToWorker_Init; transfer: Transferable[] } | null = null;
+  // messages posted while init waits for the probe: sent after init, in order,
+  // so file syncs made meanwhile aren't dropped by a worker without a volume
+  private _queuedBeforeInit: Array<{ msg: MainToWorkerMessage; transfer?: Transferable[] }> = [];
   private _probeTimer: ReturnType<typeof setTimeout> | null = null;
   private _readyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -83,7 +86,21 @@ export class ProcessHandle extends EventEmitter {
   }
 
   postMessage(msg: MainToWorkerMessage, transfer?: Transferable[]): void {
+    if (this._pendingInit) {
+      this._queuedBeforeInit.push({ msg, transfer });
+      return;
+    }
     this.worker.postMessage(attachWasmMessageMetadata(msg), transfer ?? []);
+  }
+
+  private _sendPendingInit(): void {
+    const pending = this._pendingInit;
+    if (!pending) return;
+    this._pendingInit = null;
+    this.postMessage(pending.msg, pending.transfer);
+    const queued = this._queuedBeforeInit;
+    this._queuedBeforeInit = [];
+    for (const { msg, transfer } of queued) this.postMessage(msg, transfer);
   }
 
   init(initMsg: MainToWorker_Init, extraTransfer?: Transferable[]): void {
@@ -192,6 +209,8 @@ export class ProcessHandle extends EventEmitter {
     this._state = "exited";
     this._exitCode = exitCode;
     this._deferredExit = null;
+    this._pendingInit = null;
+    this._queuedBeforeInit = [];
     this._exitHoldCount = 0;
     if (this._probeTimer) clearTimeout(this._probeTimer);
     if (this._readyTimer) clearTimeout(this._readyTimer);
@@ -214,11 +233,7 @@ export class ProcessHandle extends EventEmitter {
           if (this._probeTimer) clearTimeout(this._probeTimer);
           this._probeTimer = null;
           this._fallbackWorker = null;
-          if (this._pendingInit) {
-            const pending = this._pendingInit;
-            this._pendingInit = null;
-            this.postMessage(pending.msg, pending.transfer);
-          }
+          this._sendPendingInit();
           break;
 
         case "ready":
@@ -417,11 +432,7 @@ export class ProcessHandle extends EventEmitter {
     try {
       this.worker = factory();
       this._setupWorkerListeners(this.worker);
-      if (this._pendingInit) {
-        const pending = this._pendingInit;
-        this._pendingInit = null;
-        this.postMessage(pending.msg, pending.transfer);
-      }
+      this._sendPendingInit();
     } catch (error) {
       this.emit("worker-error", error instanceof Error ? error.message : String(error), undefined);
       this._terminate(1);
