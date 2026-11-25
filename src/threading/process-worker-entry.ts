@@ -1288,6 +1288,7 @@ export function spawnChild(
     stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    background?: boolean;
   },
 ): import("../polyfills/child_process.js").SpawnChildOperation {
   const requestId = _nextRequestId++;
@@ -1339,6 +1340,7 @@ export function spawnChild(
       stdio,
       ...(kept.data.length ? { stdin: kept.data } : {}),
       ...(kept.ended ? { stdinEnded: true } : {}),
+      ...(opts?.background ? { background: true } : {}),
     });
   });
   return Object.assign(operation, {

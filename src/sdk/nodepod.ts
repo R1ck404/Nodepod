@@ -871,6 +871,9 @@ export class Nodepod {
     // the last line sent to the shell worker; after Ctrl-C the next line
     // waits for it to finish, since the worker runs one line at a time
     let lineFinished: Promise<void> = Promise.resolve();
+    // whether a line is running: output between lines comes from background
+    // jobs (`cmd &`), and goes to the terminal through the shell's own stream
+    let lineRunning = false;
 
     const ensureShellWorker = (): Promise<void> => {
       if (shellHandle && shellHandle.state !== "exited") {
@@ -906,6 +909,19 @@ export class Nodepod {
         }
       });
 
+      const jobStdout = this._createTerminalUrlOutput((data) => {
+        terminal._writeOutput(data);
+      });
+      const jobStderr = this._createTerminalUrlOutput((data) => {
+        terminal._writeOutput(data, true);
+      });
+      shellHandle.on("stdout", (data: string) => {
+        if (!lineRunning) jobStdout.push(data);
+      });
+      shellHandle.on("stderr", (data: string) => {
+        if (!lineRunning) jobStderr.push(data);
+      });
+
       shellHandle.on("cwd-change", (cwd: string) => {
         this._cwd = cwd;
         terminal.setCwd(cwd);
@@ -917,6 +933,8 @@ export class Nodepod {
 
       // Worker died -- next command will spawn a fresh one
       shellHandle.on("exit", () => {
+        this._finishTerminalUrlOutput(jobStdout);
+        this._finishTerminalUrlOutput(jobStderr);
         shellHandle = null;
         shellReady = null;
       });
@@ -1050,10 +1068,12 @@ export class Nodepod {
           persistent: true,
         });
         execSent = true;
+        lineRunning = true;
 
         const line = new Promise<void>((resolve) => {
           const cleanup = () => {
             finished = true;
+            lineRunning = false;
             if (escalation) clearTimeout(escalation);
             handle.removeListener("shell-done", onDone);
             handle.removeListener("exit", onExit);

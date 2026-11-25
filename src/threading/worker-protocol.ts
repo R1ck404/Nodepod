@@ -340,6 +340,8 @@ export interface WorkerToMain_SpawnRequest {
   // input typed before the child started, for a child that inherits stdin
   stdin?: string[];
   stdinEnded?: boolean;
+  // started by a background job (`cmd &`): the parent's shell line doesn't wait for it
+  background?: boolean;
 }
 
 export interface WorkerToMain_ChildSignal {

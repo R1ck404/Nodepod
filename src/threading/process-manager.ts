@@ -118,6 +118,8 @@ export class ProcessManager extends EventEmitter {
   // pids of children whose stdout is their parent's terminal: they start at
   // the parent's size and get its resizes, like processes sharing a tty
   private _ttyChildren = new Set<number>();
+  // children started by a shell's background job (`cmd &`); Ctrl-C's SIGINT skips them
+  private _backgroundChildren = new Set<number>();
   // spawnSync/execSync results bigger than one sync slot, by slot handle
   private _syncWriters = new Map<number, { pid: number; writer: SyncResultWriter }>();
   private _httpCallbacks = new Map<
@@ -432,10 +434,12 @@ export class ProcessManager extends EventEmitter {
     }
   }
 
-  private _killDescendants(pid: number, signal: string): void {
+  private _killDescendants(pid: number, signal: string, foregroundOnly = false): void {
     const children = this._childPids.get(pid);
     if (!children) return;
     for (const childPid of children) {
+      // as in a terminal, Ctrl-C reaches the foreground job, not background ones
+      if (foregroundOnly && this._backgroundChildren.has(childPid)) continue;
       const childHandle = this._processes.get(childPid);
       if (childHandle && childHandle.state !== "exited") {
         this._killWithFallback(childHandle, signal);
@@ -443,7 +447,7 @@ export class ProcessManager extends EventEmitter {
         childHandle.removeAllListeners("stdout");
         childHandle.removeAllListeners("stderr");
       }
-      this._killDescendants(childPid, signal);
+      this._killDescendants(childPid, signal, foregroundOnly);
     }
   }
 
@@ -461,6 +465,7 @@ export class ProcessManager extends EventEmitter {
     this._childPids.clear();
     this._inheritStdinChildren.clear();
     this._ttyChildren.clear();
+    this._backgroundChildren.clear();
     for (const [requestId, entry] of this._httpCallbacks) {
       entry.fn({
         type: "http-response",
@@ -484,6 +489,7 @@ export class ProcessManager extends EventEmitter {
     }
     this._inheritStdinChildren.delete(pid);
     this._ttyChildren.delete(pid);
+    this._backgroundChildren.delete(pid);
     this._childPids.delete(pid);
     for (const children of this._childPids.values()) children.delete(pid);
     for (const [key, owned] of this._wasiWorkers) {
@@ -913,7 +919,7 @@ export class ProcessManager extends EventEmitter {
   private _wireHandleEvents(handle: ProcessHandle): void {
     // forward signals to all descendants, works whether parent is running or exited
     handle.on("signal", (signal: string) => {
-      this._killDescendants(handle.pid, signal);
+      this._killDescendants(handle.pid, signal, signal === "SIGINT");
     });
 
     // forward stdin to children even when parent is blocked on Atomics.wait.
@@ -1063,9 +1069,12 @@ export class ProcessManager extends EventEmitter {
           this._shareTerminal(handle, childHandle);
         }
 
-        // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
+        // defer parent exit/done until child finishes (e.g. create-vite -> vite dev).
+        // A background job's child leaves the shell's line done, so the prompt returns.
+        const holdsShellDone = !msg.background;
+        if (msg.background) this._backgroundChildren.add(childHandle.pid);
         handle.holdExit();
-        handle.holdShellDone();
+        if (holdsShellDone) handle.holdShellDone();
 
         handle.postMessage({
           type: "spawn-result",
@@ -1181,7 +1190,7 @@ export class ProcessManager extends EventEmitter {
           this._inheritStdinChildren.delete(childHandle.pid);
           this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
-          handle.releaseShellDone();
+          if (holdsShellDone) handle.releaseShellDone();
         });
       } catch (e) {
         handle.postMessage({

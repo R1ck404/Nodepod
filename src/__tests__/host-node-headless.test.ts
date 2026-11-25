@@ -538,4 +538,52 @@ describe("node headless host", () => {
     expect(display.output).toContain("name=kept");
     await pod.teardown();
   }, 60_000);
+  it("runs `cmd &` as a background job in a terminal, as bash does", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/server.js": `
+          require("http")
+            .createServer((_req, res) => res.end("up"))
+            .listen(4100, () => console.log("listening"));
+        `,
+        "/spin.js": "console.log('spinning'); setInterval(() => {}, 1000);",
+        "/once.js": "console.log('once-output');",
+      },
+    });
+    const terminal = pod.createTerminal({ Terminal: InputTerminal, autoPrompt: false });
+    terminal.attach({} as HTMLElement);
+    const term = terminal as any; // typing a line runs _executeCommand
+    const display = InputTerminal.last!;
+    const prompt = (line: Promise<void>) =>
+      Promise.race([line.then(() => "prompt"), delay(5_000).then(() => "held")]);
+
+    // the prompt returns while the server runs
+    expect(await prompt(term._executeCommand("node /server.js &"))).toBe("prompt");
+    await waitFor(() => display.output.includes("listening"));
+    expect((await pod.request(4100, { path: "/" })).statusCode).toBe(200);
+
+    // Ctrl-C ends the foreground job only
+    const spinning = term._executeCommand("node /spin.js");
+    await waitFor(() => display.output.includes("spinning"));
+    term._handleInput("\x03");
+    await spinning;
+    await delay(500);
+    expect((await pod.request(4100, { path: "/" })).statusCode).toBe(200);
+
+    // a job's output is printed once, as it is written, not again when it ends
+    expect(await prompt(term._executeCommand("node /once.js &"))).toBe("prompt");
+    await waitFor(() => display.output.includes("once-output"));
+    await delay(500);
+    expect(display.output.split("once-output").length - 1).toBe(1);
+    await pod.teardown();
+  }, 60_000);
 });

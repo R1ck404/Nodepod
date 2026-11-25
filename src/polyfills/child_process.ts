@@ -219,6 +219,8 @@ export type SpawnChildCallback = (
     stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    // started by a background job: the shell's line doesn't wait for it
+    background?: boolean;
   },
 ) => SpawnChildOperation;
 
@@ -476,7 +478,9 @@ async function executeShellNodeBinary(filePath: string, args: string[], ctx: She
   const operation = _spawnChildFn("node", [filePath, ...args], {
     cwd: ctx.cwd,
     env: ctx.env,
-    stdio: "inherit",
+    // a background job writes to the terminal but doesn't read from it
+    stdio: ctx.background ? ["pipe", "inherit", "inherit"] : "inherit",
+    ...(ctx.background ? { background: true } : {}),
     onStdout: stdoutSink ?? undefined,
     onStderr: stderrSink ?? undefined,
   });
@@ -485,9 +489,11 @@ async function executeShellNodeBinary(filePath: string, args: string[], ctx: She
   else ctx.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const result = await operation;
+    // a background job returns nothing it streamed, or the job's end would
+    // print its whole output a second time
     return {
-      stdout: result.stdout,
-      stderr: result.stderr,
+      stdout: ctx.background && stdoutSink ? "" : result.stdout,
+      stderr: ctx.background && stderrSink ? "" : result.stderr,
       exitCode: ctx.signal?.aborted ? 130 : result.exitCode,
     };
   } catch (error) {

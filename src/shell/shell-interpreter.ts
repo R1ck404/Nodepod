@@ -103,6 +103,8 @@ export class NodepodShell {
   private readonlyNames = new Set<string>();
   private localScopes: Array<Map<string, string | undefined>> = [];
   private signalCleanup: (() => void) | null = null;
+  // set on the shell running a background job (`cmd &`), and on its clones
+  private background = false;
 
   constructor(
     volume: MemoryVolume,
@@ -501,6 +503,7 @@ export class NodepodShell {
           };
         }
         const jobShell = this.createExecutionClone();
+        jobShell.background = true;
         const cancellation = new ShellCancellation();
         jobShell.setCancellationSignal(cancellation.signal);
         const promise = jobShell.execBashAndOr(entry.command).then((r) => {
@@ -1619,6 +1622,7 @@ export class NodepodShell {
     clone.arithmeticDepth = this.arithmeticDepth;
     clone.traps = new Map(this.traps);
     clone.readonlyNames = new Set(this.readonlyNames);
+    clone.background = this.background;
     clone.setSpawnChildCallback(this._spawnChild);
     clone.setBackgroundOutputCallbacks(this.backgroundStdout, this.backgroundStderr);
     return clone;
@@ -1674,6 +1678,7 @@ export class NodepodShell {
       volume: this.volume,
       signal: this.activeSignal ?? undefined,
       limits: this.shellOptions.limits,
+      ...(this.background ? { background: true } : {}),
       // Utility-launched commands have process-like isolation. Besides being
       // the correct cwd/environment behavior, this prevents a nested command
       // from waiting on the serialization slot held by its own parent.
