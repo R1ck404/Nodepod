@@ -13,6 +13,38 @@ import { Nodepod } from "../sdk/nodepod";
 const here = dirname(fileURLToPath(import.meta.url));
 const workerEntry = resolve(here, "../threading/process-worker-entry.ts");
 
+// an xterm stand-in that records what the terminal displays
+class InputTerminal {
+  static last: InputTerminal | null = null;
+  readonly writes: string[] = [];
+  constructor(_options: unknown) {
+    InputTerminal.last = this;
+  }
+  open(): void {}
+  loadAddon(): void {}
+  focus(): void {}
+  dispose(): void {}
+  write(text: string): void {
+    this.writes.push(text);
+  }
+  onData(): { dispose(): void } {
+    return { dispose() {} };
+  }
+  get output(): string {
+    return this.writes.join("");
+  }
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 20_000): Promise<void> {
+  const start = Date.now();
+  while (!check()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 describe("node headless host", () => {
   let workerPath = "";
   let tempDir = "";
@@ -473,6 +505,37 @@ describe("node headless host", () => {
     expect(stdoutChunks.join("")).toBe(stdout);
     expect(stderrChunks.join("")).toBe(stderr);
     expect(pod.port(5173)).toBeNull();
+    await pod.teardown();
+  }, 60_000);
+  it("keeps a terminal's shell, and its variables, through Ctrl-C", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: { "/spin.js": "console.log('spinning'); setInterval(() => {}, 1000);" },
+    });
+    const terminal = pod.createTerminal({ Terminal: InputTerminal, autoPrompt: false });
+    terminal.attach({} as HTMLElement);
+    const term = terminal as any; // typing a line runs _executeCommand
+    const display = InputTerminal.last!;
+
+    await term._executeCommand("NAME=kept");
+    const spinning = term._executeCommand("node /spin.js");
+    await waitFor(() => display.output.includes("spinning"));
+    term._handleInput("\x03");
+    await spinning;
+    await delay(500); // a user typing the next line
+
+    // bash prints "name=kept": Ctrl-C ends the foreground job, not the shell
+    await term._executeCommand("echo name=$NAME");
+    await waitFor(() => /name=\w*/.test(display.output.split("spinning")[1] ?? ""));
+    expect(display.output).toContain("name=kept");
     await pod.teardown();
   }, 60_000);
 });
