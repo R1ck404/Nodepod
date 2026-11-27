@@ -187,9 +187,11 @@ function isWordBoundary(source: string, offset: number): boolean {
   return offset === 0 || /[\s;|&(){}<>!]/.test(source[offset - 1] ?? "");
 }
 
+// `{` and `}` are reserved words only as whole words: `{}` (find -exec) is a word.
 function isStandaloneBrace(source: string, offset: number): boolean {
+  const previous = offset === 0 ? "" : source[offset - 1];
   const next = source[offset + 1] ?? "";
-  return isWordBoundary(source, offset) && (next === "" || /[\s;|&(){}<>]/.test(next));
+  return (previous === "" || /[\s;|&()<>]/.test(previous)) && (next === "" || /[\s;|&()<>]/.test(next));
 }
 
 function substitutionEnd(source: string, start: number): number {
@@ -337,6 +339,15 @@ function lex(source: string): Token[] {
       if (c === "\\" && quote !== "single") {
         escaped = true;
         i++;
+        continue;
+      }
+      // `$'…'`: ANSI-C quoting, where `\'` doesn't end the quote
+      if (!quote && c === "$" && source[i + 1] === "'") {
+        let end = i + 2;
+        while (end < source.length && source[end] !== "'") end += source[end] === "\\" ? 2 : 1;
+        if (end >= source.length) throw syntax("unexpected end of quoted string", source, i);
+        value += source.slice(i, end + 1);
+        i = end + 1;
         continue;
       }
       if (!quote && c === "$" && source[i + 1] === "(") {
@@ -496,8 +507,9 @@ class Parser {
       }
       entries.push({ command, separator });
 
-      // `( cmd )` needs no separator before its `)`
-      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value) && this.peek().value !== ")") {
+      // `( cmd )` needs no separator before its `)`, nor a compound command
+      // before `}` (`{ { cmd; } }`); after a simple command `}` is a word
+      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value) && this.peek().value !== ")" && this.peek().value !== "}") {
         throw syntax(`unexpected token '${this.peek().value}'`, this.source, this.peek().start);
       }
       if (separator === "&") this.skipNewlines();

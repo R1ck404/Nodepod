@@ -46,6 +46,7 @@ import {
 } from "./shell-stream-commands.js";
 import { ShellCancellation, ShellPipe, streamToString } from "./shell-stream.js";
 import { yieldToEventLoop } from "./shell-helpers.js";
+import { BASH_BUILTIN_HELP, BASH_KEYWORDS } from "./bash-help.js";
 
 type ShellControl = { kind: "break" | "continue" | "return" | "exit"; code?: number; stdout?: string; stderr?: string };
 
@@ -1491,9 +1492,17 @@ export class NodepodShell {
     const { assignmentValues } = collected;
 
     const args = await this.expandBashWords(command.words);
+    if (args[0] === "type") return this.withBashRedirects(command.redirects, stdin, async () => this.execType(args.slice(1)));
+    if (args[0] === "command" && /^-[pvV]+$/.test(args[1] ?? "") && /[vV]/.test(args[1])) {
+      return this.withBashRedirects(command.redirects, stdin, async () => this.execCommandLookup(args[1].includes("V"), args.slice(2)));
+    }
     let commandPrefixes = 0;
+    // `command` and `builtin` skip functions (and aliases, which are already expanded)
+    let bypassFunctions = false;
     while (args.length > 0 && (args[0] === "command" || args[0] === "builtin" || args[0] === "exec")) {
+      if (args[0] !== "exec") bypassFunctions = true;
       args.shift();
+      if ((args[0] as string) === "-p" && commandPrefixes === 0) args.shift();
       if (++commandPrefixes > this.shellOptions.limits.maxRecursionDepth) {
         return { stdout: "", stderr: "shell: command prefix limit exceeded\n", exitCode: 1 };
       }
@@ -1614,7 +1623,7 @@ export class NodepodShell {
       return { stdout: [this.cwd, ...[...this.directoryStack].reverse()].join(" ") + "\n", stderr: "", exitCode: 0 };
     }
 
-    const fn = this.functions.get(args[0]);
+    const fn = bypassFunctions ? undefined : this.functions.get(args[0]);
     if (fn) {
       if (this.recursionDepth >= this.shellOptions.limits.maxRecursionDepth) {
         return { stdout: "", stderr: `shell: recursion depth exceeds ${this.shellOptions.limits.maxRecursionDepth}\n`, exitCode: 1 };
@@ -2389,6 +2398,108 @@ export class NodepodShell {
     }
 
     return result;
+  }
+
+  // What a name runs, in bash's order: alias, keyword, function, builtin,
+  // then files on PATH. Nodepod's other commands (ls, grep, ...) are files in
+  // bash, so they report the /usr/bin path that also runs them.
+  private describeName(name: string, all: boolean, skipFunctions = false, pathOnly = false): { kind: "alias" | "keyword" | "function" | "builtin" | "file"; detail: string }[] {
+    const found: { kind: "alias" | "keyword" | "function" | "builtin" | "file"; detail: string }[] = [];
+    const done = () => !all && found.length > 0;
+    if (!pathOnly) {
+      if (this.aliases.has(name)) found.push({ kind: "alias", detail: this.aliases.get(name)! });
+      if (!done() && BASH_KEYWORDS.has(name)) found.push({ kind: "keyword", detail: name });
+      if (!done() && !skipFunctions && this.functions.has(name)) found.push({ kind: "function", detail: name });
+      if (!done() && BASH_BUILTIN_HELP[name]) found.push({ kind: "builtin", detail: name });
+    }
+    if (done()) return found;
+    if (name.includes("/")) {
+      if (this.volume.existsSync(this.resolvePath(name))) found.push({ kind: "file", detail: name });
+      return found;
+    }
+    const paths = new Set<string>();
+    for (const dir of (this.env.PATH || "").split(":")) {
+      if (!dir) continue;
+      const candidate = `${dir.replace(/\/$/, "")}/${name}`;
+      try {
+        if (this.volume.statSync(candidate).isFile()) paths.add(candidate);
+      } catch { /* not here */ }
+      if (paths.size && !all) break;
+    }
+    if (!paths.size && (builtins.has(name) || this.commands.has(name)) && !BASH_BUILTIN_HELP[name]) {
+      paths.add(["node", "npm", "npx", "pnpm", "yarn", "bun", "bunx"].includes(name) ? `/usr/local/bin/${name}` : `/usr/bin/${name}`);
+    }
+    for (const path of paths) found.push({ kind: "file", detail: path });
+    return found;
+  }
+
+  // type [-afptP] name ...
+  private execType(args: string[]): ShellResult {
+    let all = false, kindOnly = false, pathOnly = false, forcePath = false, skipFunctions = false;
+    const names: string[] = [];
+    let options = true;
+    for (const arg of args) {
+      if (options && /^-[afptP]+$/.test(arg)) {
+        if (arg.includes("a")) all = true;
+        if (arg.includes("t")) kindOnly = true;
+        if (arg.includes("p")) pathOnly = true;
+        if (arg.includes("P")) forcePath = true;
+        if (arg.includes("f")) skipFunctions = true;
+        continue;
+      }
+      if (options && arg === "--") { options = false; continue; }
+      if (options && arg.startsWith("-") && arg !== "-") {
+        return { stdout: "", stderr: `${this.shellName ?? "bash"}: type: ${arg}: invalid option\ntype: usage: type [-afptP] name [name ...]\n`, exitCode: 2 };
+      }
+      names.push(arg);
+    }
+    let stdout = "";
+    let stderr = "";
+    let status = 0;
+    for (const name of names) {
+      const found = this.describeName(name, all, skipFunctions, forcePath);
+      if (!found.length) {
+        status = 1;
+        if (!kindOnly && !pathOnly && !forcePath) stderr += `${this.shellName ?? "bash"}: type: ${name}: not found\n`;
+        continue;
+      }
+      for (const entry of found) {
+        if (kindOnly) { stdout += entry.kind + "\n"; continue; }
+        if (pathOnly || forcePath) {
+          if (entry.kind === "file") stdout += entry.detail + "\n";
+          continue;
+        }
+        if (entry.kind === "alias") stdout += `${name} is aliased to \`${entry.detail}'\n`;
+        else if (entry.kind === "keyword") stdout += `${name} is a shell keyword\n`;
+        else if (entry.kind === "function") stdout += `${name} is a function\n`;
+        else if (entry.kind === "builtin") stdout += `${name} is a shell builtin\n`;
+        else stdout += `${name} is ${entry.detail}\n`;
+      }
+    }
+    return { stdout, stderr, exitCode: status };
+  }
+
+  // command -v name ... / command -V name ...
+  private execCommandLookup(verbose: boolean, names: string[]): ShellResult {
+    let stdout = "";
+    let stderr = "";
+    let status = 0;
+    for (const name of names) {
+      const [entry] = this.describeName(name, false);
+      if (!entry) {
+        status = 1;
+        if (verbose) stderr += `${this.shellName ?? "bash"}: command: ${name}: not found\n`;
+        continue;
+      }
+      if (verbose) {
+        stdout += this.execType([name]).stdout;
+        continue;
+      }
+      if (entry.kind === "alias") stdout += `alias ${name}='${entry.detail.replace(/'/g, "'\\''")}'\n`;
+      else if (entry.kind === "file") stdout += entry.detail + "\n";
+      else stdout += name + "\n";
+    }
+    return { stdout, stderr, exitCode: status };
   }
 
   private handleAlias(args: string[]): ShellResult {

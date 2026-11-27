@@ -61,8 +61,9 @@ describe("Bash-compatible shell front-end", () => {
     });
     const result = await shell.exec("find . -maxdepth 2 -not -path '*/\\.git/*'");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("/workspace/a.txt");
-    expect(result.stdout).not.toContain("/workspace/.git/config");
+    // as in bash, paths start from the starting point as typed
+    expect(result.stdout).toContain("./a.txt\n");
+    expect(result.stdout).not.toContain(".git/config");
   });
 
   it("completes an empty workspace find pipeline", async () => {
@@ -112,8 +113,8 @@ describe("Bash-compatible shell front-end", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("---\n");
-    expect(result.stdout).toContain("/workspace/app.txt\n");
-    expect(result.stdout).not.toContain("/workspace/.git/config\n");
+    expect(result.stdout).toContain("./app.txt\n");
+    expect(result.stdout).not.toContain(".git/config\n");
   });
 
   it("completes find with stderr redirection and pwd", async () => {
@@ -145,7 +146,7 @@ describe("Bash-compatible shell front-end", () => {
     ]);
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("/workspace\n/workspace\nFILES:\n");
+    expect(result.stdout).toContain("/workspace\n.\nFILES:\n");
     expect(result.stdout.trimEnd().endsWith("0")).toBe(true);
   });
 
@@ -181,7 +182,8 @@ describe("Bash-compatible shell front-end", () => {
     ]);
     expect(second.exitCode).toBe(0);
     expect(second.stderr).toBe("");
-    expect(second.stdout).toBe("total 0$\n===\n^[[1;34m.^[[0m  ^[[1;34m..^[[0m$\n");
+    // ls in a pipe prints one name per line, without colors, as in bash
+    expect(second.stdout).toBe("total 0$\n===\n.$\n..$\n");
   });
 
   it("expands tildes and performs depth-first find traversal", async () => {
@@ -192,7 +194,7 @@ describe("Bash-compatible shell front-end", () => {
     expect(tilde.stdout).toBe("/home/user\n/home/user/nested\n");
 
     const depth = await shell.exec("find . -depth -maxdepth 2 -type d");
-    expect(depth.stdout.indexOf("/workspace/nested\n")).toBeLessThan(depth.stdout.indexOf("/workspace\n"));
+    expect(depth.stdout).toBe("./nested\n.\n");
   });
 
   it("preserves standard head and tail newline boundaries", async () => {

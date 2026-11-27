@@ -47,7 +47,9 @@ function matchMtime(mtimeMs: number, spec: string): boolean {
 /*  Commands                                                           */
 /* ------------------------------------------------------------------ */
 
-type FindEntry = { path: string; name: string; stat: ReturnType<MemoryVolume["statSync"]> };
+// `path` is the path as find prints it (from the starting point as typed),
+// `real` is the absolute path in the volume.
+type FindEntry = { path: string; real: string; name: string; stat: ReturnType<MemoryVolume["statSync"]> };
 type FindEval = { value: boolean; prune?: boolean; stdout: string; stderr: string };
 type FindNode =
   | { kind: "true" | "false" }
@@ -59,12 +61,13 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
   let maxDepth = Infinity;
   let minDepth = 0;
   let depthFirst = false;
-  const paths: string[] = [];
+  const paths: { real: string; display: string }[] = [];
   let index = 0;
   while (index < args.length && !args[index].startsWith("-") && args[index] !== "!" && args[index] !== "(" && args[index] !== "\\(") {
-    paths.push(resolvePath(args[index++], ctx.cwd));
+    const typed = args[index++];
+    paths.push({ real: resolvePath(typed, ctx.cwd), display: typed });
   }
-  if (!paths.length) paths.push(ctx.cwd);
+  if (!paths.length) paths.push({ real: ctx.cwd, display: "." });
 
   const expression: string[] = [];
   while (index < args.length) {
@@ -85,6 +88,7 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
   }
 
   let hasAction = false;
+  const batchedRuns: (() => Promise<{ status: number; stdout: string; stderr: string }>)[] = [];
   const action = (run: (entry: FindEntry) => Promise<FindEval>): FindNode => {
     hasAction = true;
     return { kind: "test", run };
@@ -133,13 +137,21 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
       if (spec === undefined) throw new Error("find: missing argument to '-size'");
       return primary((entry) => matchSize(entry.stat.size, spec));
     }
+    if (token === "-newer") {
+      const reference = expression[cursor++];
+      if (reference === undefined) throw new Error("find: missing argument to '-newer'");
+      let referenceTime: number;
+      try { referenceTime = ctx.volume.statSync(resolvePath(reference, ctx.cwd)).mtimeMs; }
+      catch { throw new Error(`find: '${reference}': No such file or directory`); }
+      return primary((entry) => entry.stat.mtimeMs > referenceTime);
+    }
     if (token === "-mtime") {
       const spec = expression[cursor++];
       if (spec === undefined) throw new Error("find: missing argument to '-mtime'");
       return primary((entry) => matchMtime(entry.stat.mtimeMs, spec));
     }
     if (token === "-empty") {
-      return primary((entry) => entry.stat.isDirectory() ? ctx.volume.readdirSync(entry.path).length === 0 : entry.stat.isFile() && entry.stat.size === 0);
+      return primary((entry) => entry.stat.isDirectory() ? ctx.volume.readdirSync(entry.real).length === 0 : entry.stat.isFile() && entry.stat.size === 0);
     }
     if (token === "-prune") {
       return { kind: "test", run: async (entry) => ({ value: true, prune: entry.stat.isDirectory(), stdout: "", stderr: "" }) };
@@ -151,8 +163,8 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
     if (token === "-delete") {
       return action(async (entry) => {
         try {
-          if (entry.stat.isDirectory()) ctx.volume.rmdirSync(entry.path);
-          else ctx.volume.unlinkSync(entry.path);
+          if (entry.stat.isDirectory()) ctx.volume.rmdirSync(entry.real);
+          else ctx.volume.unlinkSync(entry.real);
           return { value: true, prune: true, stdout: "", stderr: "" };
         } catch (error) {
           return { value: false, stdout: "", stderr: `find: ${entry.path}: ${(error as Error).message}\n` };
@@ -161,14 +173,44 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
     }
     if (token === "-exec" || token === "-execdir") {
       const command: string[] = [];
-      while (cursor < expression.length && expression[cursor] !== ";" && expression[cursor] !== "+") command.push(expression[cursor++]);
-      if (expression[cursor] !== ";" && expression[cursor] !== "+") throw new Error("find: missing argument to '" + token + "'");
-      cursor++;
-      return action(async (entry) => {
-        if (!command.length) return { value: false, stdout: "", stderr: "find: missing argument to '-exec'\n" };
-        const commandArgs = command.map((part) => part === "{}" ? entry.path : part);
-        const result = await ctx.exec(commandArgs.map(shellQuote).join(" "), { cwd: ctx.cwd, env: ctx.env });
+      // `;` ends the command; `+` does only straight after `{}`
+      while (cursor < expression.length && expression[cursor] !== ";" && !(expression[cursor] === "+" && command[command.length - 1] === "{}")) {
+        command.push(expression[cursor++]);
+      }
+      if (cursor >= expression.length || !command.length) throw new Error("find: missing argument to '" + token + "'");
+      const batched = expression[cursor++] === "+";
+      const inDir = token === "-execdir";
+      const target = (entry: FindEntry) => inDir ? (entry.name === "/" ? "/" : "./" + entry.name) : entry.path;
+      const folder = (entry: FindEntry) => inDir ? entry.real.slice(0, entry.real.lastIndexOf("/")) || "/" : ctx.cwd;
+      const run = async (cwd: string, targets: string[]): Promise<FindEval> => {
+        const commandArgs = batched
+          ? command.flatMap((part, i) => i === command.length - 1 ? targets : [part])
+          : command.map((part) => part.replaceAll("{}", targets[0]));
+        const result = await ctx.exec(commandArgs.map(shellQuote).join(" "), { cwd, env: ctx.env });
         return { value: result.exitCode === 0, stdout: result.stdout, stderr: result.stderr };
+      };
+      if (!batched) return action((entry) => run(folder(entry), [target(entry)]));
+      // `{} +` collects the paths (per folder for -execdir) and runs the
+      // command once at the end, like find's own batching
+      const batches = new Map<string, string[]>();
+      batchedRuns.push(async () => {
+        let status = 0;
+        let stdout = "";
+        let stderr = "";
+        for (const [cwd, targets] of batches) {
+          const result = await run(cwd, targets);
+          if (!result.value) status = 1;
+          stdout += result.stdout;
+          stderr += result.stderr;
+        }
+        return { status, stdout, stderr };
+      });
+      return action(async (entry) => {
+        const cwd = folder(entry);
+        const list = batches.get(cwd) ?? [];
+        list.push(target(entry));
+        batches.set(cwd, list);
+        return { value: true, stdout: "", stderr: "" };
       });
     }
     throw new Error("find: unknown predicate '" + token + "'");
@@ -236,8 +278,9 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
     else outputs.push(value);
   };
   let visited = 0;
+  let batchFailed = false;
   const limit = ctx.limits?.maxFilesystemEntries ?? 100000;
-  const walk = async (path: string, depth: number): Promise<void> => {
+  const walk = async (path: string, display: string, depth: number): Promise<void> => {
     if (ctx.signal?.aborted) throw new Error("find: command cancelled");
     if (++visited > limit) throw new Error(`find: filesystem entry limit ${limit} exceeded`);
     let stat: ReturnType<MemoryVolume["lstatSync"]>;
@@ -248,35 +291,47 @@ const find_cmd: BuiltinFn = async (args, ctx) => {
       stat = ctx.volume.lstatSync(path);
     } catch { return; }
     const name = path === "/" ? "/" : path.slice(path.lastIndexOf("/") + 1);
-    const entry = { path, name, stat };
+    const entry = { path: display, real: path, name, stat };
     const evaluateEntry = async (): Promise<FindEval> => {
       if (depth < minDepth || depth > maxDepth) return { value: true, stdout: "", stderr: "" };
       const result = await evaluate(root, entry);
-      if (result.value && !hasAction) appendOutput(path + "\n");
+      if (result.value && !hasAction) appendOutput(display + "\n");
       appendOutput(result.stdout);
       appendOutput(result.stderr, true);
       return result;
     };
 
     const preOrder = depthFirst ? { value: true, stdout: "", stderr: "" } : await evaluateEntry();
-    if (!stat.isDirectory() || depth >= maxDepth || (!depthFirst && preOrder.prune)) return;
-    for (const child of ctx.volume.readdirSync(path)) {
-      if (ctx.signal?.aborted) throw new Error("find: command cancelled");
-      const childPath = path === "/" ? `/${child}` : `${path}/${child}`;
-      await walk(childPath, depth + 1);
-      if ((visited & 255) === 0) await yieldToEventLoop(ctx.signal);
+    if (stat.isDirectory() && depth < maxDepth && (depthFirst || !preOrder.prune)) {
+      for (const child of ctx.volume.readdirSync(path)) {
+        if (ctx.signal?.aborted) throw new Error("find: command cancelled");
+        const childPath = path === "/" ? `/${child}` : `${path}/${child}`;
+        await walk(childPath, display.endsWith("/") ? display + child : `${display}/${child}`, depth + 1);
+        if ((visited & 255) === 0) await yieldToEventLoop(ctx.signal);
+      }
     }
+    // with -depth (or -delete) an entry is evaluated after its contents
     if (depthFirst) await evaluateEntry();
   };
   try {
-    for (const path of paths) await walk(path, 0);
+    for (const path of paths) {
+      try { ctx.volume.lstatSync(path.real); }
+      catch { appendOutput(`find: '${path.display}': No such file or directory\n`, true); continue; }
+      await walk(path.real, path.display, 0);
+    }
+    for (const runBatch of batchedRuns) {
+      const result = await runBatch();
+      appendOutput(result.stdout);
+      appendOutput(result.stderr, true);
+      if (result.status) batchFailed = true;
+    }
   } catch (error) {
     const message = (error instanceof Error ? error.message : String(error)) + "\n";
     if (collectedLength + message.length <= outputLimit) errors += message;
     else errors = "find: output limit " + outputLimit + " exceeded\n";
     return { stdout: outputs.join(""), stderr: errors, exitCode: ctx.signal?.aborted ? 130 : 1 };
   }
-  return { stdout: outputs.join(""), stderr: errors, exitCode: errors ? 1 : 0 };
+  return { stdout: outputs.join(""), stderr: errors, exitCode: errors || batchFailed ? 1 : 0 };
 };
 
 const xargs_cmd: BuiltinFn = async (args, ctx, stdin) => {

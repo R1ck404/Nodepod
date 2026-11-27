@@ -46,43 +46,6 @@ async function writeBytes(ctx: StreamCommandContext, bytes: Uint8Array): Promise
   }
 }
 
-function formatCatText(
-  content: string,
-  options: { numberAll: boolean; numberNonBlank: boolean; squeeze: boolean; showEnds: boolean; showTabs: boolean; showNonprinting: boolean },
-  maxLoopIterations: number,
-): string {
-  let lines = content.split("\n");
-  if (lines.length > maxLoopIterations) {
-    throw new ShellLimitError("maxLoopIterations", `cat: line limit ${maxLoopIterations} exceeded`);
-  }
-  if (options.squeeze) {
-    const squeezed: string[] = [];
-    let previousBlank = false;
-    for (const line of lines) {
-      const blank = line.length === 0;
-      if (blank && previousBlank) continue;
-      squeezed.push(line);
-      previousBlank = blank;
-    }
-    lines = squeezed;
-  }
-  let lineNumber = 1;
-  return lines.map((line, index) => {
-    let visible = "";
-    for (const char of line) {
-      const code = char.charCodeAt(0);
-      if (code === 9) visible += options.showTabs ? "^I" : char;
-      else if (options.showNonprinting && code < 32) visible += `^${String.fromCharCode(code + 64)}`;
-      else if (options.showNonprinting && code === 127) visible += "^?";
-      else visible += char;
-    }
-    if (options.showEnds && index < lines.length - 1) visible += "$";
-    if (options.numberNonBlank && line.length > 0) visible = `${String(lineNumber++).padStart(6)}\t${visible}`;
-    else if (options.numberAll) visible = `${String(lineNumber++).padStart(6)}\t${visible}`;
-    return visible;
-  }).join("\n");
-}
-
 async function readAll(ctx: StreamCommandContext): Promise<string> {
   if (!ctx.input) return "";
   const decoder = new TextDecoder();
@@ -140,44 +103,10 @@ async function runYes(args: string[], ctx: StreamCommandContext): Promise<Stream
   return { exitCode: 130, stderr: "" };
 }
 
+// `cat` without flags (streamsInPipeline sends a formatting cat to the full command)
 async function runCat(args: string[], ctx: StreamCommandContext): Promise<StreamCommandResult> {
-  const flags = new Set<string>();
-  const files: string[] = [];
-  let optionsEnded = false;
-  for (const arg of args) {
-    if (!optionsEnded && arg === "--") {
-      optionsEnded = true;
-    } else if (!optionsEnded && arg.startsWith("-") && arg !== "-") {
-      for (const flag of arg.slice(1)) flags.add(flag);
-    } else {
-      files.push(arg);
-    }
-  }
-  const formatting = ["n", "b", "s", "E", "T", "A", "e", "t", "v"].some((flag) => flags.has(flag));
-  if (formatting) {
-    let content = "";
-    const sources = files.length ? files : ["-"];
-    for (const file of sources) {
-      if (file === "-") content += await readAll(ctx);
-      else if (file === "/dev/null") continue;
-      else {
-        try {
-          content += ctx.volume.readFileSync(resolvePath(file, ctx.cwd), "utf8");
-        } catch {
-          return { exitCode: 1, stderr: `cat: ${file}: No such file or directory\n` };
-        }
-      }
-    }
-    await writeText(ctx, formatCatText(content, {
-      numberAll: flags.has("n"),
-      numberNonBlank: flags.has("b"),
-      squeeze: flags.has("s"),
-      showEnds: flags.has("E") || flags.has("A") || flags.has("e"),
-      showTabs: flags.has("T") || flags.has("A") || flags.has("t"),
-      showNonprinting: flags.has("v") || flags.has("A") || flags.has("e") || flags.has("t"),
-    }, ctx.maxLoopIterations));
-    return { exitCode: 0, stderr: "" };
-  }
+  let stderr = "";
+  const files = args.filter((arg, index) => !(arg === "--" && !args.slice(0, index).includes("--")));
   if (files.length === 0 || (files.length === 1 && files[0] === "-")) {
     for (;;) {
       const chunk = await ctx.input?.read(ctx.token);
@@ -206,11 +135,14 @@ async function runCat(args: string[], ctx: StreamCommandContext): Promise<Stream
     try {
       content = ctx.volume.readFileSync(path, "utf8");
     } catch {
-      return { exitCode: 1, stderr: `cat: ${file}: No such file or directory\n` };
+      let directory = false;
+      try { directory = ctx.volume.statSync(path).isDirectory(); } catch { /* missing */ }
+      stderr += `cat: ${file}: ${directory ? "Is a directory" : "No such file or directory"}\n`;
+      continue;
     }
     await writeText(ctx, content);
   }
-  return { exitCode: 0, stderr: "" };
+  return { exitCode: stderr ? 1 : 0, stderr };
 }
 
 async function runHead(args: string[], ctx: StreamCommandContext): Promise<StreamCommandResult> {
@@ -488,12 +420,13 @@ export function isStreamableCommand(name: string): boolean {
 
 // Whether a pipeline stage runs as its streaming copy. `yes` and `cat` can
 // produce without end, and `head` reading a pipe must stop its producer, so
-// those stream; `head` only with the flags its copy reads (`-n N`, `-c N`,
-// `-N`) and no file. Every other stage runs the full command on its whole
-// input.
+// those stream; `cat` only without flags, and `head` only with the flags its
+// copy reads (`-n N`, `-c N`, `-N`) and no file. Every other stage runs the
+// full command on its whole input.
 export function streamsInPipeline(args: string[], index: number): boolean {
   const name = canonicalVirtualCommandName(args[0] ?? "");
-  if (name === "yes" || name === "cat") return true;
+  if (name === "yes") return true;
+  if (name === "cat") return args.slice(1).every((arg) => arg === "-" || arg === "--" || !arg.startsWith("-"));
   if (name !== "head" || index === 0) return false;
   for (let i = 1; i < args.length; i++) {
     if ((args[i] === "-n" || args[i] === "-c") && /^\d+$/.test(args[i + 1] ?? "")) i++;

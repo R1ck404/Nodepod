@@ -485,6 +485,28 @@ async function expandArithmetic(expression: string, ctx: BashExpansionContext): 
   return arithmetic(expanded, ctx);
 }
 
+// The text of `$'…'` from `start` (after the quote): bash's escapes \a \b \e
+// \f \n \r \t \v \\ \' \" \?, octal \nnn, \xHH, \uHHHH, \UHHHHHHHH and \cX
+function ansiCQuote(raw: string, start: number): { text: string; end: number } {
+  let text = "";
+  let i = start;
+  const simple: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+  while (i < raw.length && raw[i] !== "'") {
+    if (raw[i] !== "\\" || i + 1 >= raw.length) { text += raw[i++]; continue; }
+    const c = raw[i + 1];
+    if (c in simple) { text += simple[c]; i += 2; continue; }
+    const octal = raw.slice(i + 1).match(/^[0-7]{1,3}/);
+    if (octal) { text += String.fromCharCode(parseInt(octal[0], 8) & 0xff); i += 1 + octal[0].length; continue; }
+    const hex = c === "x" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,2}/) : c === "u" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,4}/) : c === "U" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,8}/) : null;
+    if (hex) { text += String.fromCodePoint(parseInt(hex[0], 16)); i += 2 + hex[0].length; continue; }
+    if (c === "c" && i + 2 < raw.length) { text += String.fromCharCode(raw[i + 2].toUpperCase().charCodeAt(0) & 0x1f); i += 3; continue; }
+    text += "\\" + c;
+    i += 2;
+  }
+  if (i >= raw.length) throw new Error("shell: unmatched single quote");
+  return { text, end: i };
+}
+
 // `escapeQuoted` rewrites quoted and backslash-escaped text, so a pattern
 // keeps `"*"` literal while an unquoted `*` still matches.
 async function expandPart(raw: string, ctx: BashExpansionContext, escapeQuoted?: (text: string) => string): Promise<{
@@ -499,6 +521,13 @@ async function expandPart(raw: string, ctx: BashExpansionContext, escapeQuoted?:
   let preserveEmpty = false;
   for (let i = 0; i < raw.length;) {
     const ch = raw[i];
+    if (ch === "$" && raw[i + 1] === "'") {
+      const { text, end } = ansiCQuote(raw, i + 2);
+      preserveEmpty = true;
+      out += escapeQuoted ? escapeQuoted(text) : text;
+      i = end + 1;
+      continue;
+    }
     if (ch === "'") {
       const end = findQuoteEnd(raw, i, "'");
       if (end < 0) throw new Error("shell: unmatched single quote");
