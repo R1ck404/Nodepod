@@ -300,7 +300,7 @@ describe("Bash-compatible shell front-end", () => {
     const { shell } = makeShell();
     const result = await shell.exec("set -o pipefail; printf '%s\\n' $((1/0)) | cat");
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("arithmetic overflow");
+    expect(result.stderr).toContain("division by 0");
   });
 
   it("repeats printf formats for additional arguments", async () => {
@@ -373,7 +373,7 @@ describe("Bash-compatible shell front-end", () => {
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("error pipeline deadlocked")), 1000)),
     ]);
     expect(invalidRegex.exitCode).toBe(2);
-    expect(invalidRegex.stderr).toContain("Invalid regular expression");
+    expect(invalidRegex.stderr).toContain("Unmatched [");
   });
 
   it("bounds regex, range, sequence, printf, and diff work", async () => {
@@ -470,11 +470,11 @@ describe("Bash-compatible shell front-end", () => {
     expect(nested.exitCode).toBe(1);
     expect(nested.stderr).toContain("expression nesting limit");
 
-    const unsafeGrep = await shell.exec("printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\\n' | grep '(a+)+$'");
+    const unsafeGrep = await shell.exec("printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\\n' | grep -E '(a+)+$'");
     expect(unsafeGrep.exitCode).toBe(2);
     expect(unsafeGrep.stderr).toContain("unsafe nested repetition");
 
-    const unsafeSed = await shell.exec("printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\\n' | sed 's/(a+)+$/x/'");
+    const unsafeSed = await shell.exec("printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\\n' | sed -E 's/(a+)+$/x/'");
     expect(unsafeSed.exitCode).toBe(1);
     expect(unsafeSed.stderr).toContain("unsafe nested repetition");
   });

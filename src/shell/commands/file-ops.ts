@@ -483,70 +483,79 @@ const chmod: BuiltinFn = (args, ctx) => {
   return ok();
 };
 
+// GNU wc's layout: each count is right-aligned to one width, separated by a
+// space. The width is the digits of the files' total size, or 7 when stdin
+// is counted; a single count of a single input is printed unpadded.
 const wc: BuiltinFn = (args, ctx, stdin) => {
   const { flags, positional } = parseArgs(args, ["l", "w", "c", "m", "L"]);
-  const showLines = flags.has("l");
-  const showWords = flags.has("w");
-  const showBytes = flags.has("c");
-  const showChars = flags.has("m");
-  const showMaxLine = flags.has("L");
+  const showLines = flags.has("l") || flags.has("lines");
+  const showWords = flags.has("w") || flags.has("words");
+  const showBytes = flags.has("c") || flags.has("bytes");
+  const showChars = flags.has("m") || flags.has("chars");
+  const showMaxLine = flags.has("L") || flags.has("max-line-length");
   const showAll =
     !showLines && !showWords && !showBytes && !showChars && !showMaxLine;
   const inputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
 
-  const doWc = (content: string, label?: string) => {
-    const lines = content.length === 0
-      ? 0
-      : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
-    const words = content.split(/\s+/).filter(Boolean).length;
-    const bytes = new TextEncoder().encode(content).length;
-    const chars = [...content].length;
-    const maxLine = content
-      .split("\n")
-      .reduce((mx, l) => Math.max(mx, l.length), 0);
-
-    const parts: string[] = [];
-    if (showAll || showLines) parts.push(String(lines).padStart(7));
-    if (showAll || showWords) parts.push(String(words).padStart(7));
-    if (showChars) parts.push(String(chars).padStart(7));
-    if (showAll || showBytes) parts.push(String(bytes).padStart(7));
-    if (showMaxLine) parts.push(String(maxLine).padStart(7));
-
-    const suffix = label ? ` ${label}` : "";
-    return parts.join("") + suffix + "\n";
+  type Counts = { lines: number; words: number; chars: number; bytes: number; maxLine: number };
+  const count = (content: string): Counts => ({
+    lines: (content.match(/\n/g) ?? []).length,
+    words: content.split(/\s+/).filter(Boolean).length,
+    chars: [...content].length,
+    bytes: new TextEncoder().encode(content).length,
+    maxLine: content.split("\n").reduce((mx, l) => Math.max(mx, l.length), 0),
+  });
+  const columns = (c: Counts): number[] => {
+    const values: number[] = [];
+    if (showAll || showLines) values.push(c.lines);
+    if (showAll || showWords) values.push(c.words);
+    if (showChars) values.push(c.chars);
+    if (showAll || showBytes) values.push(c.bytes);
+    if (showMaxLine) values.push(c.maxLine);
+    return values;
   };
 
-  if (positional.length === 0 && stdin !== undefined) {
-    return stdin.length > inputLimit ? fail(`wc: input limit ${inputLimit} exceeded\n`) : ok(doWc(stdin));
-  }
-  if (positional.length === 0) return fail("wc: missing operand\n");
-
-  let out = "";
-  let totalLines = 0,
-    totalWords = 0,
-    totalBytes = 0;
-  for (const file of positional) {
-    const p = resolvePath(file, ctx.cwd);
-    try {
-      const content = ctx.volume.readFileSync(p, "utf8");
+  const rows: Array<{ counts: Counts; label?: string }> = [];
+  const readsStdin = positional.length === 0;
+  if (readsStdin) {
+    if (stdin === undefined) return fail("wc: missing operand\n");
+    if (stdin.length > inputLimit) return fail(`wc: input limit ${inputLimit} exceeded\n`);
+    rows.push({ counts: count(stdin) });
+  } else {
+    for (const file of positional) {
+      const content = file === "-" ? stdin ?? "" : (() => {
+        try { return ctx.volume.readFileSync(resolvePath(file, ctx.cwd), "utf8"); }
+        catch { return null; }
+      })();
+      if (content === null) return fail(`wc: ${file}: No such file or directory\n`);
       if (content.length > inputLimit) return fail(`wc: ${file}: input limit ${inputLimit} exceeded\n`);
-      out += doWc(content, file);
-      totalLines += content.length === 0
-        ? 0
-        : content.split("\n").length - (content.endsWith("\n") ? 1 : 0);
-      totalWords += content.split(/\s+/).filter(Boolean).length;
-      totalBytes += new TextEncoder().encode(content).length;
-    } catch {
-      return fail(`wc: ${file}: No such file or directory\n`);
+      rows.push({ counts: count(content), label: file });
     }
   }
-  if (positional.length > 1) {
-    const parts: string[] = [];
-    if (showAll || showLines) parts.push(String(totalLines).padStart(7));
-    if (showAll || showWords) parts.push(String(totalWords).padStart(7));
-    if (showAll || showBytes) parts.push(String(totalBytes).padStart(7));
-    out += parts.join("") + " total\n";
+  if (rows.length > 1) {
+    const total: Counts = { lines: 0, words: 0, chars: 0, bytes: 0, maxLine: 0 };
+    for (const { counts } of rows) {
+      total.lines += counts.lines;
+      total.words += counts.words;
+      total.chars += counts.chars;
+      total.bytes += counts.bytes;
+      total.maxLine = Math.max(total.maxLine, counts.maxLine);
+    }
+    rows.push({ counts: total, label: "total" });
   }
+
+  const inputs = readsStdin ? 1 : positional.length;
+  const singleColumn = columns(rows[0].counts).length === 1;
+  let width: number;
+  if (singleColumn && inputs === 1) width = 1;
+  else if (readsStdin || positional.includes("-")) width = 7;
+  else {
+    const totalBytes = rows.slice(0, positional.length).reduce((sum, row) => sum + row.counts.bytes, 0);
+    width = String(totalBytes).length;
+  }
+  const out = rows
+    .map(({ counts, label }) => columns(counts).map((value) => String(value).padStart(width)).join(" ") + (label ? ` ${label}` : "") + "\n")
+    .join("");
   return ok(out);
 };
 

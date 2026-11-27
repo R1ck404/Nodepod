@@ -475,4 +475,37 @@ describe("node headless host", () => {
     expect(pod.port(5173)).toBeNull();
     await pod.teardown();
   }, 60_000);
+
+  it("pipes input into node and keeps captured output off the terminal", async () => {
+    setRuntimeHost(createNodeHost({ workerPath }));
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/upper.js": "let s = ''; process.stdin.on('data', (d) => (s += d)).on('end', () => console.log(s.trim().toUpperCase()));",
+        "/both.js": "console.log('out'); console.error('err');",
+      },
+    });
+    const run = async (line: string) => {
+      const proc = await pod.spawn("bash", ["-c", line]);
+      let streamed = "";
+      proc.on("output", (chunk) => (streamed += chunk));
+      proc.on("error", (chunk) => (streamed += chunk));
+      const result = await proc.completion;
+      return { ...result, streamed };
+    };
+
+    const piped = await run("echo hi | node /upper.js");
+    expect(piped.exitCode).toBe(0);
+    expect(piped.stdout).toBe("HI\n");
+
+    const redirected = await run("node /both.js > /out.txt 2>/dev/null; cat /out.txt");
+    expect(redirected.stdout).toBe("out\n");
+    expect(redirected.streamed).not.toContain("err");
+    expect(redirected.streamed.match(/out/g)).toHaveLength(1);
+
+    const counted = await run("node /both.js 2>&1 | wc -l");
+    expect(counted.stdout.trim()).toBe("2");
+    await pod.teardown();
+  }, 60_000);
 });

@@ -486,6 +486,48 @@ export function isStreamableCommand(name: string): boolean {
   return STREAMABLE.has(canonicalVirtualCommandName(name));
 }
 
+// Whether a pipeline stage runs as its streaming copy. `yes` and `cat` can
+// produce without end, and `head` reading a pipe must stop its producer, so
+// those stream; `head` only with the flags its copy reads (`-n N`, `-c N`,
+// `-N`) and no file. Every other stage runs the full command on its whole
+// input.
+export function streamsInPipeline(args: string[], index: number): boolean {
+  const name = canonicalVirtualCommandName(args[0] ?? "");
+  if (name === "yes" || name === "cat") return true;
+  if (name !== "head" || index === 0) return false;
+  for (let i = 1; i < args.length; i++) {
+    if ((args[i] === "-n" || args[i] === "-c") && /^\d+$/.test(args[i + 1] ?? "")) i++;
+    else if (!/^-\d+$/.test(args[i])) return false;
+  }
+  return true;
+}
+
+// Reads a stage's whole input for a full command. Input past the output
+// limit (an endless producer such as `yes`) stops the read and cancels the
+// producer, and the command runs on what was read, so `yes | grep '['` still
+// reports its bad pattern.
+export async function readStreamInput(ctx: StreamCommandContext): Promise<{ text: string; truncated: boolean }> {
+  if (!ctx.input) return { text: "", truncated: false };
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  for (;;) {
+    const chunk = await ctx.input.read(ctx.token);
+    if (chunk === null) break;
+    bytes += chunk.byteLength;
+    text += decoder.decode(chunk, { stream: true });
+    if (bytes > ctx.maxOutputBytes) {
+      ctx.cancelUpstream();
+      return { text: text + decoder.decode(), truncated: true };
+    }
+  }
+  return { text: text + decoder.decode(), truncated: false };
+}
+
+export async function writeStreamOutput(ctx: StreamCommandContext, text: string): Promise<void> {
+  if (text) await writeText(ctx, text);
+}
+
 export async function runStreamCommand(
   name: string,
   args: string[],
