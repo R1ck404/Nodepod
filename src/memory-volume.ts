@@ -466,6 +466,8 @@ const SYSTEM_ERROR_DESCRIPTIONS: Record<string, string> = {
 // stat (node.kind never changes, so the answers are fixed at stat time)
 const STAT_TRUE = (): boolean => true;
 const STAT_FALSE = (): boolean => false;
+// Device files the engine writes at /dev: stat reports them as character devices (S_IFCHR), as on Linux.
+const CHAR_DEVICES = new Set(['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '/dev/tty']);
 
 export function makeSystemError(
   code: 'ENOENT' | 'ENOTDIR' | 'EISDIR' | 'EEXIST' | 'ENOTEMPTY' | 'ELOOP' | 'EACCES',
@@ -2935,12 +2937,13 @@ export class MemoryVolume {
     // conversion while keeping each Date independent and each stat a snapshot.
     const mtimeNs = BigInt(ts) * 1000000n;
 
+    const device = node.kind === 'file' && CHAR_DEVICES.has(norm);
     const result: FileStat = {
-      isFile: node.kind === 'file' ? STAT_TRUE : STAT_FALSE,
+      isFile: node.kind === 'file' && !device ? STAT_TRUE : STAT_FALSE,
       isDirectory: node.kind === 'directory' ? STAT_TRUE : STAT_FALSE,
       isSymbolicLink: STAT_FALSE,
       isBlockDevice: STAT_FALSE,
-      isCharacterDevice: STAT_FALSE,
+      isCharacterDevice: device ? STAT_TRUE : STAT_FALSE,
       isFIFO: STAT_FALSE,
       isSocket: STAT_FALSE,
       size: fileSize,
@@ -2948,7 +2951,7 @@ export class MemoryVolume {
       // folders from files; lstat's symlinks carry S_IFLNK the same way.
       mode: node.kind === 'directory'
         ? 0o040000 | ((node.mode ?? 0o755) & 0o7777)
-        : 0o100000 | ((inode?.mode ?? 0o644) & 0o7777),
+        : device ? 0o020666 : 0o100000 | ((inode?.mode ?? 0o644) & 0o7777),
       mtime: new Date(ts),
       atime: new Date(atimeMs),
       ctime: new Date(ctimeMs),
