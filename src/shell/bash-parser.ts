@@ -135,6 +135,8 @@ export interface BashPipeline {
   commands: BashCommand[];
   negated: boolean;
   background: boolean;
+  /** `time` (bash's report) or `time -p` (POSIX's) before the pipeline. */
+  timed?: "bash" | "posix";
 }
 
 export interface BashAndOr {
@@ -209,6 +211,32 @@ function substitutionEnd(source: string, start: number): number {
     }
     if (ch === "(") depth++;
     else if (ch === ")" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+// The `}` closing the `${` at `start`, so `${#x}`, `${x// /_}` and
+// `${x:-a b}` stay one word.
+function parameterEnd(source: string, start: number): number {
+  let depth = 0;
+  let quote: "'" | '"' | null = null;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "$" && source[i + 1] === "(") {
+      const end = substitutionEnd(source, i + 1);
+      if (end < 0) return -1;
+      i = end;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return i;
   }
   return -1;
 }
@@ -318,6 +346,13 @@ function lex(source: string): Token[] {
         i = end + 1;
         continue;
       }
+      if (!quote && c === "$" && source[i + 1] === "{") {
+        const end = parameterEnd(source, i + 1);
+        if (end < 0) throw syntax("unmatched parameter expansion", source, i);
+        value += source.slice(i, end + 1);
+        i = end + 1;
+        continue;
+      }
       if (!quote && (c === "<" || c === ">") && source[i + 1] === "(") {
         const end = substitutionEnd(source, i + 1);
         if (end < 0) throw syntax("unmatched process substitution", source, i);
@@ -362,7 +397,6 @@ function lex(source: string): Token[] {
         && (!nestedBrace || isStandaloneBrace(source, i))
         && (nestedOperator !== "!" || isWordBoundary(source, i));
       if (c === "\n" || c === " " || c === "\t" || nestedOperatorIsBoundary) break;
-      if (c === "#" && isWordBoundary(source, i)) break;
       value += c;
       i++;
     }
@@ -397,7 +431,10 @@ class Parser {
   ) {}
 
   parse(): BashList {
-    return this.parseList(new Set());
+    const list = this.parseList(new Set());
+    const rest = this.peek();
+    if (rest.kind !== "eof") throw syntax(`unexpected token '${rest.value}'`, this.source, rest.start);
+    return list;
   }
 
   private peek(offset = 0): Token {
@@ -459,7 +496,8 @@ class Parser {
       }
       entries.push({ command, separator });
 
-      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value)) {
+      // `( cmd )` needs no separator before its `)`
+      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value) && this.peek().value !== ")") {
         throw syntax(`unexpected token '${this.peek().value}'`, this.source, this.peek().start);
       }
       if (separator === "&") this.skipNewlines();
@@ -479,22 +517,36 @@ class Parser {
   }
 
   private parsePipeline(stopWords: Set<string>): BashPipeline {
+    // `time [-p]` is a reserved word that times the whole pipeline
+    let timed: BashPipeline["timed"];
+    if (this.peek().kind === "word" && this.peek().value === "time") {
+      this.advance();
+      timed = "bash";
+      if (this.peek().kind === "word" && this.peek().value === "-p") {
+        this.advance();
+        timed = "posix";
+      }
+    }
     const negated = this.accept("!");
     this.skipNewlines();
+    if (timed && (this.peek().kind === "eof" || this.peek().kind === "newline" || /^(?:;|&&|\|\||&|\)|\})$/.test(this.peek().value))) {
+      // a bare `time` times nothing
+      return { kind: "pipeline", commands: [{ kind: "group", body: { kind: "list", entries: [] } }], negated, background: false, timed };
+    }
     const commands = [this.parseCommand(stopWords)];
     while (this.peek().value === "|" || this.peek().value === "|&") {
       const op = this.advance().value;
       this.skipNewlines();
-      const command = this.parseCommand(stopWords);
       if (op === "|&") {
-        if (command.kind !== "simple") {
-          throw syntax("|& requires a simple command", this.source, this.peek().start);
-        }
-        command.redirects.unshift({ op: "2>&1", fd: 2 });
+        // `a |& b` is `a 2>&1 | b`
+        const previous = commands[commands.length - 1];
+        const redirect: BashRedirect = { op: "2>&1", fd: 2 };
+        if (previous.kind === "simple" || previous.kind === "redirected") previous.redirects.push(redirect);
+        else commands[commands.length - 1] = { kind: "redirected", body: previous, redirects: [redirect] };
       }
-      commands.push(command);
+      commands.push(this.parseCommand(stopWords));
     }
-    return { kind: "pipeline", commands, negated, background: false };
+    return { kind: "pipeline", commands, negated, background: false, ...(timed ? { timed } : {}) };
   }
 
   private parseCommand(stopWords: Set<string>): BashCommand {
@@ -573,7 +625,9 @@ class Parser {
     const redirects: BashRedirect[] = [];
     let sawWord = false;
 
-    while (this.peek().kind === "word" || this.isRedirect(this.peek().value)) {
+    // `}` closes a group only where a command could start: `echo a }` prints "a }"
+    const isWord = () => this.peek().kind === "word" || (words.length > 0 && this.peek().value === "}");
+    while (isWord() || this.isRedirect(this.peek().value)) {
       const token = this.peek();
       const redirect = this.parseRedirect();
       if (redirect) {
@@ -690,10 +744,19 @@ class Parser {
   private parseConditional(): BashConditionalCommand {
     this.expect("[[");
     const words: string[] = [];
-    while (this.peek().kind !== "eof" && this.peek().value !== "]]" && this.peek().kind !== "newline") {
-      words.push(this.advance().value);
+    const ends = () => this.peek().kind === "eof" || this.peek().value === "]]" || this.peek().kind === "newline";
+    while (!ends()) {
+      const token = this.advance();
+      words.push(token.value);
+      if (token.value === "=~" && !ends()) {
+        // the regex runs to the next blank, parentheses and `|` included
+        const start = this.peek().start;
+        let end = this.advance().end;
+        while (!ends() && this.peek().start === end) end = this.advance().end;
+        words.push(this.source.slice(start, end));
+      }
     }
-    this.expect("]]" );
+    this.expect("]]");
     return { kind: "conditional", words };
   }
 

@@ -300,7 +300,7 @@ describe("Bash-compatible shell front-end", () => {
     const { shell } = makeShell();
     const result = await shell.exec("set -o pipefail; printf '%s\\n' $((1/0)) | cat");
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("arithmetic overflow");
+    expect(result.stderr).toContain("division by 0");
   });
 
   it("repeats printf formats for additional arguments", async () => {

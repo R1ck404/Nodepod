@@ -467,7 +467,7 @@ async function ensureShell(): Promise<typeof import("../polyfills/child_process.
     for (const early of _earlyStdin.splice(0)) handleStdin(early.data, early.end, early.forwarded);
   }
   if (!_shellInitialized && _volume) {
-    _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env, shell: _shellOptions });
+    _shellMod.initShellExec(_volume, { cwd: _cwd, env: _env, shell: _shellOptions, pid: _pid });
     if (_syncChannelWorker) {
       _shellMod.setSyncChannel(_syncChannelWorker);
     }

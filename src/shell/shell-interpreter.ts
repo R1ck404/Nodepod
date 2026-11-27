@@ -30,7 +30,10 @@ import {
   type BashCoprocCommand,
   type BashRedirectedCommand,
 } from "./bash-parser.js";
-import { expandHereDocument, expandWords, expandWord } from "./bash-expansion.js";
+import {
+  arrayKeys, arrayValues, evaluateArithmeticText, expandHereDocument, expandPattern, expandRegex, expandText, expandWords, expandWord,
+  setArray, syncArray, UnboundVariableError,
+} from "./bash-expansion.js";
 import type { BashExpansionContext } from "./bash-expansion.js";
 import type { ShellResult as StreamShellResult } from "./shell-types.js";
 import {
@@ -44,7 +47,20 @@ import {
 import { ShellCancellation, ShellPipe, streamToString } from "./shell-stream.js";
 import { yieldToEventLoop } from "./shell-helpers.js";
 
-type ShellControl = { kind: "break" | "continue" | "return"; code?: number; stdout?: string; stderr?: string };
+type ShellControl = { kind: "break" | "continue" | "return" | "exit"; code?: number; stdout?: string; stderr?: string };
+
+function isControl(value: unknown): value is ShellControl {
+  const kind = (value as ShellControl | null)?.kind;
+  return kind === "break" || kind === "continue" || kind === "return" || kind === "exit";
+}
+
+// `break`, `continue`, `return` and `exit` unwind through the commands that
+// ran them; each layer adds the output it had collected, so `echo a; break`
+// still prints `a`.
+function withOutputBefore(control: unknown, stdout: string, stderr: string): unknown {
+  if (!isControl(control) || (!stdout && !stderr)) return control;
+  return { ...control, stdout: stdout + (control.stdout ?? ""), stderr: stderr + (control.stderr ?? "") };
+}
 
 /* ------------------------------------------------------------------ */
 /*  NodepodShell                                                        */
@@ -63,6 +79,8 @@ interface OutputCapture {
   stderr: boolean;
 }
 
+const JOB_PID_BASE = 32768;
+
 export class NodepodShell {
   private volume: MemoryVolume;
   private cwd: string;
@@ -78,14 +96,24 @@ export class NodepodShell {
   private shellOptions: ResolvedShellOptions;
   private pipefail = false;
   private errexit = false;
+  // > 0 while a command's status is being tested (if/while conditions,
+  // `&&`/`||`), where set -e does not exit
+  private errexitSuppressed = 0;
+  // > 0 while a file runs through `source`, where `return` ends it
+  private sourceDepth = 0;
+  // the last and-or list ended in a tested command (`a && b` with a false, `! cmd`)
+  private lastStatusTested = false;
   private nounset = false;
   private globEnabled = true;
   private nullglob = false;
   private dotglob = false;
+  private globstar = false;
+  private associativeArrays = new Set<string>();
   private positional: string[] = [];
   private shellName = "nodepod";
   private recursionDepth = 0;
   private lastBackgroundPid = 0;
+  private readonly startedAt = Date.now();
   private pipeStatuses: number[] = [];
   // The input of the compound command running now (`cat f | while ...`,
   // `while ...; done < f`). `read` takes a line from it; other commands in
@@ -95,6 +123,8 @@ export class NodepodShell {
   // file, a substitution) or the terminal. Programs stream only what goes to
   // the terminal.
   private captured: OutputCapture = { stdout: false, stderr: false };
+  // the pid of the process running this shell (`$$`), when it runs in one
+  private readonly pid: number | undefined;
   private functions = new Map<string, BashCommand>();
   private jobs = new Map<number, {
     id: number;
@@ -123,12 +153,16 @@ export class NodepodShell {
 
   constructor(
     volume: MemoryVolume,
-    opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions },
+    opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions; pid?: number },
   ) {
     this.volume = volume;
+    this.pid = opts?.pid;
     this.cwd = opts?.cwd ?? "/";
     this.env = opts?.env ? { ...opts.env } : {};
     this.env.PWD = this.cwd;
+    // login sets SHELL; the shell's other variables ($UID, $PPID, ...) are
+    // its own and not exported
+    if (this.env.SHELL === undefined) this.env.SHELL = "/bin/bash";
     this.shellOptions = resolveShellOptions(opts?.shell);
     this.installVirtualOs();
     this.loadHistory();
@@ -289,6 +323,20 @@ export class NodepodShell {
       }
       return result;
     } catch (e) {
+      if (isControl(e)) {
+        // `exit` at the top: the shell's EXIT trap runs, and the line ends
+        // with the status; a stray break or continue just ends the line
+        let result: ShellResult = { stdout: e.stdout ?? "", stderr: e.stderr ?? "", exitCode: e.code ?? this.lastExit };
+        const trap = e.kind === "exit" ? this.traps.get("EXIT") : undefined;
+        if (trap) {
+          this.traps.delete("EXIT");
+          this.lastExit = result.exitCode;
+          const ran = await this.runTrap(trap);
+          result = { stdout: result.stdout + ran.stdout, stderr: result.stderr + ran.stderr, exitCode: result.exitCode };
+        }
+        this.lastExit = result.exitCode;
+        return result;
+      }
       const message = e instanceof Error ? e.message : String(e);
       if (e instanceof ShellLimitError) {
         this.cwd = prevCwd;
@@ -534,7 +582,7 @@ export class NodepodShell {
           shell: jobShell,
           cancellation,
         });
-        this.lastBackgroundPid = id;
+        this.lastBackgroundPid = this.jobPid(id);
         void promise.then(
           (r) => {
             const job = this.jobs.get(id);
@@ -557,10 +605,7 @@ export class NodepodShell {
         try {
           next = await run();
         } catch (control) {
-          if ((control as ShellControl)?.kind === "return") {
-            throw { ...(control as ShellControl), stdout: result.stdout, stderr: result.stderr } satisfies ShellControl;
-          }
-          throw control;
+          throw withOutputBefore(control, result.stdout, result.stderr);
         }
         result = {
           stdout: result.stdout + next.stdout,
@@ -568,7 +613,12 @@ export class NodepodShell {
           exitCode: next.exitCode,
         };
         this.assertCollectedOutput(result.stdout, result.stderr);
-        if (this.errexit && next.exitCode !== 0) break;
+        // set -e: a failing command exits the shell, except where its status
+        // is being tested (conditions, `&&`/`||` lists, `!`)
+        if (this.errexit && next.exitCode !== 0 && this.errexitSuppressed === 0 && !this.lastStatusTested) {
+          this.lastExit = next.exitCode;
+          throw { kind: "exit", code: next.exitCode, stdout: result.stdout, stderr: result.stderr } satisfies ShellControl;
+        }
       }
       this.lastExit = result.exitCode;
     }
@@ -576,11 +626,22 @@ export class NodepodShell {
   }
 
   private async execBashAndOr(andOr: BashAndOr): Promise<ShellResult> {
-    let result = await this.execBashPipeline(andOr.first);
-    for (const branch of andOr.rest) {
+    // every pipeline but the last one run is tested, so set -e ignores it
+    let result: ShellResult;
+    this.errexitSuppressed += andOr.rest.length > 0 ? 1 : 0;
+    try { result = await this.execBashPipeline(andOr.first); }
+    finally { this.errexitSuppressed -= andOr.rest.length > 0 ? 1 : 0; }
+    let tested = andOr.rest.length > 0 || andOr.first.negated;
+    for (const [index, branch] of andOr.rest.entries()) {
       if (branch.op === "&&" && result.exitCode !== 0) continue;
       if (branch.op === "||" && result.exitCode === 0) continue;
-      const next = await this.execBashPipeline(branch.pipeline);
+      const last = index === andOr.rest.length - 1;
+      let next: ShellResult;
+      if (!last) this.errexitSuppressed++;
+      try { next = await this.execBashPipeline(branch.pipeline); }
+      catch (control) { throw withOutputBefore(control, result.stdout, result.stderr); }
+      finally { if (!last) this.errexitSuppressed--; }
+      tested = !last || branch.pipeline.negated;
       result = {
         stdout: result.stdout + next.stdout,
         stderr: result.stderr + next.stderr,
@@ -588,10 +649,23 @@ export class NodepodShell {
       };
       this.assertCollectedOutput(result.stdout, result.stderr);
     }
+    this.lastStatusTested = tested;
     return result;
   }
 
   private async execBashPipeline(pipeline: BashPipeline): Promise<ShellResult> {
+    if (pipeline.timed) {
+      // `time`: the report goes to the shell's stderr after the pipeline's
+      // output. The engine has no per-process CPU times, so user and sys
+      // are 0.
+      const started = Date.now();
+      const result = await this.execBashPipeline({ ...pipeline, timed: undefined });
+      const seconds = (Date.now() - started) / 1000;
+      const report = pipeline.timed === "posix"
+        ? `real ${seconds.toFixed(2)}\nuser 0.00\nsys 0.00\n`
+        : `\nreal\t${Math.floor(seconds / 60)}m${(seconds % 60).toFixed(3)}s\nuser\t0m0.000s\nsys\t0m0.000s\n`;
+      return { ...result, stderr: result.stderr + report };
+    }
     if (pipeline.commands.length > this.shellOptions.limits.maxProcesses) {
       return {
         stdout: "",
@@ -773,7 +847,16 @@ export class NodepodShell {
   }
 
   private async execBashRedirected(command: BashRedirectedCommand, stdin?: string): Promise<ShellResult> {
-    const converted = await this.convertBashRedirects(command.redirects, stdin);
+    return this.withBashRedirects(command.redirects, stdin, (input) => this.execBashCommand(command.body, input));
+  }
+
+  // Applies a command's redirects around `run`, which gets the input they give.
+  private async withBashRedirects(
+    bashRedirects: BashRedirect[],
+    stdin: string | undefined,
+    run: (input: string | undefined) => Promise<ShellResult>,
+  ): Promise<ShellResult> {
+    const converted = await this.convertBashRedirects(bashRedirects, stdin);
     let input = converted.stdin;
     for (const redirect of converted.redirects) {
       if (redirect.type !== "read") continue;
@@ -783,7 +866,7 @@ export class NodepodShell {
         return { stdout: "", stderr: `shell: ${redirect.target}: No such file or directory\n`, exitCode: 1 };
       }
     }
-    const result = await this.withCapture(this.redirectCapture(converted.redirects), () => this.execBashCommand(command.body, input));
+    const result = await this.withCapture(this.redirectCapture(converted.redirects), () => run(input));
     return this.applyRedirects(result, { kind: "command", args: [], redirects: converted.redirects, assignments: {} });
   }
 
@@ -807,20 +890,99 @@ export class NodepodShell {
     return { stdout, stderr };
   }
 
-  private async execBashCompound(command: Exclude<BashCommand, BashSimpleCommand | BashRedirectedCommand>, stdin?: string): Promise<ShellResult> {
-    if (command.kind === "group" || command.kind === "subshell") {
-      const previousCwd = this.cwd;
-      const previousEnv = this.env;
-      const previousExit = this.lastExit;
-      if (command.kind === "subshell") this.env = { ...this.env };
-      const result = await this.execBashList(command.body);
-      if (command.kind === "subshell") {
-        this.cwd = previousCwd;
-        this.env = previousEnv;
-        this.lastExit = previousExit;
-      }
-      return result;
+  // An if/while/until condition: set -e doesn't apply inside it.
+  private async execCondition(condition: BashList, output: string, error: string): Promise<ShellResult> {
+    this.errexitSuppressed++;
+    try {
+      return await this.execBashList(condition);
+    } catch (control) {
+      throw withOutputBefore(control, output, error);
+    } finally {
+      this.errexitSuppressed--;
     }
+  }
+
+  // Runs `body` as a separate shell: a subshell `( ... )`, `bash -c` or a
+  // script. What it changes (variables, folder, functions, options, traps)
+  // is undone afterwards, `exit` ends it with its status, and its EXIT trap
+  // runs when it ends. `bash -c` and scripts start without the caller's
+  // functions, aliases, traps and set options; a subshell keeps them.
+  private async runAsShell(kind: "subshell" | "script", body: () => Promise<ShellResult>): Promise<ShellResult> {
+    const saved = {
+      cwd: this.cwd,
+      env: this.env,
+      lastExit: this.lastExit,
+      functions: this.functions,
+      aliases: this.aliases,
+      traps: this.traps,
+      errexit: this.errexit,
+      nounset: this.nounset,
+      pipefail: this.pipefail,
+      globEnabled: this.globEnabled,
+      nullglob: this.nullglob,
+      dotglob: this.dotglob,
+      globstar: this.globstar,
+      readonlyNames: this.readonlyNames,
+      associativeArrays: this.associativeArrays,
+      localScopes: this.localScopes,
+      errexitSuppressed: this.errexitSuppressed,
+      sourceDepth: this.sourceDepth,
+    };
+    this.env = { ...this.env };
+    this.functions = new Map(this.functions);
+    this.aliases = new Map(this.aliases);
+    this.traps = new Map();
+    this.readonlyNames = new Set(this.readonlyNames);
+    this.associativeArrays = new Set(this.associativeArrays);
+    if (kind === "script") {
+      this.functions = new Map();
+      this.aliases = new Map();
+      this.errexit = false;
+      this.nounset = false;
+      this.pipefail = false;
+      this.localScopes = [];
+      this.errexitSuppressed = 0;
+      this.sourceDepth = 0;
+    }
+    let result: ShellResult;
+    try {
+      result = await body();
+    } catch (control) {
+      if (!isControl(control)) throw control;
+      result = {
+        stdout: control.stdout ?? "",
+        stderr: control.stderr ?? "",
+        exitCode: control.kind === "exit" || control.kind === "return" ? control.code ?? this.lastExit : this.lastExit,
+      };
+    }
+    try {
+      const trap = this.traps.get("EXIT");
+      if (trap) {
+        this.traps.delete("EXIT");
+        this.lastExit = result.exitCode;
+        const ran = await this.runTrap(trap);
+        result = { stdout: result.stdout + ran.stdout, stderr: result.stderr + ran.stderr, exitCode: result.exitCode };
+      }
+    } finally {
+      Object.assign(this, saved);
+    }
+    return result;
+  }
+
+  // A trap's command, whose `exit` ends the trap rather than the caller.
+  private async runTrap(command: string): Promise<ShellResult> {
+    try {
+      const ast = parseBash(command, this.shellOptions.limits.maxRecursionDepth);
+      return await this.execBashList(ast);
+    } catch (control) {
+      if (isControl(control)) return { stdout: control.stdout ?? "", stderr: control.stderr ?? "", exitCode: control.code ?? this.lastExit };
+      return { stdout: "", stderr: `shell: ${control instanceof Error ? control.message : String(control)}\n`, exitCode: 1 };
+    }
+  }
+
+  private async execBashCompound(command: Exclude<BashCommand, BashSimpleCommand | BashRedirectedCommand>, stdin?: string): Promise<ShellResult> {
+    if (command.kind === "subshell") return this.runAsShell("subshell", () => this.execBashList(command.body));
+    if (command.kind === "group") return this.execBashList(command.body);
     if (command.kind === "function") {
       if (!this.functions.has(command.name) && this.functions.size >= this.shellOptions.limits.maxFilesystemEntries) {
         return { stdout: "", stderr: "shell: function table limit exceeded\n", exitCode: 1 };
@@ -829,13 +991,24 @@ export class NodepodShell {
       return { stdout: "", stderr: "", exitCode: 0 };
     }
     if (command.kind === "if") {
+      let output = "";
+      let error = "";
+      const finish = async (body: BashList | undefined): Promise<ShellResult> => {
+        if (!body) return { stdout: output, stderr: error, exitCode: 0 };
+        try {
+          const result = await this.execBashList(body);
+          return { stdout: output + result.stdout, stderr: error + result.stderr, exitCode: result.exitCode };
+        } catch (control) {
+          throw withOutputBefore(control, output, error);
+        }
+      };
       for (const branch of command.branches) {
-        const condition = await this.execBashList(branch.condition);
-        if (condition.exitCode === 0) return this.execBashList(branch.body);
+        const condition = await this.execCondition(branch.condition, output, error);
+        output += condition.stdout;
+        error += condition.stderr;
+        if (condition.exitCode === 0) return finish(branch.body);
       }
-      return command.elseBody
-        ? this.execBashList(command.elseBody)
-        : { stdout: "", stderr: "", exitCode: 0 };
+      return finish(command.elseBody);
     }
     if (command.kind === "while" || command.kind === "until") {
       let output = "";
@@ -845,7 +1018,9 @@ export class NodepodShell {
       let stoppedByControl = false;
       for (let i = 0; i < this.shellOptions.limits.maxLoopIterations; i++) {
         if (!await this.canContinueLoop(i)) return { stdout: output, stderr: error, exitCode: 130 };
-        const condition = await this.execBashList(command.condition);
+        const condition = await this.execCondition(command.condition, output, error);
+        output += condition.stdout;
+        error += condition.stderr;
         const shouldRun = command.kind === "while" ? condition.exitCode === 0 : condition.exitCode !== 0;
         if (!shouldRun) { stoppedByCondition = true; break; }
         try {
@@ -855,9 +1030,11 @@ export class NodepodShell {
           this.assertCollectedOutput(output, error);
           exitCode = body.exitCode;
         } catch (control) {
-          if ((control as ShellControl)?.kind === "break") { stoppedByControl = true; break; }
-          if ((control as ShellControl)?.kind === "continue") continue;
-          throw control;
+          if (!isControl(control) || control.kind === "return" || control.kind === "exit") throw withOutputBefore(control, output, error);
+          output += control.stdout ?? "";
+          error += control.stderr ?? "";
+          if (control.kind === "break") { stoppedByControl = true; break; }
+          continue;
         }
       }
       if (!stoppedByCondition && !stoppedByControl) return { stdout: output, stderr: `${error}shell: loop iteration limit exceeded\n`, exitCode: 1 };
@@ -881,9 +1058,11 @@ export class NodepodShell {
           this.assertCollectedOutput(output, error);
           exitCode = body.exitCode;
         } catch (control) {
-          if ((control as ShellControl)?.kind === "break") break;
-          if ((control as ShellControl)?.kind === "continue") continue;
-          throw control;
+          if (!isControl(control) || control.kind === "return" || control.kind === "exit") throw withOutputBefore(control, output, error);
+          output += control.stdout ?? "";
+          error += control.stderr ?? "";
+          if (control.kind === "break") break;
+          continue;
         }
       }
       if (loopCount < words.length) return { stdout: output, stderr: `${error}shell: loop iteration limit exceeded\n`, exitCode: 1 };
@@ -908,9 +1087,11 @@ export class NodepodShell {
           this.assertCollectedOutput(output, error);
           exitCode = body.exitCode;
         } catch (control) {
-          if ((control as ShellControl)?.kind === "break") { stoppedByControl = true; break; }
-          if ((control as ShellControl)?.kind === "continue") continued = true;
-          else throw control;
+          if (!isControl(control) || control.kind === "return" || control.kind === "exit") throw withOutputBefore(control, output, error);
+          output += control.stdout ?? "";
+          error += control.stderr ?? "";
+          if (control.kind === "break") { stoppedByControl = true; break; }
+          continued = true;
         }
         await this.evalArithmeticExpression(command.update);
         if (continued) continue;
@@ -929,10 +1110,17 @@ export class NodepodShell {
   }
 
   private async execBashCase(command: BashCaseCommand): Promise<ShellResult> {
-    const word = this.expandCaseText(command.word);
+    const ctx = this.createExpansionContext();
+    const word = await expandText(command.word, ctx);
+    const patterns: string[][] = [];
+    for (const clause of command.clauses) {
+      const expanded: string[] = [];
+      for (const pattern of clause.patterns) expanded.push(await expandPattern(pattern, ctx));
+      patterns.push(expanded);
+    }
     let matchIndex = -1;
     for (let i = 0; i < command.clauses.length; i++) {
-      if (command.clauses[i].patterns.some((pattern) => this.casePatternMatches(word, pattern))) {
+      if (patterns[i].some((pattern) => this.casePatternMatches(word, pattern))) {
         matchIndex = i;
         break;
       }
@@ -957,7 +1145,7 @@ export class NodepodShell {
       if (clause.terminator === ";;&") {
         index++;
         while (index < command.clauses.length) {
-          if (command.clauses[index].patterns.some((pattern) => this.casePatternMatches(word, pattern))) break;
+          if (patterns[index].some((pattern) => this.casePatternMatches(word, pattern))) break;
           index++;
         }
         continue;
@@ -986,32 +1174,21 @@ export class NodepodShell {
   }
 
   private async evalArithmeticExpressionUnchecked(expression: string): Promise<number> {
-    const source = expression.trim();
-    const update = source.match(/^([A-Za-z_][A-Za-z0-9_]*)(\+\+|--)$/);
-    if (update) {
-      const current = Number(this.env[update[1]] ?? "0") || 0;
-      const next = current + (update[2] === "++" ? 1 : -1);
-      this.env[update[1]] = String(next);
-      return update[2] === "++" ? current : current;
-    }
-    const assignment = source.match(/^([A-Za-z_][A-Za-z0-9_]*)(\+=|-=|\*=|\/=|=)(.*)$/);
-    if (assignment) {
-      const rhs = await this.evalArithmeticExpression(assignment[3]);
-      const current = Number(this.env[assignment[1]] ?? "0") || 0;
-      const value = assignment[2] === "+=" ? current + rhs
-        : assignment[2] === "-=" ? current - rhs
-          : assignment[2] === "*=" ? current * rhs
-            : assignment[2] === "/=" ? current / (rhs || 1)
-              : rhs;
-      this.env[assignment[1]] = String(Math.trunc(value));
-      return value;
-    }
-    const value = (await this.expandBashWords([`$(( ${source} ))`]))[0] ?? "0";
-    return Number(value) || 0;
+    return evaluateArithmeticText(expression, this.createExpansionContext());
   }
 
   private async execBashConditional(command: BashConditionalCommand): Promise<ShellResult> {
-    const tokens = command.words.map((word) => this.expandCaseText(word));
+    // operators are the words as written; operands expand, the right side
+    // of ==, != and =~ as a pattern or regex
+    const ctx = this.createExpansionContext();
+    const tokens: string[] = [];
+    for (const [index, word] of command.words.entries()) {
+      const before = command.words[index - 1];
+      if (before === "==" || before === "=" || before === "!=") tokens.push(await expandPattern(word, ctx));
+      else if (before === "=~") tokens.push(await expandRegex(word, ctx));
+      else if (/^(?:&&|\|\||!|\(|\)|=~|==?|!=|<|>|-[a-zA-Z]{1,2})$/.test(word)) tokens.push(word);
+      else tokens.push(await expandText(word, ctx));
+    }
     let position = 0;
     let conditionalDepth = 0;
     const parsePrimary = (): boolean => {
@@ -1060,8 +1237,13 @@ export class NodepodShell {
         if (operator === "=" || operator === "==") return this.casePatternMatches(left, right);
         if (operator === "!=") return !this.casePatternMatches(left, right);
         if (operator === "=~") {
-          try { return new RegExp(right).test(left); } catch { return false; }
+          let match: RegExpMatchArray | null;
+          try { match = left.match(new RegExp(right)); } catch { return false; }
+          setArray(this.env, "BASH_REMATCH", match ? [...match].map((group) => group ?? "") : []);
+          return match !== null;
         }
+        if (operator === "<") return left < right;
+        if (operator === ">") return left > right;
         if (["-eq", "-ne", "-lt", "-le", "-gt", "-ge"].includes(operator)) {
           const a = Number(left) || 0;
           const b = Number(right) || 0;
@@ -1148,7 +1330,7 @@ export class NodepodShell {
     jobShell.setCancellationSignal(cancellation.signal);
     const promise = jobShell.execBashCommand(command.body);
     this.jobs.set(id, { id, command: `coproc ${command.name}`, state: "running", promise, shell: jobShell, cancellation });
-    this.lastBackgroundPid = id;
+    this.lastBackgroundPid = this.jobPid(id);
     this.env.COPROC_PID = String(id);
     this.env[`${command.name}_PID`] = String(id);
     void promise.then((result) => {
@@ -1161,24 +1343,19 @@ export class NodepodShell {
     return { stdout: "", stderr: "", exitCode: 0 };
   }
 
-  private expandCaseText(raw: string): string {
-    let text = raw.replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1");
-    text = text.replace(/\\(.)/g, "$1");
-    text = text.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_all, name: string) => this.env[name] ?? "");
-    text = text.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_all, name: string) => this.env[name] ?? "");
-    return text;
-  }
-
-  private casePatternMatches(value: string, rawPattern: string): boolean {
-    const pattern = this.expandCaseText(rawPattern).replace(/\*+/g, "*");
+  // `pattern` is expanded, with quoted characters backslash-escaped.
+  private casePatternMatches(value: string, pattern: string): boolean {
     if (value.length * Math.max(1, pattern.length) > this.shellOptions.limits.maxLoopIterations) {
       throw new ShellLimitError("maxLoopIterations", "shell: case pattern operation limit exceeded");
     }
     let regex = "^";
     for (let i = 0; i < pattern.length; i++) {
       const ch = pattern[i];
-      if (ch === "*") regex += ".*";
-      else if (ch === "?") regex += ".";
+      if (ch === "\\" && i + 1 < pattern.length) regex += pattern[++i].replace(/[\\^$+.()|{}*?[\]]/g, "\\$&");
+      else if (ch === "*") {
+        regex += "[\\s\\S]*";
+        while (pattern[i + 1] === "*") i++;
+      } else if (ch === "?") regex += "[\\s\\S]";
       else if (ch === "[") {
         const end = pattern.indexOf("]", i + 1);
         if (end < 0) regex += "\\[";
@@ -1199,32 +1376,119 @@ export class NodepodShell {
     }
   }
 
-  private async execBashSimple(command: BashSimpleCommand, stdin?: string): Promise<ShellResult> {
-    this.lastCommandSubstitutionExit = 0;
+  // `arr[i]=v`: the key is arithmetic for indexed arrays (`arr[n+1]`) and
+  // text for associative ones.
+  private async arraySubscript(name: string, raw: string): Promise<string> {
+    const key = (await this.expandBashWords([raw])).join(" ");
+    if (this.associativeArrays.has(name) || /^\d+$/.test(key)) return key;
+    try {
+      const n = await this.evalArithmeticExpression(key);
+      if (n >= 0) return String(n);
+      const keys = arrayKeys(this.env, name);
+      return String((keys.length ? Number(keys[keys.length - 1]) + 1 : 0) + n);
+    } catch {
+      return key;
+    }
+  }
+
+  // The values a command's assignments give, as `name` and `name[key]`
+  // entries, with the arrays they replace or change.
+  private async collectAssignments(assignments: string[]): Promise<ShellResult | {
+    assignmentValues: Record<string, string>;
+    replacedArrays: Set<string>;
+    touchedArrays: Set<string>;
+  }> {
     const assignmentValues: Record<string, string> = {};
-    for (const assignment of command.assignments) {
-      const eq = assignment.indexOf("=");
-      const name = eq < 0 ? assignment : assignment.slice(0, eq);
+    // arrays this command replaces, and arrays whose elements it sets
+    const replacedArrays = new Set<string>();
+    const touchedArrays = new Set<string>();
+    for (const assignment of assignments) {
+      const parsed = assignment.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(?:\[([^\]]+)\])?(\+?)=([\s\S]*)$/);
+      if (!parsed) continue;
+      const [, name, rawKey, append, value] = parsed;
       if (this.readonlyNames.has(name) && name in this.env) {
         return { stdout: "", stderr: `shell: ${name}: readonly variable\n`, exitCode: 1 };
       }
-      const value = eq < 0 ? "" : assignment.slice(eq + 1);
-      const arrayMatch = value.match(/^\((.*)\)$/s);
-      if (arrayMatch && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
-        const rawElements = arrayMatch[1].match(/'[^']*'|"[^"]*"|[^\s]+/g) ?? [];
+      const arrayMatch = value.match(/^\(([\s\S]*)\)$/);
+      if (arrayMatch && rawKey === undefined) {
+        const rawElements = arrayMatch[1].match(/(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\])+/g) ?? [];
         if (rawElements.length > this.shellOptions.limits.maxLoopIterations) {
           return { stdout: "", stderr: "shell: array element limit exceeded\n", exitCode: 1 };
         }
-        const values: string[] = [];
-        for (const element of rawElements) values.push((await this.expandBashWords([element]))[0] ?? "");
-        assignmentValues[name] = values.join(" ");
-        assignmentValues[`${name}[@]`] = values.join(" ");
+        const values = append ? arrayValues(this.env, name) : [];
+        for (const element of rawElements) {
+          const keyed = element.match(/^\[([^\]]+)\]=([\s\S]*)$/);
+          if (keyed) {
+            const key = (await this.expandBashWords([keyed[1]])).join(" ");
+            assignmentValues[`${name}[${key}]`] = (await this.expandBashWords([keyed[2]])).join(" ");
+            touchedArrays.add(name);
+          } else {
+            values.push(...await this.expandBashWords([element]));
+          }
+        }
+        if (!append) replacedArrays.add(name);
         values.forEach((item, index) => { assignmentValues[`${name}[${index}]`] = item; });
+        touchedArrays.add(name);
         continue;
       }
-      const expanded = await this.expandBashWords([value]);
-      assignmentValues[name] = expanded.join(" ");
+      const expanded = (await this.expandBashWords([value])).join(" ");
+      if (rawKey !== undefined) {
+        const key = await this.arraySubscript(name, rawKey);
+        const slot = `${name}[${key}]`;
+        assignmentValues[slot] = append ? (assignmentValues[slot] ?? this.env[slot] ?? "") + expanded : expanded;
+        touchedArrays.add(name);
+        continue;
+      }
+      if (append && arrayKeys(this.env, name).length > 0) {
+        const slot = `${name}[0]`;
+        assignmentValues[slot] = (this.env[slot] ?? "") + expanded;
+        touchedArrays.add(name);
+        continue;
+      }
+      assignmentValues[name] = append ? (assignmentValues[name] ?? this.env[name] ?? "") + expanded : expanded;
+      // a plain assignment to an array name sets its first element
+      if (arrayKeys(this.env, name).length > 0) {
+        assignmentValues[`${name}[0]`] = assignmentValues[name];
+        touchedArrays.add(name);
+      }
     }
+
+    return { assignmentValues, replacedArrays, touchedArrays };
+  }
+
+  private applyAssignments(collected: {
+    assignmentValues: Record<string, string>;
+    replacedArrays: Set<string>;
+    touchedArrays: Set<string>;
+  }): void {
+    for (const name of collected.replacedArrays) setArray(this.env, name, []);
+    Object.assign(this.env, collected.assignmentValues);
+    for (const name of collected.touchedArrays) syncArray(this.env, name);
+  }
+
+  // `declare -a`/`-A` and `declare name=(...)`: arrays go through the same
+  // assignment as `name=(...)`; other forms are the plain builtin's.
+  private async execDeclareArrays(args: string[]): Promise<ShellResult | null> {
+    const flags = args.filter((arg) => /^[-+][a-zA-Z]+$/.test(arg)).join("");
+    const operands = args.filter((arg) => !/^[-+][a-zA-Z]+$/.test(arg));
+    if (!/[aA]/.test(flags) && !operands.some((arg) => /^[a-zA-Z_][a-zA-Z0-9_]*\+?=\(/.test(arg))) return null;
+    for (const operand of operands) {
+      const name = operand.match(/^[a-zA-Z_][a-zA-Z0-9_]*/)?.[0];
+      if (!name) return { stdout: "", stderr: `declare: \`${operand}': not a valid identifier\n`, exitCode: 1 };
+      if (flags.includes("A")) this.associativeArrays.add(name);
+      if (!operand.includes("=")) continue;
+      const collected = await this.collectAssignments([operand]);
+      if ("exitCode" in collected) return collected;
+      this.applyAssignments(collected);
+    }
+    return { stdout: "", stderr: "", exitCode: 0 };
+  }
+
+  private async execBashSimple(command: BashSimpleCommand, stdin?: string): Promise<ShellResult> {
+    this.lastCommandSubstitutionExit = 0;
+    const collected = await this.collectAssignments(command.assignments);
+    if ("exitCode" in collected) return collected;
+    const { assignmentValues } = collected;
 
     const args = await this.expandBashWords(command.words);
     let commandPrefixes = 0;
@@ -1253,32 +1517,43 @@ export class NodepodShell {
       if (Object.keys(this.env).length + newNames > this.shellOptions.limits.maxFilesystemEntries) {
         return { stdout: "", stderr: "shell: variable table limit exceeded\n", exitCode: 1 };
       }
-      Object.assign(this.env, assignmentValues);
+      this.applyAssignments(collected);
       return { stdout: "", stderr: "", exitCode: this.lastCommandSubstitutionExit };
     }
 
     // the installed paths name the same shells: spawn's `shell` option and
     // `which bash` (zx) hand out /bin/sh and /bin/bash
     if (/^(?:\/usr)?\/bin\/(?:ba)?sh$/.test(args[0])) args[0] = args[0].slice(args[0].lastIndexOf("/") + 1);
+    // a shell run from this one: its redirects apply to it, and it reads
+    // their input (or the pipe's) as its stdin
+    const asShell = (run: () => Promise<ShellResult>): Promise<ShellResult> =>
+      this.withBashRedirects(command.redirects, stdin, async (input) => {
+        const previous = this.sharedStdin;
+        if (input !== undefined) this.sharedStdin = { data: input, offset: 0 };
+        try { return await this.withPrefixAssignments(assignmentValues, run); }
+        finally { this.sharedStdin = previous; }
+      });
     if ((args[0] === "bash" || args[0] === "sh") && args[1] === "-c") {
-      const previous = this.positional;
-      const previousName = this.shellName;
-      this.positional = args.slice(3);
-      this.shellName = args[0];
-      try { return await this.withPrefixAssignments(assignmentValues, () => this.execNested(args[2] ?? "", args[0])); }
-      finally { this.positional = previous; this.shellName = previousName; }
+      return asShell(async () => {
+        const previous = this.positional;
+        const previousName = this.shellName;
+        this.positional = args.slice(4);
+        this.shellName = args[3] ?? args[0];
+        try { return await this.execNested(args[2] ?? "", args[0]); }
+        finally { this.positional = previous; this.shellName = previousName; }
+      });
     }
     if (args[0] === "bash" || args[0] === "sh") {
       const script = args[1];
       if (!script) return { stdout: "", stderr: "", exitCode: 0 };
-      return this.withPrefixAssignments(assignmentValues, () => this.execScriptFile(script, args.slice(2), args[0]));
+      return asShell(() => this.execScriptFile(script, args.slice(2), args[0]));
     }
     const scriptPath = this.resolvePath(args[0]);
     if (this.volume.existsSync(scriptPath)) {
       try {
         const content = this.volume.readFileSync(scriptPath, "utf8");
         if (content.startsWith("#!") && /(?:^|\/)(?:ba)?sh(?:\s|$)/.test(content.slice(2, content.indexOf("\n") < 0 ? content.length : content.indexOf("\n")))) {
-          return this.withPrefixAssignments(assignmentValues, () => this.execScriptFile(args[0], args.slice(1), args[0]));
+          return asShell(() => this.execScriptFile(args[0], args.slice(1), args[0]));
         }
       } catch {
         /* fall through to normal command lookup */
@@ -1287,6 +1562,10 @@ export class NodepodShell {
 
     if (args[0] === "set") return this.execSet(args.slice(1));
     if (args[0] === "let") return this.execLet(args.slice(1));
+    if (args[0] === "declare" || args[0] === "typeset") {
+      const declared = await this.execDeclareArrays(args.slice(1));
+      if (declared) return declared;
+    }
     if (args[0] === "getopts") return this.execGetopts(args.slice(1));
     if (args[0] === "readonly") return this.execReadonly(args.slice(1));
     if (args[0] === "local") return this.execLocal(args.slice(1));
@@ -1296,18 +1575,25 @@ export class NodepodShell {
     }
     if (args[0] === "trap") return this.execTrap(args.slice(1));
 
+    if (args[0] === "exit" || args[0] === "logout") {
+      const code = args[1] === undefined ? this.lastExit : parseInt(args[1], 10);
+      if (args[1] !== undefined && !/^-?\d+$/.test(args[1])) {
+        throw { kind: "exit", code: 2, stderr: `${this.shellName ?? "bash"}: exit: ${args[1]}: numeric argument required\n` } satisfies ShellControl;
+      }
+      throw { kind: "exit", code: ((code % 256) + 256) % 256 } satisfies ShellControl;
+    }
     if (args[0] === "break" || args[0] === "continue") {
       throw { kind: args[0] as "break" | "continue" } satisfies ShellControl;
     }
     if (args[0] === "return") {
-      if (this.localScopes.length === 0) return { stdout: "", stderr: "return: can only `return' from a function or sourced script\n", exitCode: 1 };
+      if (this.localScopes.length === 0 && this.sourceDepth === 0) return { stdout: "", stderr: "return: can only `return' from a function or sourced script\n", exitCode: 1 };
       throw { kind: "return", code: parseInt(args[1] ?? "0", 10) || 0 } satisfies ShellControl;
     }
     if (args[0] === "shift") {
       this.positional = this.positional.slice(parseInt(args[1] ?? "1", 10) || 1);
       return { stdout: "", stderr: "", exitCode: 0 };
     }
-    if (args[0] === "eval") return this.execNested(args.slice(1).join(" "), "eval");
+    if (args[0] === "eval") return this.execInCurrentShell(args.slice(1).join(" "), "eval");
     if (args[0] === "unalias") {
       for (const alias of args.slice(1)) this.aliases.delete(alias);
       return { stdout: "", stderr: "", exitCode: 0 };
@@ -1385,13 +1671,14 @@ export class NodepodShell {
     let redirectedStdin = stdin;
     for (const redirect of bashRedirects) {
       const rawTarget = redirect.target ?? "";
-      const target = redirect.heredoc ? rawTarget : ((await this.expandBashWords([rawTarget]))[0] ?? "");
+      const target = redirect.heredoc || redirect.op === "<<<" ? rawTarget : ((await this.expandBashWords([rawTarget]))[0] ?? "");
       if (redirect.heredoc) {
         redirectedStdin = redirect.heredoc.expand === false
           ? redirect.heredoc.body
           : await expandHereDocument(redirect.heredoc.body, this.createExpansionContext());
       } else if (redirect.op === "<<<") {
-        redirectedStdin = (await this.expandBashWords([target])).join(" ") + "\n";
+        // one expansion, without word splitting or globbing
+        redirectedStdin = (await expandText(rawTarget, this.createExpansionContext())) + "\n";
       } else if (redirect.op === "2>&1") {
         redirects.push({ type: "stderr-to-stdout", target: "" });
       } else if (redirect.op === ">&" && redirect.fd === 2 && target === "1") {
@@ -1431,10 +1718,13 @@ export class NodepodShell {
       lastExit: this.lastExit,
       positional: this.positional,
       lastBackgroundPid: this.lastBackgroundPid,
+      pid: this.shellPid(),
+      ppid: 1,
+      startedAt: this.startedAt,
       pipeStatuses: this.pipeStatuses,
       nounset: this.nounset,
       shellName: this.shellName,
-      globOptions: { enabled: this.globEnabled, nullglob: this.nullglob, dotglob: this.dotglob },
+      globOptions: { enabled: this.globEnabled, nullglob: this.nullglob, dotglob: this.dotglob, globstar: this.globstar },
       limits: this.shellOptions.limits,
       commandSubstitution: async (command) => {
         if (this.commandSubstitutionDepth >= this.shellOptions.limits.maxCommandSubstitutionDepth) {
@@ -1582,11 +1872,13 @@ export class NodepodShell {
       else if (arg === "-q") mode = "query";
       else if (!arg.startsWith("-")) names.push(arg);
     }
-    const known = new Set(["nullglob", "dotglob"]);
-    const read = (name: string): boolean => name === "nullglob" ? this.nullglob : name === "dotglob" ? this.dotglob : false;
+    const known = new Set(["dotglob", "globstar", "nullglob"]);
+    const read = (name: string): boolean =>
+      name === "nullglob" ? this.nullglob : name === "dotglob" ? this.dotglob : name === "globstar" ? this.globstar : false;
     const write = (name: string, value: boolean): void => {
       if (name === "nullglob") this.nullglob = value;
       if (name === "dotglob") this.dotglob = value;
+      if (name === "globstar") this.globstar = value;
     };
     if (mode === "set" || mode === "unset") {
       for (const name of names) {
@@ -1645,6 +1937,18 @@ export class NodepodShell {
     }
   }
 
+  // `$$`: the pid of the process running this shell, which subshells and
+  // command substitutions share, as in bash.
+  private shellPid(): number {
+    return this.pid ?? 1000;
+  }
+
+  // Background jobs run inside this shell, so `$!` is a pid of their own,
+  // above the engine's process ids; `wait`, `kill` and `fg` take it.
+  private jobPid(id: number): number {
+    return JOB_PID_BASE + id;
+  }
+
   private async execJobsBuiltin(name: string, args: string[]): Promise<ShellResult> {
     if (name === "jobs") {
       let out = "";
@@ -1652,7 +1956,12 @@ export class NodepodShell {
       return { stdout: out, stderr: "", exitCode: 0 };
     }
     const idArgs = name === "kill" ? args.filter((arg) => !/^-[A-Za-z]+$/.test(arg)) : args;
-    const ids = idArgs.length ? idArgs.map((arg) => parseInt(arg.replace(/^%/, ""), 10)).filter(Number.isFinite) : [...this.jobs.keys()];
+    const ids = idArgs.length
+      ? idArgs.map((arg) => {
+        const n = parseInt(arg.replace(/^%/, ""), 10);
+        return !arg.startsWith("%") && n > JOB_PID_BASE ? n - JOB_PID_BASE : n;
+      }).filter(Number.isFinite)
+      : [...this.jobs.keys()];
     if (name === "wait") {
       let result: ShellResult = { stdout: "", stderr: "", exitCode: 0 };
       for (const id of ids) {
@@ -1711,6 +2020,7 @@ export class NodepodShell {
       cwd: this.cwd,
       env: { ...this.env },
       shell: { limits: { ...this.shellOptions.limits }, jobControl: this.shellOptions.jobControl },
+      pid: this.pid,
     });
     clone.commands = this.commands;
     clone.aliases = new Map(this.aliases);
@@ -1721,6 +2031,7 @@ export class NodepodShell {
     clone.globEnabled = this.globEnabled;
     clone.nullglob = this.nullglob;
     clone.dotglob = this.dotglob;
+    clone.globstar = this.globstar;
     clone.positional = [...this.positional];
     clone.lastExit = this.lastExit;
     clone.recursionDepth = this.recursionDepth;
@@ -2124,9 +2435,9 @@ export class NodepodShell {
       };
     }
     const p = this.resolvePath(args[0]);
+    let content: string;
     try {
-      const content = this.volume.readFileSync(p, "utf8");
-      return this.execNested(content, "source");
+      content = this.volume.readFileSync(p, "utf8");
     } catch {
       return {
         stdout: "",
@@ -2134,6 +2445,9 @@ export class NodepodShell {
         exitCode: 1,
       };
     }
+    this.sourceDepth++;
+    try { return await this.execInCurrentShell(content, "source"); }
+    finally { this.sourceDepth--; }
   }
 
   // A nested shell runs in this interpreter, so prefix assignments
@@ -2155,6 +2469,32 @@ export class NodepodShell {
     }
   }
 
+  // `eval` and `source`: the text runs in this shell, so its variables,
+  // functions and `exit` take effect here; `return` ends a sourced file.
+  private async execInCurrentShell(command: string, label: "eval" | "source"): Promise<ShellResult> {
+    if (this.recursionDepth >= this.shellOptions.limits.maxRecursionDepth) {
+      return { stdout: "", stderr: `${label}: recursion depth exceeds ${this.shellOptions.limits.maxRecursionDepth}\n`, exitCode: 1 };
+    }
+    let ast: BashList;
+    try {
+      ast = parseBash(command, this.shellOptions.limits.maxRecursionDepth);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return { stdout: "", stderr: `${message.startsWith("shell:") ? message : `shell: ${message}`}\n`, exitCode: 2 };
+    }
+    this.recursionDepth++;
+    try {
+      return await this.execBashList(ast);
+    } catch (control) {
+      if (label === "source" && isControl(control) && control.kind === "return") {
+        return { stdout: control.stdout ?? "", stderr: control.stderr ?? "", exitCode: control.code ?? 0 };
+      }
+      throw control;
+    } finally {
+      this.recursionDepth--;
+    }
+  }
+
   private async execNested(command: string, label: string): Promise<ShellResult> {
     if (this.recursionDepth >= this.shellOptions.limits.maxRecursionDepth) {
       return {
@@ -2165,7 +2505,15 @@ export class NodepodShell {
     }
     this.recursionDepth++;
     try {
-      return await this.exec(command);
+      return await this.runAsShell("script", async () => {
+        const ast = parseBash(command, this.shellOptions.limits.maxRecursionDepth);
+        return this.execBashList(ast);
+      });
+    } catch (e) {
+      if (e instanceof UnboundVariableError) return { stdout: "", stderr: `${label}: ${e.variable}: unbound variable\n`, exitCode: 127 };
+      if (e instanceof ShellLimitError) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      return { stdout: "", stderr: `${message.startsWith("shell:") ? `${label}${message.slice(5)}` : `${label}: ${message}`}\n`, exitCode: (e as Error)?.name === "BashSyntaxError" ? 2 : 1 };
     } finally {
       this.recursionDepth--;
     }

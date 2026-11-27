@@ -405,7 +405,7 @@ export function endStdin(): void {
   else _stdinBacklogEnded = true;
 }
 
-export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
+export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions; pid?: number }): void {
   _vol = volume;
 
   _shell = new NodepodShell(volume, {
@@ -423,6 +423,7 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
       ...opts?.env,
     },
     shell: opts?.shell,
+    pid: opts?.pid,
   });
 
   const pmDeps: PmDeps = {
