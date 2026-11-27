@@ -83,6 +83,7 @@ export function linkGlobalBins(vol: MemoryVolume, name: string): string[] {
     vol.mkdirSync(GLOBAL_BIN, { recursive: true });
     // same stub format as node_modules/.bin, which PATH lookup understands
     vol.writeFileSync(`${GLOBAL_BIN}/${cmd}`, `node "${target}" "$@"\n`);
+    vol.chmodSync(`${GLOBAL_BIN}/${cmd}`, 0o755);
     linked.push(cmd);
   }
   return linked;
