@@ -475,4 +475,47 @@ describe("node headless host", () => {
     expect(pod.port(5173)).toBeNull();
     await pod.teardown();
   }, 60_000);
+
+  it("reports a killed server's port closed once, and the port works for the next server", async () => {
+    setRuntimeHost(
+      createNodeHost({
+        workerPath,
+        httpHost: "127.0.0.1",
+        httpPort: 0,
+      }),
+    );
+
+    const pod = await Nodepod.boot({
+      packageStore: "memory",
+      enableSnapshotCache: false,
+      files: {
+        "/serve.js": `
+          const http = require("http");
+          http.createServer((_req, res) => res.end(process.argv[2])).listen(4311, () => console.log("listening"));
+        `,
+      },
+    });
+    const closed: number[] = [];
+    (pod as unknown as { _processManager: { on(e: string, fn: (pid: number, port: number) => void): void } })
+      ._processManager.on("server-close", (_pid, port) => closed.push(port));
+    const listening = (proc: Awaited<ReturnType<typeof pod.spawn>>) =>
+      new Promise<void>((resolve) => proc.on("output", (chunk) => { if (chunk.includes("listening")) resolve(); }));
+
+    const first = await pod.spawn("node", ["/serve.js", "first"]);
+    await listening(first);
+    first.kill();
+    await first.completion;
+    // the worker's own server-close may still be on its way: let it arrive
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(closed).toEqual([4311]);
+
+    const second = await pod.spawn("node", ["/serve.js", "second"]);
+    await listening(second);
+    expect(new TextDecoder().decode((await pod.request(4311, { path: "/" })).body)).toBe("second");
+    second.kill();
+    await second.completion;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(closed).toEqual([4311, 4311]);
+    await pod.teardown();
+  }, 60_000);
 });
