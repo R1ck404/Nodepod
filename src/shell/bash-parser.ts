@@ -102,6 +102,13 @@ export interface BashCoprocCommand {
   body: BashCommand;
 }
 
+// A compound command with redirects after it (`while ...; done < file`).
+export interface BashRedirectedCommand {
+  kind: "redirected";
+  body: BashCommand;
+  redirects: BashRedirect[];
+}
+
 export interface BashFunctionCommand {
   kind: "function";
   name: string;
@@ -120,6 +127,7 @@ export type BashCommand =
   | BashConditionalCommand
   | BashArithmeticCommand
   | BashCoprocCommand
+  | BashRedirectedCommand
   | BashFunctionCommand;
 
 export interface BashPipeline {
@@ -127,6 +135,8 @@ export interface BashPipeline {
   commands: BashCommand[];
   negated: boolean;
   background: boolean;
+  /** `time` (bash's report) or `time -p` (POSIX's) before the pipeline. */
+  timed?: "bash" | "posix";
 }
 
 export interface BashAndOr {
@@ -177,9 +187,11 @@ function isWordBoundary(source: string, offset: number): boolean {
   return offset === 0 || /[\s;|&(){}<>!]/.test(source[offset - 1] ?? "");
 }
 
+// `{` and `}` are reserved words only as whole words: `{}` (find -exec) is a word.
 function isStandaloneBrace(source: string, offset: number): boolean {
+  const previous = offset === 0 ? "" : source[offset - 1];
   const next = source[offset + 1] ?? "";
-  return isWordBoundary(source, offset) && (next === "" || /[\s;|&(){}<>]/.test(next));
+  return (previous === "" || /[\s;|&()<>]/.test(previous)) && (next === "" || /[\s;|&()<>]/.test(next));
 }
 
 function substitutionEnd(source: string, start: number): number {
@@ -201,6 +213,32 @@ function substitutionEnd(source: string, start: number): number {
     }
     if (ch === "(") depth++;
     else if (ch === ")" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+// The `}` closing the `${` at `start`, so `${#x}`, `${x// /_}` and
+// `${x:-a b}` stay one word.
+function parameterEnd(source: string, start: number): number {
+  let depth = 0;
+  let quote: "'" | '"' | null = null;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "$" && source[i + 1] === "(") {
+      const end = substitutionEnd(source, i + 1);
+      if (end < 0) return -1;
+      i = end;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return i;
   }
   return -1;
 }
@@ -303,9 +341,25 @@ function lex(source: string): Token[] {
         i++;
         continue;
       }
+      // `$'…'`: ANSI-C quoting, where `\'` doesn't end the quote
+      if (!quote && c === "$" && source[i + 1] === "'") {
+        let end = i + 2;
+        while (end < source.length && source[end] !== "'") end += source[end] === "\\" ? 2 : 1;
+        if (end >= source.length) throw syntax("unexpected end of quoted string", source, i);
+        value += source.slice(i, end + 1);
+        i = end + 1;
+        continue;
+      }
       if (!quote && c === "$" && source[i + 1] === "(") {
         const end = substitutionEnd(source, i + 1);
         if (end < 0) throw syntax("unmatched command substitution", source, i);
+        value += source.slice(i, end + 1);
+        i = end + 1;
+        continue;
+      }
+      if (!quote && c === "$" && source[i + 1] === "{") {
+        const end = parameterEnd(source, i + 1);
+        if (end < 0) throw syntax("unmatched parameter expansion", source, i);
         value += source.slice(i, end + 1);
         i = end + 1;
         continue;
@@ -354,7 +408,6 @@ function lex(source: string): Token[] {
         && (!nestedBrace || isStandaloneBrace(source, i))
         && (nestedOperator !== "!" || isWordBoundary(source, i));
       if (c === "\n" || c === " " || c === "\t" || nestedOperatorIsBoundary) break;
-      if (c === "#" && isWordBoundary(source, i)) break;
       value += c;
       i++;
     }
@@ -389,7 +442,10 @@ class Parser {
   ) {}
 
   parse(): BashList {
-    return this.parseList(new Set());
+    const list = this.parseList(new Set());
+    const rest = this.peek();
+    if (rest.kind !== "eof") throw syntax(`unexpected token '${rest.value}'`, this.source, rest.start);
+    return list;
   }
 
   private peek(offset = 0): Token {
@@ -451,7 +507,9 @@ class Parser {
       }
       entries.push({ command, separator });
 
-      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value)) {
+      // `( cmd )` needs no separator before its `)`, nor a compound command
+      // before `}` (`{ { cmd; } }`); after a simple command `}` is a word
+      if (!separator && this.peek().kind !== "eof" && !stopWords.has(this.peek().value) && this.peek().value !== ")" && this.peek().value !== "}") {
         throw syntax(`unexpected token '${this.peek().value}'`, this.source, this.peek().start);
       }
       if (separator === "&") this.skipNewlines();
@@ -471,22 +529,36 @@ class Parser {
   }
 
   private parsePipeline(stopWords: Set<string>): BashPipeline {
+    // `time [-p]` is a reserved word that times the whole pipeline
+    let timed: BashPipeline["timed"];
+    if (this.peek().kind === "word" && this.peek().value === "time") {
+      this.advance();
+      timed = "bash";
+      if (this.peek().kind === "word" && this.peek().value === "-p") {
+        this.advance();
+        timed = "posix";
+      }
+    }
     const negated = this.accept("!");
     this.skipNewlines();
+    if (timed && (this.peek().kind === "eof" || this.peek().kind === "newline" || /^(?:;|&&|\|\||&|\)|\})$/.test(this.peek().value))) {
+      // a bare `time` times nothing
+      return { kind: "pipeline", commands: [{ kind: "group", body: { kind: "list", entries: [] } }], negated, background: false, timed };
+    }
     const commands = [this.parseCommand(stopWords)];
     while (this.peek().value === "|" || this.peek().value === "|&") {
       const op = this.advance().value;
       this.skipNewlines();
-      const command = this.parseCommand(stopWords);
       if (op === "|&") {
-        if (command.kind !== "simple") {
-          throw syntax("|& requires a simple command", this.source, this.peek().start);
-        }
-        command.redirects.unshift({ op: "2>&1", fd: 2 });
+        // `a |& b` is `a 2>&1 | b`
+        const previous = commands[commands.length - 1];
+        const redirect: BashRedirect = { op: "2>&1", fd: 2 };
+        if (previous.kind === "simple" || previous.kind === "redirected") previous.redirects.push(redirect);
+        else commands[commands.length - 1] = { kind: "redirected", body: previous, redirects: [redirect] };
       }
-      commands.push(command);
+      commands.push(this.parseCommand(stopWords));
     }
-    return { kind: "pipeline", commands, negated, background: false };
+    return { kind: "pipeline", commands, negated, background: false, ...(timed ? { timed } : {}) };
   }
 
   private parseCommand(stopWords: Set<string>): BashCommand {
@@ -499,21 +571,21 @@ class Parser {
       this.advance();
       const body = this.parseNestedList(new Set());
       this.expect(")");
-      return { kind: "subshell", body };
+      return this.withTrailingRedirects({ kind: "subshell", body });
     }
     if (token.value === "{") {
       this.advance();
       const body = this.parseNestedList(new Set());
       this.expect("}");
-      return { kind: "group", body };
+      return this.withTrailingRedirects({ kind: "group", body });
     }
-    if (token.value === "if") return this.parseIf();
-    if (token.value === "while" || token.value === "until") return this.parseLoop(token.value as "while" | "until");
-    if (token.value === "for") return this.parseFor();
-    if (token.value === "case") return this.parseCase();
-    if (token.value === "select") return this.parseSelect();
-    if (token.value === "[[") return this.parseConditional();
-    if (token.value === "((") return this.parseArithmetic();
+    if (token.value === "if") return this.withTrailingRedirects(this.parseIf());
+    if (token.value === "while" || token.value === "until") return this.withTrailingRedirects(this.parseLoop(token.value as "while" | "until"));
+    if (token.value === "for") return this.withTrailingRedirects(this.parseFor());
+    if (token.value === "case") return this.withTrailingRedirects(this.parseCase());
+    if (token.value === "select") return this.withTrailingRedirects(this.parseSelect());
+    if (token.value === "[[") return this.withTrailingRedirects(this.parseConditional());
+    if (token.value === "((") return this.withTrailingRedirects(this.parseArithmetic());
     if (token.value === "coproc") return this.parseCoproc();
     if (token.value === "function") return this.parseFunction(true);
     if (token.kind === "word" && this.peek(1).value === "(" && this.peek(2).value === ")") {
@@ -523,46 +595,54 @@ class Parser {
     return this.parseSimple(stopWords);
   }
 
+  // Parses one redirect at the current token (`> f`, `2>&1`, `<<EOF`), or
+  // returns null when the token doesn't start one.
+  private parseRedirect(): BashRedirect | null {
+    const token = this.peek();
+    if (token.kind === "word" && /^\d+$/.test(token.value) && this.isRedirect(this.peek(1).value)) {
+      const fd = Number(this.advance().value);
+      const op = this.advance().value;
+      if (op === ">&-" || op === "<&-") return { op, fd };
+      const target = this.peek();
+      if (target.kind !== "word") throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
+      this.advance();
+      return { op, target: target.value, fd };
+    }
+    if (!this.isRedirect(token.value)) return null;
+    const op = this.advance().value;
+    if (op === "2>&1") return { op, target: "1", fd: 2 };
+    if (op === ">&-" || op === "<&-") return { op, fd: this.extractFd(op) };
+    const target = this.peek();
+    if (target.kind !== "word") {
+      throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
+    }
+    this.advance();
+    const redirect: BashRedirect = { op, target: target.value, fd: this.extractFd(op) };
+    if (op === "<<" || op === "<<-") {
+      redirect.heredoc = this.readHereDoc(target.value, op === "<<-");
+    }
+    return redirect;
+  }
+
+  // Redirects after a compound command apply to the whole command.
+  private withTrailingRedirects(body: BashCommand): BashCommand {
+    const redirects: BashRedirect[] = [];
+    for (let redirect = this.parseRedirect(); redirect; redirect = this.parseRedirect()) redirects.push(redirect);
+    return redirects.length ? { kind: "redirected", body, redirects } : body;
+  }
+
   private parseSimple(_stopWords: Set<string>): BashSimpleCommand {
     const assignments: string[] = [];
     const words: string[] = [];
     const redirects: BashRedirect[] = [];
     let sawWord = false;
 
-    while (this.peek().kind === "word" || this.isRedirect(this.peek().value)) {
+    // `}` closes a group only where a command could start: `echo a }` prints "a }"
+    const isWord = () => this.peek().kind === "word" || (words.length > 0 && this.peek().value === "}");
+    while (isWord() || this.isRedirect(this.peek().value)) {
       const token = this.peek();
-      if (token.kind === "word" && /^\d+$/.test(token.value) && this.isRedirect(this.peek(1).value)) {
-        const fd = Number(this.advance().value);
-        const op = this.advance().value;
-        if (op === ">&-" || op === "<&-") {
-          redirects.push({ op, fd });
-          continue;
-        }
-        const target = this.peek();
-        if (target.kind !== "word") throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
-        this.advance();
-        redirects.push({ op, target: target.value, fd });
-        continue;
-      }
-      if (this.isRedirect(token.value)) {
-        const op = this.advance().value;
-        if (op === "2>&1") {
-          redirects.push({ op, target: "1", fd: 2 });
-          continue;
-        }
-        if (op === ">&-" || op === "<&-") {
-          redirects.push({ op, fd: this.extractFd(op) });
-          continue;
-        }
-        const target = this.peek();
-        if (target.kind !== "word") {
-          throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
-        }
-        this.advance();
-        const redirect: BashRedirect = { op, target: target.value, fd: this.extractFd(op) };
-        if (op === "<<" || op === "<<-") {
-          redirect.heredoc = this.readHereDoc(target.value, op === "<<-");
-        }
+      const redirect = this.parseRedirect();
+      if (redirect) {
         redirects.push(redirect);
         continue;
       }
@@ -676,10 +756,19 @@ class Parser {
   private parseConditional(): BashConditionalCommand {
     this.expect("[[");
     const words: string[] = [];
-    while (this.peek().kind !== "eof" && this.peek().value !== "]]" && this.peek().kind !== "newline") {
-      words.push(this.advance().value);
+    const ends = () => this.peek().kind === "eof" || this.peek().value === "]]" || this.peek().kind === "newline";
+    while (!ends()) {
+      const token = this.advance();
+      words.push(token.value);
+      if (token.value === "=~" && !ends()) {
+        // the regex runs to the next blank, parentheses and `|` included
+        const start = this.peek().start;
+        let end = this.advance().end;
+        while (!ends() && this.peek().start === end) end = this.advance().end;
+        words.push(this.source.slice(start, end));
+      }
     }
-    this.expect("]]" );
+    this.expect("]]");
     return { kind: "conditional", words };
   }
 

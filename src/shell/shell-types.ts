@@ -17,6 +17,13 @@ export interface ShellContext {
   volume: MemoryVolume;
   signal?: AbortSignal;
   limits?: ShellLimits;
+  // the command's input from a pipe, a `<` redirect, `<<<` or a here-document
+  stdin?: string;
+  // true when the command's stdout or stderr goes to a pipe, a file or a
+  // command substitution rather than the terminal: a program writes it to
+  // its result only, not to the terminal as it runs
+  stdoutCaptured?: boolean;
+  stderrCaptured?: boolean;
   // run a sub-command through the shell (used by npm run, etc.)
   exec: (
     cmd: string,

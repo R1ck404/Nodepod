@@ -1,5 +1,6 @@
 import type { BuiltinFn } from "../shell-types.js";
 import { fail, ok, resolvePath, scheduleLongTimeout, yieldToEventLoop } from "../shell-helpers.js";
+import { stat_cmd, od_cmd } from "./stat-od.js";
 
 function shellQuote(value: string): string {
   if (value.length > 0 && /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -43,26 +44,6 @@ const uname: BuiltinFn = (args) => {
 
 const hostname: BuiltinFn = (_args, ctx) => ok(`${ctx.env.HOSTNAME || "nodepod"}\n`);
 
-const statCmd: BuiltinFn = (args, ctx) => {
-  const formatIndex = args.indexOf("-c");
-  const format = formatIndex >= 0 ? args[formatIndex + 1] ?? "%n" : "%n  %s  %F\n";
-  const pathArg = args.find((arg, index) => !arg.startsWith("-") && index !== formatIndex + 1);
-  if (!pathArg) return fail("stat: missing operand\n");
-  const path = resolvePath(pathArg, ctx.cwd);
-  try {
-    const stat = ctx.volume.statSync(path);
-    const type = stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symbolic link" : "regular file";
-    const output = format
-      .replace(/%n/g, pathArg)
-      .replace(/%s/g, String(stat.size))
-      .replace(/%F/g, type)
-      .replace(/%a/g, (stat.mode & 0o777).toString(8))
-      .replace(/%Y/g, String(Math.floor(stat.mtimeMs / 1000)));
-    return ok(output.endsWith("\n") ? output : output + "\n");
-  } catch {
-    return fail(`stat: cannot stat '${pathArg}': No such file or directory\n`);
-  }
-};
 
 const duCmd: BuiltinFn = async (args, ctx) => {
   const human = args.includes("-h") || args.includes("--human-readable");
@@ -145,15 +126,6 @@ const base64Cmd: BuiltinFn = (args, ctx, stdin) => {
   }
 };
 
-const odCmd: BuiltinFn = (args, ctx, stdin) => {
-  const file = args.find((arg) => !arg.startsWith("-"));
-  const input = stdin ?? (file ? ctx.volume.readFileSync(resolvePath(file, ctx.cwd), "utf8") : "");
-  const bytes = new TextEncoder().encode(input);
-  const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
-  if (bytes.length * 3 + 2 > outputLimit) return fail("od: output limit exceeded\n");
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
-  return ok(` ${hex}\n`);
-};
 
 /**
  * GNU timeout-compatible virtual utility. The command runs in a cancellable
@@ -253,11 +225,11 @@ export const systemCommands: [string, BuiltinFn][] = [
   ["id", id],
   ["uname", uname],
   ["hostname", hostname],
-  ["stat", statCmd],
+  ["stat", stat_cmd],
   ["du", duCmd],
   ["mktemp", mktempCmd],
   ["fold", foldCmd],
   ["base64", base64Cmd],
-  ["od", odCmd],
+  ["od", od_cmd],
   ["timeout", timeoutCmd],
 ];

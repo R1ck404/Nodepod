@@ -2,6 +2,8 @@ import type { MemoryVolume } from "../memory-volume.js";
 import { expandGlob } from "./shell-parser.js";
 import type { ShellLimits } from "./shell-options.js";
 import { ShellLimitError } from "./shell-options.js";
+import { ArithmeticError, evaluateArithmetic } from "./bash-arithmetic.js";
+import type { ArithmeticScope } from "./bash-arithmetic.js";
 
 export interface BashExpansionContext {
   env: Record<string, string>;
@@ -10,11 +12,17 @@ export interface BashExpansionContext {
   lastExit: number;
   positional: string[];
   lastBackgroundPid: number;
+  /** `$$`: the shell's process ID. */
+  pid?: number;
+  /** `$PPID`. */
+  ppid?: number;
+  /** When the shell started, for `$SECONDS`. */
+  startedAt?: number;
   shellName?: string;
   pipeStatuses: number[];
   nounset?: boolean;
   limits: ShellLimits;
-  globOptions?: { enabled?: boolean; nullglob?: boolean; dotglob?: boolean };
+  globOptions?: { enabled?: boolean; nullglob?: boolean; dotglob?: boolean; globstar?: boolean };
   commandSubstitution: (command: string) => Promise<{ stdout: string; exitCode: number }>;
   processSubstitution?: (command: string, mode: "read" | "write") => Promise<string>;
 }
@@ -31,6 +39,11 @@ function braceExpand(word: string, limit: number, recursionDepth = 0, maxDepth =
       if (word[i] === quote) quote = null;
     } else if (word[i] === "'" || word[i] === '"') {
       quote = word[i] as "'" | '"';
+    } else if (word[i] === "$" && (word[i + 1] === "{" || word[i + 1] === "(")) {
+      // `${x,}` and `$(…)` are expansions, not brace lists
+      const end = findMatching(word, i + 1, word[i + 1], word[i + 1] === "{" ? "}" : ")");
+      if (end < 0) return [word];
+      i = end;
     } else if (word[i] === "{") {
       open = i;
       break;
@@ -76,22 +89,33 @@ function braceExpand(word: string, limit: number, recursionDepth = 0, maxDepth =
   return [word];
 }
 
+// `{1..5}`, `{01..10..2}` (zero padding follows the widest end) and
+// `{a..e}` (single characters).
 function expandRange(body: string, limit: number): string[] {
+  const letters = body.match(/^([a-zA-Z])\.\.([a-zA-Z])(?:\.\.(-?\d+))?$/);
   const match = body.match(/^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$/);
-  if (!match) return body.split(",");
-  const start = parseInt(match[1], 10);
-  const end = parseInt(match[2], 10);
-  const step = parseInt(match[3] ?? (start <= end ? "1" : "-1"), 10) || 1;
+  if (!match && !letters) return body.split(",");
+  const start = letters ? letters[1].charCodeAt(0) : parseInt(match![1], 10);
+  const end = letters ? letters[2].charCodeAt(0) : parseInt(match![2], 10);
+  const step = parseInt((letters ? letters[3] : match![3]) ?? "1", 10) || 1;
   const actualStep = start <= end ? Math.abs(step) : -Math.abs(step);
   const count = Math.floor(Math.abs(end - start) / Math.abs(actualStep)) + 1;
   if (!Number.isSafeInteger(count) || count > limit) {
     throw new ShellLimitError("maxExpansionBytes", "shell: brace expansion limit exceeded");
   }
+  const padded = match && /^-?0\d/.test(match[1]) || match && /^-?0\d/.test(match[2]);
+  const width = match ? Math.max(match[1].length, match[2].length) : 0;
+  const format = (n: number): string => {
+    if (letters) return String.fromCharCode(n);
+    if (!padded) return String(n);
+    const digits = String(Math.abs(n)).padStart(n < 0 ? width - 1 : width, "0");
+    return n < 0 ? `-${digits}` : digits;
+  };
   const values: string[] = [];
   if (actualStep > 0) {
-    for (let n = start; n <= end; n += actualStep) values.push(String(n));
+    for (let n = start; n <= end; n += actualStep) values.push(format(n));
   } else {
-    for (let n = start; n >= end; n += actualStep) values.push(String(n));
+    for (let n = start; n >= end; n += actualStep) values.push(format(n));
   }
   return values;
 }
@@ -143,84 +167,271 @@ function findQuoteEnd(text: string, start: number, quote: "'" | '"'): number {
   return -1;
 }
 
+// Arrays are stored in the environment as `name[key]` entries, with
+// `name[@]` holding the elements joined by spaces and `name` the first.
+export function arrayKeys(env: Record<string, string>, name: string): string[] {
+  const prefix = `${name}[`;
+  const keys: string[] = [];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(prefix) && key.endsWith("]")) {
+      const inner = key.slice(prefix.length, -1);
+      if (inner !== "@" && inner !== "*") keys.push(inner);
+    }
+  }
+  if (keys.every((key) => /^\d+$/.test(key))) keys.sort((a, b) => Number(a) - Number(b));
+  return keys;
+}
+
+export function arrayValues(env: Record<string, string>, name: string): string[] {
+  const keys = arrayKeys(env, name);
+  if (keys.length === 0) return env[name] === undefined ? [] : [env[name]];
+  return keys.map((key) => env[`${name}[${key}]`]);
+}
+
+/** Replaces the array `name` with `values`, indexed from 0. */
+export function setArray(env: Record<string, string>, name: string, values: string[]): void {
+  for (const key of arrayKeys(env, name)) delete env[`${name}[${key}]`];
+  values.forEach((value, index) => { env[`${name}[${index}]`] = value; });
+  syncArray(env, name);
+}
+
+/** Refreshes `name[@]` and `name` after an element of the array changed. */
+export function syncArray(env: Record<string, string>, name: string): void {
+  const keys = arrayKeys(env, name);
+  if (keys.length === 0) {
+    delete env[`${name}[@]`];
+    return;
+  }
+  env[`${name}[@]`] = keys.map((key) => env[`${name}[${key}]`]).join(" ");
+  const first = env[`${name}[0]`];
+  if (first !== undefined) env[name] = first;
+  else if (!/^\d+$/.test(keys[0])) delete env[name];
+}
+
+// The key a subscript names: a number, an associative key, or a variable
+// holding the index (`${arr[i]}`).
+function subscriptKey(base: string, index: string, ctx: BashExpansionContext): string {
+  if (/^-?\d+$/.test(index)) {
+    const n = parseInt(index, 10);
+    if (n >= 0) return String(n);
+    const keys = arrayKeys(ctx.env, base);
+    const last = keys.length ? Number(keys[keys.length - 1]) : -1;
+    return String(last + 1 + n);
+  }
+  if (`${base}[${index}]` in ctx.env) return index;
+  // an indexed array's subscript is arithmetic: `${arr[i]}`, `${arr[i+1]}`
+  try {
+    const n = Number(arithmetic(index, ctx));
+    return n >= 0 ? String(n) : subscriptKey(base, String(n), ctx);
+  } catch {
+    return index;
+  }
+}
+
+// Variables bash sets in every shell without exporting them, so they stay
+// out of the environment programs see.
+function shellVariable(name: string, ctx: BashExpansionContext): string | undefined {
+  switch (name) {
+    case "RANDOM": return String(Math.floor(Math.random() * 32768));
+    case "UID":
+    case "EUID": return "1000";
+    case "PPID": return String(ctx.ppid ?? 1);
+    case "BASHPID": return String(ctx.pid ?? 1);
+    case "HOSTNAME": return "nodepod";
+    case "BASH": return "/bin/bash";
+    case "BASH_VERSION": return "5.2.0(1)-release";
+    case "SECONDS": return String(Math.floor((Date.now() - (ctx.startedAt ?? Date.now())) / 1000));
+  }
+  return undefined;
+}
+
 function lookupParameter(name: string, ctx: BashExpansionContext): string {
   if (name === "?") return String(ctx.lastExit);
-  if (name === "$") return "1";
+  if (name === "$") return String(ctx.pid ?? 1);
   if (name === "0") return ctx.shellName ?? "nodepod";
   if (name === "#") return String(ctx.positional.length);
   if (name === "!") return ctx.lastBackgroundPid ? String(ctx.lastBackgroundPid) : "";
+  if (!(name in ctx.env)) {
+    const dynamic = shellVariable(name, ctx);
+    if (dynamic !== undefined) return dynamic;
+  }
   if (name === "PIPESTATUS") return ctx.pipeStatuses.join(" ");
   if (name === "@" || name === "*") return ctx.positional.join(" ");
-  const array = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\[([@*]|\d+)\]$/);
+  const array = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$/);
   if (array) {
     const base = array[1];
     const index = array[2];
-    if (index === "@" || index === "*") return ctx.env[`${base}[@]`] ?? ctx.env[base] ?? "";
-    return ctx.env[`${base}[${index}]`] ?? "";
+    if (base === "PIPESTATUS") {
+      return index === "@" || index === "*" ? ctx.pipeStatuses.join(" ") : String(ctx.pipeStatuses[Number(index)] ?? "");
+    }
+    if (index === "@" || index === "*") return arrayValues(ctx.env, base).join(" ");
+    const key = subscriptKey(base, index, ctx);
+    if (key === "0" && arrayKeys(ctx.env, base).length === 0) return ctx.env[base] ?? "";
+    return ctx.env[`${base}[${key}]`] ?? "";
   }
   if (/^\d+$/.test(name)) return ctx.positional[parseInt(name, 10) - 1] ?? "";
   if (ctx.nounset && !(name in ctx.env)) {
-    throw new Error(`shell: ${name}: unbound variable`);
+    if (shellVariable(name, ctx) !== undefined) return shellVariable(name, ctx)!;
+    throw new UnboundVariableError(name);
   }
   return ctx.env[name] ?? "";
 }
 
-function expandParameter(raw: string, ctx: BashExpansionContext): string {
-  if (!raw.startsWith("${") || !raw.endsWith("}")) return lookupParameter(raw.slice(1), ctx);
-  let body = raw.slice(2, -1);
-  if (body.startsWith("#")) return String(lookupParameter(body.slice(1), ctx).length);
+/** `set -u` and an unset variable: a non-interactive shell exits with 127. */
+export class UnboundVariableError extends Error {
+  constructor(readonly variable: string) {
+    super(`shell: ${variable}: unbound variable`);
+  }
+}
 
-  const caseModifier = body.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(\^\^|\^|,,|,)$/);
+// A glob pattern as a regular expression source, for `${x#pat}`, `${x/pat/rep}`.
+function patternSource(pattern: string): string {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\" && i + 1 < pattern.length) {
+      out += pattern[++i].replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    } else if (ch === "*") {
+      out += "[\\s\\S]*";
+      while (pattern[i + 1] === "*") i++;
+    } else if (ch === "?") {
+      out += "[\\s\\S]";
+    } else if (ch === "[") {
+      const end = pattern.indexOf("]", i + 2);
+      if (end < 0) { out += "\\["; continue; }
+      let cls = pattern.slice(i + 1, end);
+      if (cls.startsWith("!")) cls = "^" + cls.slice(1);
+      out += `[${cls.replace(/\\/g, "\\\\")}]`;
+      i = end;
+    } else {
+      out += ch.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+    }
+  }
+  return out;
+}
+
+// Splits `pat/rep` at the first `/` that is not escaped or quoted.
+function splitReplacement(text: string): [string, string | undefined] {
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\\") { i++; continue; }
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "/") return [text.slice(0, i), text.slice(i + 1)];
+  }
+  return [text, undefined];
+}
+
+// The words inside `${...}` (fallbacks, patterns, replacements) expand
+// like a quoted word: parameters, substitutions and quote removal, no
+// splitting.
+async function expandOperand(text: string, ctx: BashExpansionContext): Promise<string> {
+  if (!/[$`'"\\~]/.test(text)) return text;
+  return (await expandPart(expandTilde(text, ctx), ctx)).value;
+}
+
+const NAME = String.raw`[a-zA-Z_][a-zA-Z0-9_]*(?:\[[^\]]+\])?|\d+|[@*?#$!]`;
+
+async function expandParameter(raw: string, ctx: BashExpansionContext): Promise<string> {
+  if (!raw.startsWith("${") || !raw.endsWith("}")) return lookupParameter(raw.slice(1), ctx);
+  const body = raw.slice(2, -1);
+  if (body === "#" || body === "!" || body === "$" || body === "?") return lookupParameter(body, ctx);
+
+  const length = body.match(/^#([a-zA-Z_][a-zA-Z0-9_]*)\[([@*])\]$/);
+  if (length) return String(arrayValues(ctx.env, length[1]).length);
+  if (body === "#@" || body === "#*") return String(ctx.positional.length);
+  if (body.startsWith("#") && new RegExp(`^#(?:${NAME})$`).test(body)) {
+    return String(lookupParameter(body.slice(1), ctx).length);
+  }
+
+  const keys = body.match(/^!([a-zA-Z_][a-zA-Z0-9_]*)\[([@*])\]$/);
+  if (keys) {
+    const found = arrayKeys(ctx.env, keys[1]);
+    return (found.length === 0 && ctx.env[keys[1]] !== undefined ? ["0"] : found).join(" ");
+  }
+  const indirect = body.match(/^!([a-zA-Z_][a-zA-Z0-9_]*)$/);
+  if (indirect) {
+    const target = lookupParameter(indirect[1], ctx);
+    return target ? lookupParameter(target, ctx) : "";
+  }
+
+  const caseModifier = body.match(new RegExp(`^(${NAME})(\\^\\^|\\^|,,|,)$`));
   if (caseModifier) {
     const value = lookupParameter(caseModifier[1], ctx);
-    return caseModifier[2].startsWith("^") ? value.toUpperCase() : value.toLowerCase();
+    const all = caseModifier[2].length === 2;
+    const upper = caseModifier[2].startsWith("^");
+    if (all) return upper ? value.toUpperCase() : value.toLowerCase();
+    return (upper ? value.charAt(0).toUpperCase() : value.charAt(0).toLowerCase()) + value.slice(1);
   }
 
-  const patternModifier = body.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(##|#|%%|%)(.*)$/);
+  const patternModifier = body.match(new RegExp(`^(${NAME})(##|#|%%|%)([\\s\\S]*)$`));
   if (patternModifier) {
-    const value = lookupParameter(patternModifier[1], ctx);
-    const pattern = patternModifier[3].replace(/\*+/g, "*");
+    const [, name, op, rawPattern] = patternModifier;
+    const value = lookupParameter(name, ctx);
+    const pattern = await expandOperand(rawPattern, ctx);
     if (!pattern) return value;
-    if (value.length * Math.max(1, pattern.length) > ctx.limits.maxLoopIterations) {
+    if ((value.length + 1) * (value.length + 1) > ctx.limits.maxLoopIterations) {
       throw new ShellLimitError("maxLoopIterations", "shell: parameter pattern operation limit exceeded");
     }
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-    const expression = patternModifier[2].startsWith("#") ? `^${escaped}` : `${escaped}$`;
-    const match = value.match(new RegExp(expression));
-    if (!match) return value;
-    return patternModifier[2].length === 2
-      ? patternModifier[2].startsWith("#") ? value.slice(match[0].length) : value.slice(0, value.length - match[0].length)
-      : patternModifier[2].startsWith("#") ? value.slice(match[0].length) : value.slice(0, value.length - match[0].length);
+    const whole = new RegExp(`^(?:${patternSource(pattern)})$`);
+    const n = value.length;
+    if (op === "#") { for (let k = 0; k <= n; k++) if (whole.test(value.slice(0, k))) return value.slice(k); }
+    if (op === "##") { for (let k = n; k >= 0; k--) if (whole.test(value.slice(0, k))) return value.slice(k); }
+    if (op === "%") { for (let k = n; k >= 0; k--) if (whole.test(value.slice(k))) return value.slice(0, k); }
+    if (op === "%%") { for (let k = 0; k <= n; k++) if (whole.test(value.slice(k))) return value.slice(0, k); }
+    return value;
   }
 
-  const operator = body.match(/^([a-zA-Z_][a-zA-Z0-9_]*(?:\[[^\]]+\])?|\d+|[@*?])(:?[-+=?])(.*)$/);
-  if (operator) {
-    const [, name, op, fallback] = operator;
+  const replacement = body.match(new RegExp(`^(${NAME})\\/(\\/|#|%)?([\\s\\S]*)$`));
+  if (replacement) {
+    const [, name, mode, rest] = replacement;
     const value = lookupParameter(name, ctx);
+    const [rawPattern, rawReplacement] = splitReplacement(rest);
+    const pattern = await expandOperand(rawPattern, ctx);
+    if (!pattern) return value;
+    const with_ = rawReplacement === undefined ? "" : await expandOperand(rawReplacement, ctx);
+    const source = patternSource(pattern);
+    const regex = new RegExp(mode === "#" ? `^(?:${source})` : mode === "%" ? `(?:${source})$` : source, mode === "/" ? "g" : "");
+    return value.replace(regex, () => with_);
+  }
+
+  const operator = body.match(new RegExp(`^(${NAME})(:?[-+=?])([\\s\\S]*)$`));
+  if (operator) {
+    const [, name, op, rawFallback] = operator;
+    const value = lookupParameter(name, ctx);
+    const isSet = /^\d+$/.test(name) ? Number(name) <= ctx.positional.length
+      : name === "@" || name === "*" ? ctx.positional.length > 0
+        : ctx.env[name] !== undefined || (name.includes("[") && value !== "");
     const empty = value.length === 0;
-    if ((op === "-" && ctx.env[name] === undefined) || (op === ":-" && empty)) return fallback;
-    if ((op === "+" && ctx.env[name] !== undefined) || (op === ":+" && !empty)) return fallback;
+    if ((op === "-" && !isSet) || (op === ":-" && empty)) return expandOperand(rawFallback, ctx);
+    if ((op === "+" && isSet) || (op === ":+" && !empty)) return expandOperand(rawFallback, ctx);
+    if (op === "+" || op === ":+") return "";
     if (op === "=" || op === ":=") {
-      if (ctx.env[name] === undefined || (op === ":=" && empty)) ctx.env[name] = fallback;
-      return ctx.env[name];
+      if (!isSet || (op === ":=" && empty)) ctx.env[name] = await expandOperand(rawFallback, ctx);
+      return ctx.env[name] ?? value;
     }
     if (op === "?" || op === ":?") {
-      if (ctx.env[name] === undefined || (op === ":?" && empty)) {
-        throw new Error(`shell: ${fallback || name}: parameter is unset`);
+      if (!isSet || (op === ":?" && empty)) {
+        const message = rawFallback ? await expandOperand(rawFallback, ctx) : "parameter null or not set";
+        throw new Error(`shell: ${name}: ${message}`);
       }
     }
     return value;
   }
 
   // Bash substring syntax: ${var:offset[:length]}.
-  const slice = body.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(-?\d+)(?::\s*(-?\d+))?$/);
+  const slice = body.match(new RegExp(`^(${NAME}):([^:]*)(?::([\\s\\S]*))?$`));
   if (slice) {
     const value = lookupParameter(slice[1], ctx);
-    const start = parseInt(slice[2], 10);
-    const length = slice[3] === undefined ? undefined : parseInt(slice[3], 10);
-    return length === undefined ? value.slice(start) : value.slice(start, start + length);
+    let start = Number(await expandArithmetic(slice[2] || "0", ctx));
+    if (start < 0) start = Math.max(0, value.length + start);
+    if (slice[3] === undefined) return value.slice(start);
+    const len = Number(await expandArithmetic(slice[3] || "0", ctx));
+    return len < 0 ? value.slice(start, value.length + len) : value.slice(start, start + len);
   }
 
+  if (!new RegExp(`^(?:${NAME})$`).test(body)) throw new Error(`shell: \${${body}}: bad substitution`);
   return lookupParameter(body, ctx);
 }
 
@@ -228,26 +439,77 @@ function arithmetic(expression: string, ctx: BashExpansionContext): string {
   if (expression.length > Math.min(ctx.limits.maxExpansionBytes, ctx.limits.maxLoopIterations)) {
     throw new ShellLimitError("maxLoopIterations", "shell: arithmetic expression limit exceeded");
   }
-  const substituted = expression.replace(/[a-zA-Z_][a-zA-Z0-9_]*/g, (name) => lookupParameter(name, ctx) || "0");
-  if (!/^[\d\s()+\-*/%<>&|^~!?=:]+$/.test(substituted)) {
-    throw new Error("shell: invalid arithmetic expression");
+  const scope: ArithmeticScope = {
+    get: (name) => {
+      const element = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\[(\d+)\]$/);
+      if (element && element[2] === "0" && arrayKeys(ctx.env, element[1]).length === 0) return ctx.env[element[1]];
+      if (!(name in ctx.env) && shellVariable(name, ctx) !== undefined) return shellVariable(name, ctx);
+      if (!element && ctx.nounset && !(name in ctx.env)) throw new UnboundVariableError(name);
+      return ctx.env[name];
+    },
+    set: (name, value) => {
+      ctx.env[name] = value;
+      const element = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\[/);
+      if (element) syncArray(ctx.env, element[1]);
+      else if (arrayKeys(ctx.env, name).length > 0) {
+        ctx.env[`${name}[0]`] = value;
+        syncArray(ctx.env, name);
+      }
+    },
+  };
+  try {
+    return String(evaluateArithmetic(expression, scope, ctx.limits.maxRecursionDepth));
+  } catch (error) {
+    if (error instanceof ArithmeticError) throw new Error(`shell: ${expression.trim()}: ${error.message}`);
+    throw error;
   }
-  let nesting = 0;
-  for (const char of substituted) {
-    if (char === "(" && ++nesting > ctx.limits.maxRecursionDepth) {
-      throw new ShellLimitError("maxRecursionDepth", "shell: arithmetic nesting limit exceeded");
-    }
-    if (char === ")") nesting--;
-  }
-  // This is intentionally isolated from the module scope and accepts only
-  // the arithmetic character set above. It does not have access to globals.
-  const value = Function(`"use strict"; return (${substituted});`)();
-  if (typeof value === "boolean") return value ? "1" : "0";
-  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("shell: arithmetic overflow");
-  return String(Math.trunc(value));
 }
 
-async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
+/** Expands and evaluates the text of `(( ))`, `for (( ;; ))` or `let`. */
+export async function evaluateArithmeticText(expression: string, ctx: BashExpansionContext): Promise<number> {
+  return Number(await expandArithmetic(expression, ctx));
+}
+
+// The index of the last `)` of the `$(( ... ))` at `start`, matching nested
+// parentheses so `$(( $(cmd) + 1 ))` and `$(( (1 + 2) * 3 ))` end at the
+// right place, or -1.
+function arithmeticEnd(text: string, start: number): number {
+  const end = findMatching(text, start + 1, "(", ")");
+  return end > start + 2 && text[end - 1] === ")" ? end : -1;
+}
+
+// Parameters and command substitutions inside `$(( ))` expand before the
+// expression is evaluated, as in bash.
+async function expandArithmetic(expression: string, ctx: BashExpansionContext): Promise<string> {
+  const expanded = /[$`]/.test(expression) ? await expandInner(expression, ctx, false) : expression;
+  return arithmetic(expanded, ctx);
+}
+
+// The text of `$'…'` from `start` (after the quote): bash's escapes \a \b \e
+// \f \n \r \t \v \\ \' \" \?, octal \nnn, \xHH, \uHHHH, \UHHHHHHHH and \cX
+function ansiCQuote(raw: string, start: number): { text: string; end: number } {
+  let text = "";
+  let i = start;
+  const simple: Record<string, string> = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+  while (i < raw.length && raw[i] !== "'") {
+    if (raw[i] !== "\\" || i + 1 >= raw.length) { text += raw[i++]; continue; }
+    const c = raw[i + 1];
+    if (c in simple) { text += simple[c]; i += 2; continue; }
+    const octal = raw.slice(i + 1).match(/^[0-7]{1,3}/);
+    if (octal) { text += String.fromCharCode(parseInt(octal[0], 8) & 0xff); i += 1 + octal[0].length; continue; }
+    const hex = c === "x" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,2}/) : c === "u" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,4}/) : c === "U" ? raw.slice(i + 2).match(/^[0-9a-fA-F]{1,8}/) : null;
+    if (hex) { text += String.fromCodePoint(parseInt(hex[0], 16)); i += 2 + hex[0].length; continue; }
+    if (c === "c" && i + 2 < raw.length) { text += String.fromCharCode(raw[i + 2].toUpperCase().charCodeAt(0) & 0x1f); i += 3; continue; }
+    text += "\\" + c;
+    i += 2;
+  }
+  if (i >= raw.length) throw new Error("shell: unmatched single quote");
+  return { text, end: i };
+}
+
+// `escapeQuoted` rewrites quoted and backslash-escaped text, so a pattern
+// keeps `"*"` literal while an unquoted `*` still matches.
+async function expandPart(raw: string, ctx: BashExpansionContext, escapeQuoted?: (text: string) => string): Promise<{
   value: string;
   split: boolean;
   glob: boolean;
@@ -259,11 +521,18 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
   let preserveEmpty = false;
   for (let i = 0; i < raw.length;) {
     const ch = raw[i];
+    if (ch === "$" && raw[i + 1] === "'") {
+      const { text, end } = ansiCQuote(raw, i + 2);
+      preserveEmpty = true;
+      out += escapeQuoted ? escapeQuoted(text) : text;
+      i = end + 1;
+      continue;
+    }
     if (ch === "'") {
       const end = findQuoteEnd(raw, i, "'");
       if (end < 0) throw new Error("shell: unmatched single quote");
       preserveEmpty = true;
-      out += raw.slice(i + 1, end);
+      out += escapeQuoted ? escapeQuoted(raw.slice(i + 1, end)) : raw.slice(i + 1, end);
       i = end + 1;
       continue;
     }
@@ -271,22 +540,22 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
       const end = findQuoteEnd(raw, i, '"');
       if (end < 0) throw new Error("shell: unmatched double quote");
       preserveEmpty = true;
-      const inner = raw.slice(i + 1, end);
-      out += await expandInner(inner, ctx, false);
+      const inner = await expandInner(raw.slice(i + 1, end), ctx, false);
+      out += escapeQuoted ? escapeQuoted(inner) : inner;
       i = end + 1;
       continue;
     }
     if (ch === "\\") {
-      if (i + 1 < raw.length) out += raw[i + 1];
+      if (i + 1 < raw.length) out += escapeQuoted ? escapeQuoted(raw[i + 1]) : raw[i + 1];
       i += 2;
       continue;
     }
     if (ch === "$" && raw[i + 1] === "(" && raw[i + 2] === "(") {
-      const end = raw.indexOf("))", i + 3);
+      const end = arithmeticEnd(raw, i);
       if (end < 0) throw new Error("shell: unmatched arithmetic expansion");
-      out += arithmetic(raw.slice(i + 3, end), ctx);
+      out += await expandArithmetic(raw.slice(i + 3, end - 1), ctx);
       split = true;
-      i = end + 2;
+      i = end + 1;
       continue;
     }
     if (ch === "$" && raw[i + 1] === "(") {
@@ -319,7 +588,7 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
     if (ch === "$" && raw[i + 1] === "{") {
       const end = findMatching(raw, i + 1, "{", "}");
       if (end < 0) throw new Error("shell: unmatched parameter expansion");
-      out += expandParameter(raw.slice(i, end + 1), ctx);
+      out += await expandParameter(raw.slice(i, end + 1), ctx);
       split = true;
       i = end + 1;
       continue;
@@ -338,7 +607,7 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
         continue;
       }
     }
-    if (ch === "*" || ch === "?") glob = true;
+    if (ch === "*" || ch === "?" || ch === "[") glob = true;
     out += ch;
     i++;
   }
@@ -362,7 +631,7 @@ export async function expandWord(raw: string, ctx: BashExpansionContext): Promis
   if (raw === '"$*"' || raw === '"${*}"') return [ctx.positional.join(" ")];
   if (raw === "$@") return [...ctx.positional];
   const quotedArray = raw.match(/^"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"$/);
-  if (quotedArray) return (ctx.env[`${quotedArray[1]}[@]`] ?? "").split(" ").filter((value) => value.length > 0);
+  if (quotedArray) return arrayValues(ctx.env, quotedArray[1]);
   const values: string[] = [];
   let expandedLength = 0;
   for (const braced of braceExpand(
@@ -381,6 +650,7 @@ export async function expandWord(raw: string, ctx: BashExpansionContext): Promis
       for (const piece of pieces) {
         const matches = expandGlob(piece, ctx.cwd, ctx.volume, {
           dotglob: ctx.globOptions?.dotglob,
+          globstar: ctx.globOptions?.globstar,
           maxEntries: ctx.limits.maxFilesystemEntries,
           maxOperations: ctx.limits.maxLoopIterations,
           maxPatternLength: ctx.limits.maxExpansionBytes,
@@ -397,6 +667,21 @@ export async function expandWord(raw: string, ctx: BashExpansionContext): Promis
     }
   }
   return values;
+}
+
+/** One word expanded without splitting or globbing: `case` words and `[[ ]]` operands. */
+export async function expandText(raw: string, ctx: BashExpansionContext): Promise<string> {
+  return (await expandPart(expandTilde(raw, ctx), ctx)).value;
+}
+
+/** A pattern word (`case`, `[[ == ]]`): quoted characters come back backslash-escaped. */
+export async function expandPattern(raw: string, ctx: BashExpansionContext): Promise<string> {
+  return (await expandPart(expandTilde(raw, ctx), ctx, (text) => text.replace(/[*?[\]\\]/g, "\\$&"))).value;
+}
+
+/** The right side of `[[ =~ ]]`: quoted characters match themselves. */
+export async function expandRegex(raw: string, ctx: BashExpansionContext): Promise<string> {
+  return (await expandPart(raw, ctx, (text) => text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"))).value;
 }
 
 export async function expandWords(words: string[], ctx: BashExpansionContext): Promise<string[]> {
@@ -438,10 +723,10 @@ async function expandQuotedText(
       continue;
     }
     if (ch === "$" && text[i + 1] === "(" && text[i + 2] === "(") {
-      const end = text.indexOf("))", i + 3);
+      const end = arithmeticEnd(text, i);
       if (end < 0) throw new Error("shell: unmatched arithmetic expansion in here-document");
-      out += arithmetic(text.slice(i + 3, end), ctx);
-      i = end + 2;
+      out += await expandArithmetic(text.slice(i + 3, end - 1), ctx);
+      i = end + 1;
       continue;
     }
     if (ch === "$" && text[i + 1] === "(") {
@@ -463,7 +748,7 @@ async function expandQuotedText(
     if (ch === "$" && text[i + 1] === "{") {
       const end = findMatching(text, i + 1, "{", "}");
       if (end < 0) throw new Error("shell: unmatched parameter expansion in here-document");
-      out += expandParameter(text.slice(i, end + 1), ctx);
+      out += await expandParameter(text.slice(i, end + 1), ctx);
       i = end + 1;
       continue;
     }

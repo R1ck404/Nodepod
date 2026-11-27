@@ -129,57 +129,106 @@ export function expandVariables(
 /*  Glob expansion                                                     */
 /* ------------------------------------------------------------------ */
 
+// Matches each `/`-separated segment of the pattern against the directory
+// it names, and keeps the path as written: `notes/*.md` gives `notes/a.md`,
+// `../*.txt` gives `../x.txt`. With `globstar`, a `**` segment matches the
+// directory and every directory below it.
 export function expandGlob(
   pattern: string,
   cwd: string,
   volume: MemoryVolume,
-  options?: { dotglob?: boolean; maxEntries?: number; maxOperations?: number; maxPatternLength?: number },
+  options?: {
+    dotglob?: boolean;
+    globstar?: boolean;
+    maxEntries?: number;
+    maxOperations?: number;
+    maxPatternLength?: number;
+  },
 ): string[] {
-  if (!pattern.includes("*") && !pattern.includes("?")) return [pattern];
-
-  const lastSlash = pattern.lastIndexOf("/");
-  let dir: string;
-  let filePattern: string;
-
-  if (lastSlash === -1) {
-    dir = cwd;
-    filePattern = pattern;
-  } else {
-    dir = pattern.slice(0, lastSlash) || "/";
-    if (!dir.startsWith("/")) dir = `${cwd}/${dir}`.replace(/\/+/g, "/");
-    filePattern = pattern.slice(lastSlash + 1);
-  }
-
-  let entries: string[];
-  try {
-    entries = volume.readdirSync(dir);
-  } catch {
-    return [pattern];
-  }
-  if (filePattern.length > (options?.maxPatternLength ?? Infinity)) {
+  if (!hasGlob(pattern)) return [pattern];
+  if (pattern.length > (options?.maxPatternLength ?? Infinity)) {
     throw new Error("shell: glob pattern limit exceeded");
   }
-  if (entries.length > (options?.maxEntries ?? Infinity)) {
-    throw new Error("shell: glob entry limit exceeded");
-  }
-  if (entries.length * Math.max(1, filePattern.length) > (options?.maxOperations ?? Infinity)) {
-    throw new Error("shell: glob operation limit exceeded");
-  }
-  try {
-    const regex = globToRegex(filePattern);
-    const matches = entries.filter((e) => {
-      if (!options?.dotglob && e.startsWith(".") && !filePattern.startsWith(".")) return false;
-      return regex.test(e);
-    });
+  const maxEntries = options?.maxEntries ?? Infinity;
+  const maxOperations = options?.maxOperations ?? Infinity;
+  let operations = 0;
+  const absolute = pattern.startsWith("/");
+  const segments = pattern.split("/");
+  if (absolute) segments.shift();
+  const join = (base: string, name: string) => base === "" ? name : base.endsWith("/") ? base + name : `${base}/${name}`;
+  const real = (shown: string) => shown.startsWith("/") ? shown : shown === "" ? cwd : `${cwd}/${shown}`;
+  const isDir = (shown: string) => {
+    try { return volume.statSync(real(shown)).isDirectory(); } catch { return false; }
+  };
+  const list = (shown: string): string[] => {
+    let entries: string[];
+    try { entries = volume.readdirSync(real(shown) || "/"); } catch { return []; }
+    if (entries.length > maxEntries) throw new Error("shell: glob entry limit exceeded");
+    operations += entries.length;
+    if (operations > maxOperations) throw new Error("shell: glob operation limit exceeded");
+    return entries;
+  };
+  const visible = (name: string, segment: string) => options?.dotglob || !name.startsWith(".") || segment.startsWith(".");
 
-    if (matches.length === 0) return [pattern];
-
-    return matches.sort().map((m) =>
-      lastSlash === -1 ? m : `${dir}/${m}`.replace(/\/+/g, "/"),
-    );
-  } catch {
-    return [pattern];
+  let paths = [absolute ? "/" : ""];
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
+    const last = index === segments.length - 1;
+    const next: string[] = [];
+    if (segment === "") {
+      // a trailing slash keeps only directories; `a//b` keeps its slashes
+      for (const path of paths) if (!last || isDir(path)) next.push(path + "/");
+    } else if (options?.globstar && segment === "**") {
+      const walk = (path: string, depth: number) => {
+        if (depth > 64) return;
+        next.push(path);
+        for (const name of list(path).sort()) {
+          if (name.startsWith(".") && !options?.dotglob) continue;
+          const child = join(path, name);
+          if (isDir(child)) walk(child, depth + 1);
+        }
+      };
+      for (const path of paths) if (path === "" || path === "/" || isDir(path)) walk(path, 0);
+      if (last) {
+        // `**` at the end also names the files below each directory
+        const all: string[] = [];
+        for (const path of next) {
+          if (path !== "" && path !== "/") all.push(path);
+          for (const name of list(path)) {
+            const child = join(path, name);
+            if (!isDir(child) && visible(name, segment)) all.push(child);
+          }
+        }
+        next.length = 0;
+        next.push(...all);
+      }
+    } else if (!hasGlob(segment)) {
+      for (const path of paths) next.push(join(path, segment));
+    } else {
+      let regex: RegExp;
+      try { regex = globToRegex(segment); } catch { return [pattern]; }
+      for (const path of paths) {
+        if (path !== "" && path !== "/" && !isDir(path)) continue;
+        for (const name of list(path)) {
+          if (visible(name, segment) && regex.test(name)) next.push(join(path, name));
+        }
+      }
+    }
+    paths = next;
+    if (paths.length === 0) break;
   }
+  const matches = [...new Set(paths)].filter((path) => path !== "" && volume.existsSync(real(path).replace(/\/$/, "") || "/"));
+  if (matches.length === 0) return [pattern];
+  return matches.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function hasGlob(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\\") { i++; continue; }
+    if (text[i] === "*" || text[i] === "?") return true;
+    if (text[i] === "[" && text.indexOf("]", i + 2) > i) return true;
+  }
+  return false;
 }
 
 function globToRegex(pattern: string): RegExp {
