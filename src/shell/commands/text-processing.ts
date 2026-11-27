@@ -447,7 +447,7 @@ const grep_cmd: BuiltinFn = async (args, ctx, stdin) => {
     regex = new RegExp(patternStr, ignoreCase ? "im" : "m");
     highlightRe = new RegExp(patternStr, ignoreCase ? "gi" : "g");
   } catch {
-    return fail(`grep: Invalid regular expression: '${patternStr}'\n`);
+    return fail(`grep: Invalid regular expression: '${patternStr}'\n`, 2);
   }
 
   const grepOpts: GrepOpts = {
@@ -1042,27 +1042,50 @@ const cut_cmd: BuiltinFn = (args, ctx, stdin) => {
     ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024,
   );
 
+  let onlyDelimited = false;
   try {
+    // options take their value attached (`-d,`, `-f1`) or as the next word,
+    // and in their long forms (`--delimiter=,`)
+    const long: Record<string, string> = { delimiter: "d", fields: "f", bytes: "b", characters: "c" };
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-d" && i + 1 < args.length) delimiter = args[++i];
-      else if (args[i] === "-f" && i + 1 < args.length)
-        fields = parseRangeSpec(args[++i], rangeLimit);
-      else if (args[i] === "-b" && i + 1 < args.length)
-        bytes = parseRangeSpec(args[++i], rangeLimit);
-      else if (args[i] === "-c" && i + 1 < args.length)
-        chars = parseRangeSpec(args[++i], rangeLimit);
-      else if (args[i] === "--output-delimiter" && i + 1 < args.length)
-        outputDelimiter = args[++i];
-      else if (!args[i].startsWith("-")) files.push(args[i]);
+      const arg = args[i];
+      let option: string | null = null;
+      let value: string | undefined;
+      if (arg === "-s" || arg === "--only-delimited") { onlyDelimited = true; continue; }
+      if (arg === "--") { files.push(...args.slice(i + 1)); break; }
+      const longMatch = arg.match(/^--([a-z-]+)(?:=(.*))?$/s);
+      if (longMatch && (longMatch[1] in long || longMatch[1] === "output-delimiter")) {
+        option = longMatch[1] === "output-delimiter" ? "o" : long[longMatch[1]];
+        value = longMatch[2] ?? args[++i];
+      } else if (/^-[dfbc]/.test(arg)) {
+        option = arg[1];
+        value = arg.length > 2 ? arg.slice(2) : args[++i];
+      } else if (arg === "-" || !arg.startsWith("-")) {
+        files.push(arg);
+        continue;
+      } else {
+        continue;
+      }
+      if (value === undefined) return fail(`cut: option requires an argument -- '${option}'\n`);
+      if (option === "d") delimiter = value;
+      else if (option === "o") outputDelimiter = value;
+      else if (option === "f") fields = parseRangeSpec(value, rangeLimit);
+      else if (option === "b") bytes = parseRangeSpec(value, rangeLimit);
+      else if (option === "c") chars = parseRangeSpec(value, rangeLimit);
     }
   } catch (error) {
     return fail(`cut: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+  if (fields.length === 0 && bytes.length === 0 && chars.length === 0) {
+    return fail("cut: you must specify a list of bytes, characters, or fields\n");
   }
 
   const outDelim = outputDelimiter ?? delimiter;
 
   const doCut = (content: string) => {
-    const lines = content.split("\n");
+    const trailingNewline = content.endsWith("\n");
+    const lines = (trailingNewline ? content.slice(0, -1) : content).split("\n");
+    if (content === "") return "";
     const selectionCount = (bytes.length > 0 ? bytes.length : chars.length > 0 ? chars.length : fields.length);
     if (lines.length * Math.max(1, selectionCount) > rangeLimit) {
       throw new Error(`operation limit ${rangeLimit} exceeded`);
@@ -1073,10 +1096,14 @@ const cut_cmd: BuiltinFn = (args, ctx, stdin) => {
           const indices = bytes.length > 0 ? bytes : chars;
           return indices.map((idx) => line[idx - 1] ?? "").join("");
         }
+        // a line without the delimiter is printed whole, or dropped with -s
+        if (!line.includes(delimiter)) return onlyDelimited ? null : line;
         const parts = line.split(delimiter);
-        return fields.map((f) => parts[f - 1] ?? "").join(outDelim);
+        return fields.filter((f) => f <= parts.length).map((f) => parts[f - 1]).join(outDelim);
       })
-      .join("\n");
+      .filter((line): line is string => line !== null)
+      .map((line) => line + "\n")
+      .join("");
     const outputLimit = ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024;
     if (output.length > outputLimit) throw new Error(`output limit ${outputLimit} exceeded`);
     return output;
@@ -1090,7 +1117,7 @@ const cut_cmd: BuiltinFn = (args, ctx, stdin) => {
   for (const file of files) {
     const p = resolvePath(file, ctx.cwd);
     try {
-      out += doCut(ctx.volume.readFileSync(p, "utf8"));
+      out += doCut(file === "-" ? stdin ?? "" : ctx.volume.readFileSync(p, "utf8"));
       if (out.length > (ctx.limits?.maxOutputBytes ?? 4 * 1024 * 1024)) throw new Error("output limit exceeded");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

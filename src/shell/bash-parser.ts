@@ -102,6 +102,13 @@ export interface BashCoprocCommand {
   body: BashCommand;
 }
 
+// A compound command with redirects after it (`while ...; done < file`).
+export interface BashRedirectedCommand {
+  kind: "redirected";
+  body: BashCommand;
+  redirects: BashRedirect[];
+}
+
 export interface BashFunctionCommand {
   kind: "function";
   name: string;
@@ -120,6 +127,7 @@ export type BashCommand =
   | BashConditionalCommand
   | BashArithmeticCommand
   | BashCoprocCommand
+  | BashRedirectedCommand
   | BashFunctionCommand;
 
 export interface BashPipeline {
@@ -499,21 +507,21 @@ class Parser {
       this.advance();
       const body = this.parseNestedList(new Set());
       this.expect(")");
-      return { kind: "subshell", body };
+      return this.withTrailingRedirects({ kind: "subshell", body });
     }
     if (token.value === "{") {
       this.advance();
       const body = this.parseNestedList(new Set());
       this.expect("}");
-      return { kind: "group", body };
+      return this.withTrailingRedirects({ kind: "group", body });
     }
-    if (token.value === "if") return this.parseIf();
-    if (token.value === "while" || token.value === "until") return this.parseLoop(token.value as "while" | "until");
-    if (token.value === "for") return this.parseFor();
-    if (token.value === "case") return this.parseCase();
-    if (token.value === "select") return this.parseSelect();
-    if (token.value === "[[") return this.parseConditional();
-    if (token.value === "((") return this.parseArithmetic();
+    if (token.value === "if") return this.withTrailingRedirects(this.parseIf());
+    if (token.value === "while" || token.value === "until") return this.withTrailingRedirects(this.parseLoop(token.value as "while" | "until"));
+    if (token.value === "for") return this.withTrailingRedirects(this.parseFor());
+    if (token.value === "case") return this.withTrailingRedirects(this.parseCase());
+    if (token.value === "select") return this.withTrailingRedirects(this.parseSelect());
+    if (token.value === "[[") return this.withTrailingRedirects(this.parseConditional());
+    if (token.value === "((") return this.withTrailingRedirects(this.parseArithmetic());
     if (token.value === "coproc") return this.parseCoproc();
     if (token.value === "function") return this.parseFunction(true);
     if (token.kind === "word" && this.peek(1).value === "(" && this.peek(2).value === ")") {
@@ -521,6 +529,42 @@ class Parser {
     }
 
     return this.parseSimple(stopWords);
+  }
+
+  // Parses one redirect at the current token (`> f`, `2>&1`, `<<EOF`), or
+  // returns null when the token doesn't start one.
+  private parseRedirect(): BashRedirect | null {
+    const token = this.peek();
+    if (token.kind === "word" && /^\d+$/.test(token.value) && this.isRedirect(this.peek(1).value)) {
+      const fd = Number(this.advance().value);
+      const op = this.advance().value;
+      if (op === ">&-" || op === "<&-") return { op, fd };
+      const target = this.peek();
+      if (target.kind !== "word") throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
+      this.advance();
+      return { op, target: target.value, fd };
+    }
+    if (!this.isRedirect(token.value)) return null;
+    const op = this.advance().value;
+    if (op === "2>&1") return { op, target: "1", fd: 2 };
+    if (op === ">&-" || op === "<&-") return { op, fd: this.extractFd(op) };
+    const target = this.peek();
+    if (target.kind !== "word") {
+      throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
+    }
+    this.advance();
+    const redirect: BashRedirect = { op, target: target.value, fd: this.extractFd(op) };
+    if (op === "<<" || op === "<<-") {
+      redirect.heredoc = this.readHereDoc(target.value, op === "<<-");
+    }
+    return redirect;
+  }
+
+  // Redirects after a compound command apply to the whole command.
+  private withTrailingRedirects(body: BashCommand): BashCommand {
+    const redirects: BashRedirect[] = [];
+    for (let redirect = this.parseRedirect(); redirect; redirect = this.parseRedirect()) redirects.push(redirect);
+    return redirects.length ? { kind: "redirected", body, redirects } : body;
   }
 
   private parseSimple(_stopWords: Set<string>): BashSimpleCommand {
@@ -531,38 +575,8 @@ class Parser {
 
     while (this.peek().kind === "word" || this.isRedirect(this.peek().value)) {
       const token = this.peek();
-      if (token.kind === "word" && /^\d+$/.test(token.value) && this.isRedirect(this.peek(1).value)) {
-        const fd = Number(this.advance().value);
-        const op = this.advance().value;
-        if (op === ">&-" || op === "<&-") {
-          redirects.push({ op, fd });
-          continue;
-        }
-        const target = this.peek();
-        if (target.kind !== "word") throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
-        this.advance();
-        redirects.push({ op, target: target.value, fd });
-        continue;
-      }
-      if (this.isRedirect(token.value)) {
-        const op = this.advance().value;
-        if (op === "2>&1") {
-          redirects.push({ op, target: "1", fd: 2 });
-          continue;
-        }
-        if (op === ">&-" || op === "<&-") {
-          redirects.push({ op, fd: this.extractFd(op) });
-          continue;
-        }
-        const target = this.peek();
-        if (target.kind !== "word") {
-          throw syntax(`redirection '${op}' requires a target`, this.source, target.start);
-        }
-        this.advance();
-        const redirect: BashRedirect = { op, target: target.value, fd: this.extractFd(op) };
-        if (op === "<<" || op === "<<-") {
-          redirect.heredoc = this.readHereDoc(target.value, op === "<<-");
-        }
+      const redirect = this.parseRedirect();
+      if (redirect) {
         redirects.push(redirect);
         continue;
       }
