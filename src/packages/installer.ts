@@ -1180,6 +1180,9 @@ export class DependencyInstaller {
           path.join(binDir, cmd),
           `node "${target}" "$@"\n`,
         );
+        // npm makes each bin and its target executable
+        this.vol.chmodSync(path.join(binDir, cmd), 0o755);
+        if (this.vol.existsSync(target)) this.vol.chmodSync(target, 0o755);
       }
     } catch {
       // best-effort

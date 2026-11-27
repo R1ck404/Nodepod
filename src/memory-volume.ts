@@ -3111,7 +3111,8 @@ export class MemoryVolume {
 
   mkdirSync(p: string, options?: { recursive?: boolean; mode?: number }): string | undefined {
     const norm = this.normalize(p);
-    const mode = options?.mode !== undefined ? options.mode & 0o7777 : 0o777;
+    // as in Node, the mode (0o777 by default) is masked by the umask, 022
+    const mode = (options?.mode ?? 0o777) & 0o7777 & ~0o022;
 
     if (options?.recursive) {
       const { created } = this.ensureDirTracked(norm);
