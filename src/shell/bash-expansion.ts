@@ -247,6 +247,21 @@ function arithmetic(expression: string, ctx: BashExpansionContext): string {
   return String(Math.trunc(value));
 }
 
+// The index of the last `)` of the `$(( ... ))` at `start`, matching nested
+// parentheses so `$(( $(cmd) + 1 ))` and `$(( (1 + 2) * 3 ))` end at the
+// right place, or -1.
+function arithmeticEnd(text: string, start: number): number {
+  const end = findMatching(text, start + 1, "(", ")");
+  return end > start + 2 && text[end - 1] === ")" ? end : -1;
+}
+
+// Parameters and command substitutions inside `$(( ))` expand before the
+// expression is evaluated, as in bash.
+async function expandArithmetic(expression: string, ctx: BashExpansionContext): Promise<string> {
+  const expanded = /[$`]/.test(expression) ? await expandInner(expression, ctx, false) : expression;
+  return arithmetic(expanded, ctx);
+}
+
 async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
   value: string;
   split: boolean;
@@ -282,11 +297,11 @@ async function expandPart(raw: string, ctx: BashExpansionContext): Promise<{
       continue;
     }
     if (ch === "$" && raw[i + 1] === "(" && raw[i + 2] === "(") {
-      const end = raw.indexOf("))", i + 3);
+      const end = arithmeticEnd(raw, i);
       if (end < 0) throw new Error("shell: unmatched arithmetic expansion");
-      out += arithmetic(raw.slice(i + 3, end), ctx);
+      out += await expandArithmetic(raw.slice(i + 3, end - 1), ctx);
       split = true;
-      i = end + 2;
+      i = end + 1;
       continue;
     }
     if (ch === "$" && raw[i + 1] === "(") {
@@ -438,10 +453,10 @@ async function expandQuotedText(
       continue;
     }
     if (ch === "$" && text[i + 1] === "(" && text[i + 2] === "(") {
-      const end = text.indexOf("))", i + 3);
+      const end = arithmeticEnd(text, i);
       if (end < 0) throw new Error("shell: unmatched arithmetic expansion in here-document");
-      out += arithmetic(text.slice(i + 3, end), ctx);
-      i = end + 2;
+      out += await expandArithmetic(text.slice(i + 3, end - 1), ctx);
+      i = end + 1;
       continue;
     }
     if (ch === "$" && text[i + 1] === "(") {

@@ -24,7 +24,9 @@ const readCmd: BuiltinFn = (args, ctx, stdin) => {
       ? fields.slice(i).join(" ")
       : fields[i] ?? "";
   }
-  return ok();
+  // like bash, read fails at end of input (no newline left), which ends
+  // `while read` loops; a last line without a newline is still assigned
+  return stdin.includes("\n") ? ok() : { stdout: "", stderr: "", exitCode: 1 };
 };
 
 const mapfileCmd: BuiltinFn = (args, ctx, stdin) => {

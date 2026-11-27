@@ -28,13 +28,17 @@ import {
   type BashArithmeticCommand,
   type BashSelectCommand,
   type BashCoprocCommand,
+  type BashRedirectedCommand,
 } from "./bash-parser.js";
 import { expandHereDocument, expandWords, expandWord } from "./bash-expansion.js";
 import type { BashExpansionContext } from "./bash-expansion.js";
 import type { ShellResult as StreamShellResult } from "./shell-types.js";
 import {
   isStreamableCommand,
+  readStreamInput,
   runStreamCommand,
+  streamsInPipeline,
+  writeStreamOutput,
   canonicalVirtualCommandName,
 } from "./shell-stream-commands.js";
 import { ShellCancellation, ShellPipe, streamToString } from "./shell-stream.js";
@@ -53,6 +57,11 @@ export type SpawnChildCallback = (
   args: string[],
   opts?: { cwd?: string; env?: Record<string, string>; stdio?: "pipe" | "inherit" },
 ) => Promise<{ pid: number; exitCode: number; stdout: string; stderr: string }>;
+
+interface OutputCapture {
+  stdout: boolean;
+  stderr: boolean;
+}
 
 export class NodepodShell {
   private volume: MemoryVolume;
@@ -78,6 +87,14 @@ export class NodepodShell {
   private recursionDepth = 0;
   private lastBackgroundPid = 0;
   private pipeStatuses: number[] = [];
+  // The input of the compound command running now (`cat f | while ...`,
+  // `while ...; done < f`). `read` takes a line from it; other commands in
+  // the body see what's left without consuming it.
+  private sharedStdin: { data: string; offset: number } | null = null;
+  // Where the running command's stdout and stderr go: captured (a pipe, a
+  // file, a substitution) or the terminal. Programs stream only what goes to
+  // the terminal.
+  private captured: OutputCapture = { stdout: false, stderr: false };
   private functions = new Map<string, BashCommand>();
   private jobs = new Map<number, {
     id: number;
@@ -413,6 +430,7 @@ export class NodepodShell {
     }
 
     const ctx = this.buildContext();
+    ctx.stdin = stdin;
     let result: ShellResult;
 
     // dispatch: builtin > registered command > PATH lookup > error
@@ -599,8 +617,11 @@ export class NodepodShell {
     let stdin: string | undefined;
     let result: ShellResult = { stdout: "", stderr: "", exitCode: 0 };
     const statuses: number[] = [];
-    for (const command of pipeline.commands) {
-      const next = await this.execBashCommand(command, stdin);
+    for (const [index, command] of pipeline.commands.entries()) {
+      // every stage but the last writes into the next one's input
+      const next = index < pipeline.commands.length - 1
+        ? await this.withCapture({ ...this.captured, stdout: true }, () => this.execBashCommand(command, stdin))
+        : await this.execBashCommand(command, stdin);
       statuses.push(next.exitCode);
       result = { stdout: next.stdout, stderr: result.stderr + next.stderr, exitCode: next.exitCode };
       this.assertCollectedOutput(result.stdout, result.stderr);
@@ -654,7 +675,7 @@ export class NodepodShell {
         expanded = await this.expandBashWords(command.words);
         pipelineCancel.onCancel(() => stageToken.cancel(pipelineCancel.signal.reason));
         if (pipelineCancel.signal.aborted) stageToken.cancel(pipelineCancel.signal.reason);
-        const result = await runStreamCommand(expanded[0], expanded.slice(1), {
+        const streamContext = {
           cwd: this.cwd,
           env: this.env,
           volume: this.volume,
@@ -664,9 +685,26 @@ export class NodepodShell {
           maxOutputBytes: this.shellOptions.limits.maxOutputBytes,
           maxLoopIterations: this.shellOptions.limits.maxLoopIterations,
           cancelUpstream,
-        });
-        statuses[index] = result.exitCode;
-        if (result.stderr) errors[index] = result.stderr;
+        };
+        // Only the stages that must run while their neighbours do (`yes`,
+        // `cat`, and `head` reading a pipe) use the streaming copies. Every
+        // other stage takes its whole input and runs the full command, so
+        // file operands and flags behave as they do outside a pipeline.
+        if (streamsInPipeline(expanded, index)) {
+          const result = await runStreamCommand(expanded[0], expanded.slice(1), streamContext);
+          statuses[index] = result.exitCode;
+          if (result.stderr) errors[index] = result.stderr;
+        } else {
+          const stdin = input ? await readStreamInput(streamContext) : undefined;
+          const result = await this.execCommand({ kind: "command", args: expanded, redirects: [], assignments: {} }, stdin?.text);
+          if (stdin?.truncated && result.exitCode === 0) {
+            result.exitCode = 1;
+            result.stderr += `${expanded[0]}: input exceeds ${this.shellOptions.limits.maxOutputBytes} bytes\n`;
+          }
+          statuses[index] = result.exitCode;
+          if (result.stderr) errors[index] = result.stderr;
+          await writeStreamOutput(streamContext, result.stdout);
+        }
       } catch (error) {
         const cancellationReason = stageToken.signal.reason;
         statuses[index] = stageToken.signal.aborted
@@ -724,6 +762,52 @@ export class NodepodShell {
 
   private async execBashCommand(command: BashCommand, stdin?: string): Promise<ShellResult> {
     if (command.kind === "simple") return this.execBashSimple(command, stdin);
+    if (command.kind === "redirected") return this.execBashRedirected(command, stdin);
+    if (stdin !== undefined && command.kind !== "function") {
+      const previous = this.sharedStdin;
+      this.sharedStdin = { data: stdin, offset: 0 };
+      try { return await this.execBashCompound(command, stdin); }
+      finally { this.sharedStdin = previous; }
+    }
+    return this.execBashCompound(command, stdin);
+  }
+
+  private async execBashRedirected(command: BashRedirectedCommand, stdin?: string): Promise<ShellResult> {
+    const converted = await this.convertBashRedirects(command.redirects, stdin);
+    let input = converted.stdin;
+    for (const redirect of converted.redirects) {
+      if (redirect.type !== "read") continue;
+      try {
+        input = this.volume.readFileSync(this.resolvePath(redirect.target), "utf8");
+      } catch {
+        return { stdout: "", stderr: `shell: ${redirect.target}: No such file or directory\n`, exitCode: 1 };
+      }
+    }
+    const result = await this.withCapture(this.redirectCapture(converted.redirects), () => this.execBashCommand(command.body, input));
+    return this.applyRedirects(result, { kind: "command", args: [], redirects: converted.redirects, assignments: {} });
+  }
+
+  private async withCapture<T>(capture: OutputCapture, run: () => Promise<T>): Promise<T> {
+    const previous = this.captured;
+    this.captured = capture;
+    try { return await run(); }
+    finally { this.captured = previous; }
+  }
+
+  // Where stdout and stderr go after a command's redirects, applied left to
+  // right as applyRedirects does: `2>&1 | cmd` captures both.
+  private redirectCapture(redirects: CommandNode["redirects"]): OutputCapture {
+    let { stdout, stderr } = this.captured;
+    for (const redirect of redirects) {
+      if (redirect.type === "write" || redirect.type === "append") stdout = true;
+      else if (redirect.type === "stderr-write" || redirect.type === "stderr-append") stderr = true;
+      else if (redirect.type === "stderr-to-stdout") stderr = stdout;
+      else if (redirect.type === "stdout-to-stderr") stdout = stderr;
+    }
+    return { stdout, stderr };
+  }
+
+  private async execBashCompound(command: Exclude<BashCommand, BashSimpleCommand | BashRedirectedCommand>, stdin?: string): Promise<ShellResult> {
     if (command.kind === "group" || command.kind === "subshell") {
       const previousCwd = this.cwd;
       const previousEnv = this.env;
@@ -1150,6 +1234,20 @@ export class NodepodShell {
         return { stdout: "", stderr: "shell: command prefix limit exceeded\n", exitCode: 1 };
       }
     }
+    if (stdin === undefined && this.sharedStdin && args.length > 0 && !command.redirects.some((r) => r.op.startsWith("<") && r.op !== "<&-")) {
+      // inside `cat f | while read ...`: `read` takes the next line, mapfile
+      // the rest, and other commands see what's left
+      const shared = this.sharedStdin;
+      const rest = shared.data.slice(shared.offset);
+      if (args[0] === "read") {
+        const newline = rest.indexOf("\n");
+        stdin = newline < 0 ? rest : rest.slice(0, newline + 1);
+        shared.offset += stdin.length;
+      } else {
+        stdin = rest;
+        if (args[0] === "mapfile" || args[0] === "readarray") shared.offset = shared.data.length;
+      }
+    }
     if (args.length === 0) {
       const newNames = Object.keys(assignmentValues).filter((name) => !(name in this.env)).length;
       if (Object.keys(this.env).length + newNames > this.shellOptions.limits.maxFilesystemEntries) {
@@ -1167,20 +1265,20 @@ export class NodepodShell {
       const previousName = this.shellName;
       this.positional = args.slice(3);
       this.shellName = args[0];
-      try { return await this.execNested(args[2] ?? "", args[0]); }
+      try { return await this.withPrefixAssignments(assignmentValues, () => this.execNested(args[2] ?? "", args[0])); }
       finally { this.positional = previous; this.shellName = previousName; }
     }
     if (args[0] === "bash" || args[0] === "sh") {
       const script = args[1];
       if (!script) return { stdout: "", stderr: "", exitCode: 0 };
-      return this.execScriptFile(script, args.slice(2), args[0]);
+      return this.withPrefixAssignments(assignmentValues, () => this.execScriptFile(script, args.slice(2), args[0]));
     }
     const scriptPath = this.resolvePath(args[0]);
     if (this.volume.existsSync(scriptPath)) {
       try {
         const content = this.volume.readFileSync(scriptPath, "utf8");
         if (content.startsWith("#!") && /(?:^|\/)(?:ba)?sh(?:\s|$)/.test(content.slice(2, content.indexOf("\n") < 0 ? content.length : content.indexOf("\n")))) {
-          return this.execScriptFile(args[0], args.slice(1), args[0]);
+          return this.withPrefixAssignments(assignmentValues, () => this.execScriptFile(args[0], args.slice(1), args[0]));
         }
       } catch {
         /* fall through to normal command lookup */
@@ -1240,7 +1338,7 @@ export class NodepodShell {
       this.recursionDepth++;
       this.localScopes.push(new Map());
       try {
-        return await this.execBashCommand(fn);
+        return await this.execBashCommand(fn, stdin);
       } catch (control) {
         if ((control as ShellControl)?.kind === "return") {
           return {
@@ -1261,9 +1359,31 @@ export class NodepodShell {
       }
     }
 
+    const { redirects, stdin: redirectedStdin } = await this.convertBashRedirects(command.redirects, stdin);
+
+    const previousEnv: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries(assignmentValues)) {
+      previousEnv[key] = this.env[key];
+      this.env[key] = value;
+    }
+    try {
+      return await this.withCapture(this.redirectCapture(redirects), () =>
+        this.execCommand({ kind: "command", args, redirects, assignments: {} }, redirectedStdin));
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete this.env[key];
+        else this.env[key] = value;
+      }
+    }
+  }
+
+  private async convertBashRedirects(
+    bashRedirects: BashRedirect[],
+    stdin: string | undefined,
+  ): Promise<{ redirects: CommandNode["redirects"]; stdin: string | undefined }> {
     const redirects: CommandNode["redirects"] = [];
     let redirectedStdin = stdin;
-    for (const redirect of command.redirects) {
+    for (const redirect of bashRedirects) {
       const rawTarget = redirect.target ?? "";
       const target = redirect.heredoc ? rawTarget : ((await this.expandBashWords([rawTarget]))[0] ?? "");
       if (redirect.heredoc) {
@@ -1296,20 +1416,7 @@ export class NodepodShell {
       else if (redirect.op === "2>") redirects.push({ type: "stderr-write", target });
       else if (redirect.op === "2>>") redirects.push({ type: "stderr-append", target });
     }
-
-    const previousEnv: Record<string, string | undefined> = {};
-    for (const [key, value] of Object.entries(assignmentValues)) {
-      previousEnv[key] = this.env[key];
-      this.env[key] = value;
-    }
-    try {
-      return await this.execCommand({ kind: "command", args, redirects, assignments: {} }, redirectedStdin);
-    } finally {
-      for (const [key, value] of Object.entries(previousEnv)) {
-        if (value === undefined) delete this.env[key];
-        else this.env[key] = value;
-      }
-    }
+    return { redirects, stdin: redirectedStdin };
   }
 
   private async expandBashWords(words: string[]): Promise<string[]> {
@@ -1336,6 +1443,7 @@ export class NodepodShell {
         this.commandSubstitutionDepth++;
         try {
           const child = this.createExecutionClone();
+          child.captured = { ...this.captured, stdout: true };
           child.commandSubstitutionDepth = this.commandSubstitutionDepth;
           child.setCancellationSignal(this.activeSignal);
           const result = await child.exec(command);
@@ -1352,6 +1460,7 @@ export class NodepodShell {
         }
         const path = `/tmp/.nodepod-proc-${++this.processSubstitutionCounter}`;
         const child = this.createExecutionClone();
+        child.captured = { ...this.captured, stdout: true };
         child.setCancellationSignal(this.activeSignal);
         const result = await child.exec(command);
         try {
@@ -1619,6 +1728,7 @@ export class NodepodShell {
     clone.arithmeticDepth = this.arithmeticDepth;
     clone.traps = new Map(this.traps);
     clone.readonlyNames = new Set(this.readonlyNames);
+    clone.captured = { ...this.captured };
     clone.setSpawnChildCallback(this._spawnChild);
     clone.setBackgroundOutputCallbacks(this.backgroundStdout, this.backgroundStderr);
     return clone;
@@ -1674,6 +1784,8 @@ export class NodepodShell {
       volume: this.volume,
       signal: this.activeSignal ?? undefined,
       limits: this.shellOptions.limits,
+      ...(this.captured.stdout ? { stdoutCaptured: true } : {}),
+      ...(this.captured.stderr ? { stderrCaptured: true } : {}),
       // Utility-launched commands have process-like isolation. Besides being
       // the correct cwd/environment behavior, this prevents a nested command
       // from waiting on the serialization slot held by its own parent.
@@ -2021,6 +2133,25 @@ export class NodepodShell {
         stderr: `source: ${args[0]}: No such file or directory\n`,
         exitCode: 1,
       };
+    }
+  }
+
+  // A nested shell runs in this interpreter, so prefix assignments
+  // (`FOO=x bash -c ...`) are set for its run and restored afterwards, as
+  // they would be in a child's environment.
+  private async withPrefixAssignments(values: Record<string, string>, run: () => Promise<ShellResult>): Promise<ShellResult> {
+    const names = Object.keys(values);
+    if (names.length === 0) return run();
+    const saved = new Map<string, string | undefined>();
+    for (const name of names) saved.set(name, Object.prototype.hasOwnProperty.call(this.env, name) ? this.env[name] : undefined);
+    Object.assign(this.env, values);
+    try {
+      return await run();
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete this.env[name];
+        else this.env[name] = value;
+      }
     }
   }
 

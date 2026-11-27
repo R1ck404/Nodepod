@@ -1053,12 +1053,11 @@ export class ProcessManager extends EventEmitter {
         // msg.stdio can be the legacy string or node's [stdin, stdout, stderr].
         const inheritsStdin = msg.stdio === "inherit"
           || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
-        if (inheritsStdin) {
-          this._inheritStdinChildren.add(childHandle.pid);
-          // input the parent held for its next reader: typed before this child started
-          for (const data of msg.stdin ?? []) childHandle.sendStdin(data);
-          if (msg.stdinEnded) childHandle.endStdin();
-        }
+        if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+        // input the parent held for its next reader (typed before this child
+        // started), or a piped child's whole input
+        for (const data of msg.stdin ?? []) childHandle.sendStdin(data);
+        if (msg.stdinEnded) childHandle.endStdin();
         if (msg.stdio === "inherit" || (Array.isArray(msg.stdio) && msg.stdio[1] === "inherit")) {
           this._shareTerminal(handle, childHandle);
         }

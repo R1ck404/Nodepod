@@ -1286,6 +1286,7 @@ export function spawnChild(
     cwd?: string;
     env?: Record<string, string>;
     stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
+    input?: string;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
@@ -1325,8 +1326,11 @@ export function spawnChild(
 
     const stdio = opts?.stdio || "pipe";
     const inheritsStdin = stdio === "inherit" || (Array.isArray(stdio) && stdio[0] === "inherit");
-    // input typed before this child started goes with the request
-    const kept = inheritsStdin && _shellMod ? _shellMod.takeStdinBacklog() : { data: [], ended: false };
+    // input typed before this child started goes with the request; a
+    // child reading a pipe gets the pipe's whole input, then its end
+    const kept = opts?.input !== undefined
+      ? { data: opts.input ? [opts.input] : [], ended: true }
+      : inheritsStdin && _shellMod ? _shellMod.takeStdinBacklog() : { data: [], ended: false };
     if (inheritsStdin) _inheritStdinRequests.add(requestId);
     post({
       type: "spawn-request",
