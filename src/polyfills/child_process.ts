@@ -217,6 +217,8 @@ export type SpawnChildCallback = (
     cwd?: string;
     env?: Record<string, string>;
     stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
+    // the child's whole stdin, ended after it (a pipe or a `<` redirect)
+    input?: string;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
   },
@@ -403,7 +405,7 @@ export function endStdin(): void {
   else _stdinBacklogEnded = true;
 }
 
-export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions }): void {
+export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?: Record<string, string>; shell?: ShellOptions; pid?: number }): void {
   _vol = volume;
 
   _shell = new NodepodShell(volume, {
@@ -421,6 +423,7 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
       ...opts?.env,
     },
     shell: opts?.shell,
+    pid: opts?.pid,
   });
 
   const pmDeps: PmDeps = {
@@ -471,12 +474,23 @@ async function executeShellNodeBinary(filePath: string, args: string[], ctx: She
   if (!_spawnChildFn) return executeNodeBinary(filePath, args, ctx);
   // package scripts run Node binaries in a dedicated worker. stream output and
   // inherit stdin so long-running interactive CLIs behave like local processes.
-  const stdoutSink = getStdoutSink();
-  const stderrSink = getStderrSink();
+  // Output going to a pipe, a file or a substitution (ctx.stdoutCaptured,
+  // ctx.stderrCaptured) isn't streamed: it reaches the shell in the result
+  // only, so `node app.js > out.txt` and `node app.js | grep x` don't also
+  // print it. Input from a pipe or a redirect is the child's whole stdin.
+  const stdoutSink = ctx.stdoutCaptured ? null : getStdoutSink();
+  const stderrSink = ctx.stderrCaptured ? null : getStderrSink();
+  const piped = ctx.stdin !== undefined;
+  const stdio: Array<"pipe" | "inherit"> = [
+    piped ? "pipe" : "inherit",
+    ctx.stdoutCaptured ? "pipe" : "inherit",
+    ctx.stderrCaptured ? "pipe" : "inherit",
+  ];
   const operation = _spawnChildFn("node", [filePath, ...args], {
     cwd: ctx.cwd,
     env: ctx.env,
-    stdio: "inherit",
+    stdio: stdio.every((mode) => mode === "inherit") ? "inherit" : stdio,
+    ...(piped ? { input: ctx.stdin } : {}),
     onStdout: stdoutSink ?? undefined,
     onStderr: stderrSink ?? undefined,
   });
@@ -660,7 +674,7 @@ async function runScript(
   const banner = (hdr: string) => {
     if (silent) return;
     allOut += hdr;
-    getStdoutSink()?.(hdr);
+    if (!ctx.stdoutCaptured) getStdoutSink()?.(hdr);
   };
 
   const pre = scripts[`pre${name}`];
@@ -1438,7 +1452,7 @@ export async function executeNodeBinary(
 
   if (!resolved) {
     const errMsg = `Cannot locate module '${rawPath}'\n`;
-    const errSink = getStderrSink();
+    const errSink = ctx.stderrCaptured ? null : getStderrSink();
     if (errSink) errSink(errMsg);
     return {
       stdout: "",
@@ -1464,7 +1478,7 @@ export async function executeNodeBinary(
       throw new Error(`shell: output exceeds ${outputLimit} bytes`);
     }
     out += s;
-    const sink = getStdoutSink();
+    const sink = ctx.stdoutCaptured ? null : getStdoutSink();
     if (sink) sink(s);
     return true;
   };
@@ -1476,7 +1490,7 @@ export async function executeNodeBinary(
       return false;
     }
     err += s;
-    const sink = getStderrSink();
+    const sink = ctx.stderrCaptured ? null : getStderrSink();
     if (sink) sink(s);
     return true;
   };
