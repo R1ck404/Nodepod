@@ -957,6 +957,9 @@ export class NodepodShell {
           if (left === "-e") return true;
           if (left === "-f") return stat.isFile();
           if (left === "-d") return stat.isDirectory();
+          if (left === "-c") return stat.isCharacterDevice();
+          if (left === "-b") return stat.isBlockDevice();
+          if (left === "-p") return stat.isFIFO();
           if (left === "-s") return stat.isFile() && this.volume.readFileSync(this.resolvePath(value)).byteLength > 0;
           if (left === "-r" || left === "-w" || left === "-x") {
             try {

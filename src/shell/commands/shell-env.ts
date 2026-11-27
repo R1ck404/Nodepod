@@ -163,6 +163,14 @@ function evalTest(args: string[], ctx: ShellContext): boolean {
       try { return ctx.volume.statSync(p).isDirectory(); } catch { return false; }
     }
     if (flag === "-e") return ctx.volume.existsSync(p);
+    if (flag === "-c" || flag === "-b" || flag === "-p" || flag === "-S") {
+      try {
+        const st = ctx.volume.statSync(p);
+        if (flag === "-c") return st.isCharacterDevice();
+        if (flag === "-b") return st.isBlockDevice();
+        return flag === "-p" ? st.isFIFO() : st.isSocket();
+      } catch { return false; }
+    }
     if (flag === "-L" || flag === "-h") {
       try {
         return ctx.volume.lstatSync(p).isSymbolicLink();
