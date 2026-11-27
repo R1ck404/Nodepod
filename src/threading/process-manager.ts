@@ -1788,6 +1788,8 @@ export class ProcessManager extends EventEmitter {
     });
 
     handle.on("server-close", (port: number) => {
+      // a killed process's ports are already closed, and the port may have a new owner since
+      if (this._serverPorts.get(port) !== handle.pid) return;
       this.unregisterServerPort(port);
       this.emit("server-close", handle.pid, port);
     });
