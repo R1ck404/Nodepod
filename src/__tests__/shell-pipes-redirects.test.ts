@@ -39,7 +39,7 @@ describe("pipelines run the full commands", () => {
   it("stops reading an endless producer and still runs the command", async () => {
     const result = await shell().exec("yes | grep '['");
     expect(result.exitCode).toBe(2);
-    expect(result.stderr).toContain("Invalid regular expression");
+    expect(result.stderr).toContain("Unmatched [");
   });
 });
 

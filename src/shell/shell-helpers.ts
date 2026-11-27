@@ -355,3 +355,15 @@ export function regexSafetyError(pattern: string, maxLength = 64 * 1024): string
   }
   return null;
 }
+
+// String order as GNU's sort and ls follow it: the locale's collation from
+// LC_ALL, LC_COLLATE or LANG, or code-point order for C, POSIX, C.UTF-8 or
+// no locale at all
+export function collator(env: Record<string, string>): (a: string, b: string) => number {
+  const locale = env.LC_ALL || env.LC_COLLATE || env.LANG || "";
+  if (!locale || /^(C|POSIX)([.@]|$)/i.test(locale)) return (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const tag = locale.split(/[.@]/)[0].replace("_", "-");
+  let compare: Intl.Collator;
+  try { compare = new Intl.Collator(tag); } catch { compare = new Intl.Collator(); }
+  return (a, b) => compare.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0);
+}

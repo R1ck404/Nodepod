@@ -160,7 +160,8 @@ describe("sed invalid regex", () => {
     } as any;
     const result = await sed(["s/[a/b/"], ctx, "abc\n");
     expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toMatch(/invalid regular expression/i);
+    // GNU sed: an open bracket runs to the end, so the command is unterminated
+    expect(result.stderr).toMatch(/unterminated `s' command/);
   });
 });
 
